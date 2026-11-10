@@ -1,0 +1,17 @@
+services:
+  chatbot:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - metabase:/data
+    environment:
+      # Optional: set a key here instead of typing it into the page.
+      - ANTHROPIC_API_KEY
+      - CLAUDE_MODEL
+      - CLAUDE_EFFORT
+      - SYSTEM_PROMPT
+    restart: unless-stopped
+
+volumes:
+  metabase:
