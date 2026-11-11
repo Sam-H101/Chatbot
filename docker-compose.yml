@@ -2,16 +2,45 @@ services:
   chatbot:
     build: .
     ports:
-      - "8000:8000"
+      - "0.0.0.0:8000:8000"
     volumes:
       - metabase:/data
     environment:
-      # Optional: set a key here instead of typing it into the page.
+      # ollama (default): local models in the ollama service below. claude: the Claude API.
+      - LLM_BACKEND=${LLM_BACKEND:-ollama}
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
+      - OLLAMA_MODEL
+      - OLLAMA_VISION_MODEL
+      - OLLAMA_NUM_CTX
+      - OLLAMA_ANALYZE_CHARS
+      # Claude backend only. Optional: set a key here instead of typing it into the page.
       - ANTHROPIC_API_KEY
       - CLAUDE_MODEL
       - CLAUDE_EFFORT
+      - CLAUDE_ANALYZE_CHARS
       - SYSTEM_PROMPT
+      - PDF_EXTRACTOR
+      - MAX_UPLOAD_MB
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama:/root/.ollama   # downloaded models survive rebuilds
+    # Not published: only the chatbot talks to it. Uncomment to use it from the host.
+    # ports:
+    #   - "127.0.0.1:11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
 
 volumes:
   metabase:
+  ollama:

@@ -15,13 +15,20 @@ CREATE TABLE IF NOT EXISTS documents (
     doc_type    TEXT NOT NULL DEFAULT '',
     summary     TEXT NOT NULL DEFAULT '',
     keywords    TEXT NOT NULL DEFAULT '',
-    analysis    TEXT NOT NULL DEFAULT ''   -- 'full', 'partial' or 'none: <reason>'
+    analysis    TEXT NOT NULL DEFAULT '',  -- 'full', 'partial' or 'none: <reason>'
+    model       TEXT NOT NULL DEFAULT ''   -- model that read the document, e.g. 'Claude Opus 5.5'
 );
 CREATE TABLE IF NOT EXISTS chunks (
     id     INTEGER PRIMARY KEY,
     doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     idx    INTEGER NOT NULL,
     text   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS instructions (
+    id         INTEGER PRIMARY KEY,
+    text       TEXT NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
     filename, title, doc_type, summary, keywords, tokenize='porter unicode61'
@@ -38,16 +45,18 @@ def connect():
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     con.executescript(SCHEMA)
+    if "model" not in {r[1] for r in con.execute("PRAGMA table_info(documents)")}:  # older databases
+        con.execute("ALTER TABLE documents ADD COLUMN model TEXT NOT NULL DEFAULT ''")
     return con
 
 
-def add_document(filename, chunks, meta, analysis):
+def add_document(filename, chunks, meta, analysis, model=""):
     with connect() as con:
         cur = con.execute(
-            "INSERT INTO documents (filename, char_count, title, doc_type, summary, keywords, analysis)"
-            " VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO documents (filename, char_count, title, doc_type, summary, keywords, analysis, model)"
+            " VALUES (?,?,?,?,?,?,?,?)",
             (filename, sum(len(c) for c in chunks), meta.get("title", ""), meta.get("doc_type", ""),
-             meta.get("summary", ""), ", ".join(meta.get("keywords", [])), analysis),
+             meta.get("summary", ""), ", ".join(meta.get("keywords", [])), analysis, model),
         )
         doc_id = cur.lastrowid
         con.execute(
@@ -69,10 +78,21 @@ def list_documents():
 
 
 def delete_document(doc_id):
+    return delete_documents([doc_id]) > 0
+
+
+def delete_documents(ids):
+    """Delete several documents in one transaction. Returns how many existed."""
+    ids = list(dict.fromkeys(int(i) for i in ids))
+    deleted = 0
     with connect() as con:
-        con.execute("DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE doc_id=?)", (doc_id,))
-        con.execute("DELETE FROM docs_fts WHERE rowid=?", (doc_id,))
-        return con.execute("DELETE FROM documents WHERE id=?", (doc_id,)).rowcount > 0
+        for start in range(0, len(ids), 500):  # stay well under SQLite's bound-parameter limit
+            part = ids[start:start + 500]
+            marks = ",".join("?" * len(part))
+            con.execute(f"DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE doc_id IN ({marks}))", part)
+            con.execute(f"DELETE FROM docs_fts WHERE rowid IN ({marks})", part)
+            deleted += con.execute(f"DELETE FROM documents WHERE id IN ({marks})", part).rowcount
+    return deleted
 
 
 def fts_query(text):
@@ -103,3 +123,35 @@ def search_chunks(text, limit=5):
             " FROM chunks_fts f JOIN chunks c ON c.id = f.rowid JOIN documents d ON d.id = c.doc_id"
             " WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?", (q, limit))
         return [dict(r) for r in rows]
+
+
+# ---- operator instructions added to the chat system prompt ----
+
+def list_instructions():
+    with connect() as con:
+        return [{**dict(r), "enabled": bool(r["enabled"])}
+                for r in con.execute("SELECT * FROM instructions ORDER BY id")]
+
+
+def active_instructions():
+    with connect() as con:
+        return [r[0] for r in con.execute("SELECT text FROM instructions WHERE enabled ORDER BY id")]
+
+
+def add_instruction(text, enabled=True):
+    with connect() as con:
+        return con.execute("INSERT INTO instructions (text, enabled) VALUES (?,?)", (text, int(enabled))).lastrowid
+
+
+def update_instruction(rule_id, text=None, enabled=None):
+    with connect() as con:
+        if text is not None:
+            con.execute("UPDATE instructions SET text=? WHERE id=?", (text, rule_id))
+        if enabled is not None:
+            con.execute("UPDATE instructions SET enabled=? WHERE id=?", (int(enabled), rule_id))
+        return con.execute("SELECT 1 FROM instructions WHERE id=?", (rule_id,)).fetchone() is not None
+
+
+def delete_instruction(rule_id):
+    with connect() as con:
+        return con.execute("DELETE FROM instructions WHERE id=?", (rule_id,)).rowcount > 0
