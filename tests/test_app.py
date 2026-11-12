@@ -15,9 +15,12 @@ def client(tmp_path, monkeypatch):
         {"title": "Lease", "doc_type": "contract", "summary": "A flat lease.", "keywords": ["rent", "tenant"]}, "full"))
     seen = {}
 
-    def fake_chat(c, history, msg, model=None, system=None):
+    def fake_chat(c, history, msg, model=None, system=None, on_usage=None):
         seen["history"], seen["msg"], seen["model"], seen["system"] = history, msg, model, system
-        return "42", {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0}
+        usage = {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0}
+        if on_usage:
+            on_usage("chat", "claude", model, usage)
+        return "42", usage
 
     monkeypatch.setattr(llm, "chat", fake_chat)
     c = main.app.test_client()
@@ -395,19 +398,24 @@ def test_cost_uses_the_price_table():
         return {"input": i, "output": o, "cache_read": cr, "cache_write": cw}
 
     assert llm.cost("claude-opus-5-5", u(1_000_000, 1_000_000)) == pytest.approx(24.0)
-    assert llm.cost("claude-sonnet-5-5", u(cr=1_000_000, cw=1_000_000)) == pytest.approx(0.2 + 2.5)  # 0.1x / 1.25x
+    assert llm.cost("claude-sonnet-5-5", u(cr=1_000_000, cw=1_000_000)) == pytest.approx(0.10 + 2.5)  # 1.25x writes
+    # Cache reads have their own list price per model: 0.05x on Opus and Sonnet 5.5, 0.025x on Fable 5.2.
+    assert llm.cost("claude-opus-5-5", u(cr=1_000_000)) == pytest.approx(0.20)
+    assert llm.cost("claude-fable-5-2", u(cr=1_000_000)) == pytest.approx(0.20)
     assert llm.cost("claude-haiku-5-5", u(50_000, 1_000)) == pytest.approx((50_000 * 0.10 + 1_000 * 0.50) / 1e6)
     assert llm.cost("claude-haiku-5-5", u(150_000, 1_000)) == pytest.approx((150_000 * 0.50 + 1_000 * 2.50) / 1e6)
+    assert llm.cost("claude-haiku-5-5", u(1_000, cr=60_000)) == pytest.approx((1_000 * 0.10 + 60_000 * 0.01) / 1e6)
+    assert llm.cost("claude-haiku-5-5", u(1_000, cr=200_000)) == pytest.approx((1_000 * 0.50 + 200_000 * 0.05) / 1e6)
+    # A realistic later chat turn on Opus 5.5: mostly read from the cache.
+    assert llm.cost("claude-opus-5-5", u(20, 300, 20_000, 2_500)) == pytest.approx(
+        (20 * 4 + 300 * 20 + 20_000 * 0.20 + 2_500 * 5) / 1e6)
     assert llm.cost("claude-fable-5-2", u(1_000, 1_000)) == pytest.approx(0.048)
     assert llm.cost("claude-unknown-9", u(1_000, 1_000)) == 0
 
 
-def test_claude_calls_report_their_usage():
+def fake_claude(reply):
+    """An Anthropic client whose every call, plain or streamed, answers `reply`."""
     from types import SimpleNamespace as NS
-    from app import llm
-    usage = NS(input_tokens=1200, output_tokens=300, cache_read_input_tokens=None, cache_creation_input_tokens=50)
-    reply = NS(stop_reason="end_turn", usage=usage, content=[
-        NS(type="text", text='{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}')])
 
     class Stream:
         def __enter__(self):
@@ -419,14 +427,38 @@ def test_claude_calls_report_their_usage():
         def get_final_message(self):
             return reply
 
-    fake = NS(beta=NS(messages=NS(create=lambda **kw: reply, stream=lambda **kw: Stream())))
+    return NS(beta=NS(messages=NS(create=lambda **kw: reply, stream=lambda **kw: Stream())))
+
+
+def test_claude_calls_report_their_usage():
+    from types import SimpleNamespace as NS
+    from app import llm
+    usage = NS(input_tokens=1200, output_tokens=300, cache_read_input_tokens=None, cache_creation_input_tokens=50)
+    reply = NS(stop_reason="end_turn", usage=usage, content=[
+        NS(type="text", text='{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}')])
+    fake = fake_claude(reply)
     seen = []
     llm.analyze(fake, "a.txt", "text", "claude-haiku-5-5", on_usage=lambda *call: seen.append(call))
     llm.transcribe_pdf(fake, [(1, 20, 40, b"x"), (21, 40, 40, b"y")], "claude-haiku-5-5",
                        on_usage=lambda *call: seen.append(call))
-    assert [c[0] for c in seen] == ["analyze", "transcribe", "transcribe"]
+    assert llm.chat(fake, [], "hi", "claude-haiku-5-5", on_usage=lambda *call: seen.append(call))[1]["cache_write"] == 50
+    assert [c[0] for c in seen] == ["analyze", "transcribe", "transcribe", "chat"]
     assert seen[0][1:] == ("claude", "claude-haiku-5-5", {"input": 1200, "output": 300, "cache_read": 0, "cache_write": 50})
-    assert llm.chat(fake, [], "hi", "claude-haiku-5-5")[1]["cache_write"] == 50
+
+
+def test_refused_claude_chat_is_logged_and_reported(tmp_path, monkeypatch):
+    """A refusal is billed for its input, so it gets a usage row, and the page gets a
+    readable error instead of an HTML 500."""
+    from types import SimpleNamespace as NS
+    from app import db, llm, main
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    usage = NS(input_tokens=4000, output_tokens=0, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+    monkeypatch.setattr(llm, "client_for", lambda key: fake_claude(NS(stop_reason="refusal", usage=usage, content=[])))
+    r = main.app.test_client().post("/api/chat", json={"question": "hi", "model": "claude:claude-haiku-5-5"}, headers=H)
+    assert r.status_code == 502 and "declined" in r.json["error"]
+    (row,) = _usage_rows()
+    assert (row["kind"], row["model"], row["input_tokens"]) == ("chat", "claude-haiku-5-5", 4000)
+    assert row["cost_usd"] == pytest.approx(4000 * 0.10 / 1e6)
 
 
 def _usage_rows():
@@ -498,6 +530,155 @@ def test_usage_report_when_nothing_was_logged(client):
     assert r["total"] == {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
                           "cache_write_tokens": 0, "cost_usd": 0}
     assert r["by_model"] == [] and r["by_day"] == []
+
+
+def test_a_failed_usage_write_does_not_fail_the_request(client, monkeypatch):
+    """Usage logging is best effort: a busy database must not throw away a paid answer,
+    report a stored upload as failed, or hide why a read failed."""
+    import sqlite3
+    from app import db
+
+    def locked(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "add_usage", locked)
+    r = client.post("/api/chat", json={"question": "hi"}, headers=H)
+    assert r.status_code == 200 and r.json["answer"] == "42"
+    r = upload(client)
+    assert r.status_code == 200 and [d["id"] for d in client.get("/api/documents").json] == [r.json["id"]]
+    r = upload(client, "blank.txt", b"   ")
+    assert r.status_code == 400 and r.json["error"] == "No text found in file"
+
+
+def test_usage_rows_lose_their_link_when_the_document_goes(local):
+    """Document ids are reused after a delete, so a deleted document's usage rows keep
+    their cost but must not point at whichever document gets its id next."""
+    first = upload(local).json["id"]
+    second = upload(local, on_duplicate="replace").json
+    assert second["replaced"] == [first]
+    assert [r["doc_id"] for r in _usage_rows()] == [None, second["id"]]                 # one analyze call each
+    assert local.delete(f"/api/documents/{second['id']}").status_code == 204
+    assert [r["doc_id"] for r in _usage_rows()] == [None, None]                          # still logged
+
+
+def test_first_requests_at_once_bring_the_schema_up_to_date(tmp_path, monkeypatch):
+    """The page loads documents and instructions in parallel. On a new database and on
+    one from before kept files, every one of those first requests must succeed."""
+    import sqlite3
+    import threading
+    from app import db
+    errors = []
+    for n in range(40):
+        path = tmp_path / f"{n}.db"
+        if n % 2:
+            con = sqlite3.connect(path)
+            con.executescript(SCHEMA_894B984)
+            con.close()
+        monkeypatch.setattr(db, "DB_PATH", str(path))
+        gate = threading.Barrier(4)
+
+        def hit(fn):
+            gate.wait()
+            try:
+                fn()
+            except Exception as e:
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=hit, args=(fn,)) for fn in (db.list_documents, db.list_instructions) * 2]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        with db.connect() as con:
+            assert {"sha256", "file_path", "file_size", "mime"} <= {r[1] for r in con.execute("PRAGMA table_info(documents)")}
+    assert errors == []
+
+
+def test_a_copy_still_being_read_counts_as_a_duplicate(client, monkeypatch):
+    """Reloading the page mid-upload and picking the file again must not add it twice:
+    the server is still reading the first one."""
+    import threading
+    from app import llm, main
+    started, release = threading.Event(), threading.Event()
+    fast = llm.analyze
+
+    def slow(c, name, text, model=None, **kw):
+        if name == "pump.txt":
+            started.set()
+            release.wait(10)
+        return fast(c, name, text, model, **kw)
+
+    monkeypatch.setattr(llm, "analyze", slow)
+    first = {}
+    t = threading.Thread(target=lambda: first.update(r=upload(main.app.test_client(), "pump.txt")))
+    t.start()
+    try:
+        assert started.wait(10)
+        r = upload(client, "pump (1).txt")
+        dup = r.json["duplicate"]
+        assert r.status_code == 409 and dup["in_progress"] is True and dup["filename"] == "pump.txt" and dup["started_at"]
+        assert upload(client, "pump (1).txt", on_duplicate="replace").status_code == 409  # nothing to replace yet
+        assert upload(client, "pump (1).txt", on_duplicate="keep").status_code == 200
+    finally:
+        release.set()
+        t.join(10)
+    assert first["r"].status_code == 200 and len(client.get("/api/documents").json) == 2
+    r = upload(client, "pump (2).txt")                                                   # both done: an ordinary duplicate
+    assert r.status_code == 409 and "in_progress" not in r.json["duplicate"] and r.json["duplicate"]["copies"] == 2
+
+
+def test_a_failed_insert_leaves_no_file_behind(client, tmp_path, monkeypatch):
+    import sqlite3
+    from app import db, llm
+    files = tmp_path / "files"
+    monkeypatch.setattr(llm, "analyze", lambda c, name, text, model=None, **kw: (
+        {"title": "T", "doc_type": "d", "summary": "s", "keywords": [1, 2]}, "full"))     # not strings: the insert fails
+    assert upload(client).status_code == 500
+    assert client.get("/api/documents").json == [] and not any(files.glob("*"))
+    real = db.connect
+
+    class CommitFails:  # the rows are written, then the commit fails (say the database is locked)
+        def __init__(self):
+            self.con = real()
+
+        def __getattr__(self, name):
+            return getattr(self.con, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.con.rollback()
+            if exc[0] is None:
+                raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "connect", CommitFails)
+    with pytest.raises(sqlite3.OperationalError):
+        db.add_document("a.txt", ["Rent."], {"title": "A"}, "full", data=b"Rent.")
+    monkeypatch.setattr(db, "connect", real)
+    assert db.list_documents() == [] and not any(files.glob("*"))
+
+
+def test_control_characters_are_removed_from_file_names(client):
+    """A crafted client can send CR/LF in a file name; it must not break the Open link."""
+    body = (b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''evil%0D%0AX-Injected%3A%201.txt\r\n"
+            b"Content-Type: text/plain\r\n\r\nThe rent is 900 euros.\r\n--b--\r\n")
+    r = client.post("/api/upload", data=body, content_type="multipart/form-data; boundary=b", headers=H)
+    assert r.status_code == 200
+    doc = client.get("/api/documents").json[0]
+    assert doc["filename"] == "evil X-Injected: 1.txt"
+    f = client.get(f"/api/documents/{doc['id']}/file")
+    assert f.status_code == 200 and "X-Injected" not in f.headers
+
+
+def test_ids_too_large_for_sqlite_are_not_found(client):
+    huge = 2 ** 70
+    assert client.get(f"/api/documents/{huge}/file").status_code == 404
+    assert client.delete(f"/api/documents/{huge}").status_code == 404
+    assert client.patch(f"/api/instructions/{huge}", json={"enabled": False}).status_code == 404
+    assert client.delete(f"/api/instructions/{huge}").status_code == 404
+    r = client.post("/api/documents/delete", json={"ids": [huge, 2 ** 63 - 1]})
+    assert r.status_code == 200 and r.json["deleted"] == 0
 
 
 def test_instructions_reach_the_system_prompt(client):

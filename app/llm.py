@@ -33,16 +33,18 @@ MODELS = [
 ]
 if MODEL not in dict(MODELS):
     MODELS.append((MODEL, MODEL))
-# USD per million tokens (input, output), for the usage log. Cache reads cost 0.1x the
-# input price and cache writes 1.25x. Models missing here are logged at $0.
+# List prices in USD per million tokens (input, output, cache read), for the usage log.
+# Cache reads are priced per model (0.05x input on Opus and Sonnet 5.5, 0.025x on Fable 5.2,
+# 0.1x on Haiku 5.5); cache writes (5-minute, what chat uses) cost 1.25x input on all four.
+# Models missing here are logged at $0.
 PRICES = {
-    "claude-opus-5-5": (4.00, 20.00),
-    "claude-sonnet-5-5": (2.00, 10.00),
-    "claude-haiku-5-5": (0.10, 0.50),
-    "claude-fable-5-2": (8.00, 40.00),
+    "claude-opus-5-5": (4.00, 20.00, 0.20),
+    "claude-sonnet-5-5": (2.00, 10.00, 0.10),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    "claude-fable-5-2": (8.00, 40.00, 0.20),
 }
-# Haiku charges more once a prompt passes 100K tokens: (threshold, input, output).
-LONG_PROMPT_PRICES = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
+# Haiku charges more once a prompt passes 100K tokens: (threshold, prices as above).
+LONG_PROMPT_PRICES = {"claude-haiku-5-5": (100_000, (0.50, 2.50, 0.05))}
 # Routes a safety-classifier decline to a fallback model instead of failing.
 # Only these models take server-side fallbacks; others are sent without it.
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-5"}
@@ -61,11 +63,11 @@ def label(model):
 def cost(model, usage):
     """USD for one call, from a usage dict (input, output, cache_read, cache_write)."""
     get = lambda k: usage.get(k) or 0
-    p_in, p_out = PRICES.get(model, (0, 0))
-    threshold, long_in, long_out = LONG_PROMPT_PRICES.get(model, (None, 0, 0))
+    p_in, p_out, p_read = PRICES.get(model, (0, 0, 0))
+    threshold, long_prices = LONG_PROMPT_PRICES.get(model, (None, None))
     if threshold and get("input") + get("cache_read") + get("cache_write") > threshold:
-        p_in, p_out = long_in, long_out
-    return (get("input") * p_in + get("cache_write") * p_in * 1.25 + get("cache_read") * p_in * 0.1
+        p_in, p_out, p_read = long_prices
+    return (get("input") * p_in + get("cache_write") * p_in * 1.25 + get("cache_read") * p_read
             + get("output") * p_out) / 1_000_000
 
 
@@ -114,9 +116,13 @@ def system_prompt(rules=()):
             + "\n".join(f"- {r}" for r in rules))
 
 
+class Refused(RuntimeError):
+    """Claude's safety filter declined (after any server-side fallbacks)."""
+
+
 def _text(response):
     if response.stop_reason == "refusal":
-        raise RuntimeError("Claude declined this request")
+        raise Refused("Claude declined this request")
     return "".join(b.text for b in response.content if b.type == "text")
 
 
@@ -176,9 +182,10 @@ def build_user_message(question, hits):
     return "<excerpts>\n" + "\n".join(parts) + "\n</excerpts>\n\n" + question
 
 
-def chat(client, history, user_message, model=MODEL, system=SYSTEM):
+def chat(client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):
     """history: prior [{role, content}] turns exactly as previously sent, so the
-    conversation prefix is byte-identical between requests and hits the cache."""
+    conversation prefix is byte-identical between requests and hits the cache.
+    Returns (answer, usage); on_usage also hears of a refusal, which is billed."""
     with client.beta.messages.stream(
         model=model,
         max_tokens=16000,
@@ -189,6 +196,7 @@ def chat(client, history, user_message, model=MODEL, system=SYSTEM):
         **_fallback(model),
     ) as stream:
         response = stream.get_final_message()
+    _report(on_usage, "chat", model, response)
     return _text(response), _usage(response)
 
 

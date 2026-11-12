@@ -14,6 +14,11 @@ FILES_DIR = os.environ.get("FILES_DIR", "")
 # Serialises writing and removing stored files with the rows that point at them, so a
 # delete never removes a file that an upload is about to reference (one gunicorn worker).
 _files_lock = threading.Lock()
+# The schema is brought up to date once per database per process, under this lock: the
+# page's first requests arrive together, and two threads that both saw a column missing
+# would both run ALTER TABLE, failing the slower request.
+_schema_lock = threading.Lock()
+_schema_ready = set()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -26,8 +31,11 @@ CREATE TABLE IF NOT EXISTS documents (
     summary     TEXT NOT NULL DEFAULT '',
     keywords    TEXT NOT NULL DEFAULT '',
     analysis    TEXT NOT NULL DEFAULT '',  -- 'full', 'partial' or 'none: <reason>'
-    model       TEXT NOT NULL DEFAULT ''   -- model that read the document, e.g. 'Claude Opus 5.5'
-    -- plus the columns in COLUMNS below, added by connect()
+    model       TEXT NOT NULL DEFAULT '',  -- model that read the document, e.g. 'Claude Opus 5.5'
+    sha256      TEXT,                      -- see COLUMNS below; older databases gain these on connect
+    file_path   TEXT,
+    file_size   INTEGER,
+    mime        TEXT
 );
 CREATE TABLE IF NOT EXISTS usage (
     id                 INTEGER PRIMARY KEY,
@@ -40,7 +48,8 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd           REAL NOT NULL DEFAULT 0,
-    doc_id             INTEGER              -- no foreign key: the cost stays logged after a delete
+    doc_id             INTEGER              -- no foreign key: the cost stays logged after a delete,
+                                            -- with doc_id set to NULL (ids get reused)
 );
 CREATE INDEX IF NOT EXISTS usage_created ON usage(created_at);
 CREATE TABLE IF NOT EXISTS chunks (
@@ -77,16 +86,28 @@ COLUMNS = {
 
 def connect():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    fresh = not os.path.exists(DB_PATH)
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    if fresh or DB_PATH not in _schema_ready:
+        with _schema_lock:
+            _migrate(con)
+            _schema_ready.add(DB_PATH)
+    return con
+
+
+def _migrate(con):
     con.executescript(SCHEMA)
     have = {r[1] for r in con.execute("PRAGMA table_info(documents)")}
     for name, decl in COLUMNS.items():
         if name not in have:
-            con.execute(f"ALTER TABLE documents ADD COLUMN {name} {decl}")
+            try:
+                con.execute(f"ALTER TABLE documents ADD COLUMN {name} {decl}")
+            except sqlite3.OperationalError as e:  # another process added it first
+                if "duplicate column name" not in str(e):
+                    raise
     con.execute("CREATE INDEX IF NOT EXISTS documents_sha256 ON documents(sha256)")
-    return con
 
 
 def _doc(row):
@@ -107,22 +128,30 @@ def file_hash(data):
 
 
 def _store(sha, data):
-    """Write the bytes once per content. A temporary file plus rename means a crash
-    never leaves a half-written original under its final name."""
+    """Write the bytes once per content; True if this call wrote the file. A temporary
+    file plus rename means a crash never leaves a half-written original under its name."""
     folder = files_dir()
     path = os.path.join(folder, sha)
-    if not os.path.exists(path):
-        os.makedirs(folder, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".upload-")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            os.chmod(tmp, 0o644)  # mkstemp makes it private to the writer
-            os.replace(tmp, path)
-        except BaseException:
-            os.unlink(tmp)
-            raise
-    return sha
+    if os.path.exists(path):
+        return False
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".upload-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o644)  # mkstemp makes it private to the writer
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    return True
+
+
+def _remove(file_path):
+    try:
+        os.remove(os.path.join(files_dir(), os.path.basename(file_path)))
+    except FileNotFoundError:
+        pass
 
 
 def stored_file(doc_id):
@@ -154,30 +183,39 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
     that hold the same file, in the same transaction. Returns the new id."""
     if data is not None:
         sha = sha or file_hash(data)
-    with _files_lock, connect() as con:
-        if replace and sha:
-            old = [r[0] for r in con.execute("SELECT id FROM documents WHERE sha256=?", (sha,))]
-            _delete_rows(con, old)  # the file stays: the new row points at it
-        file_path = _store(sha, data) if data is not None else None
-        cur = con.execute(
-            "INSERT INTO documents (filename, char_count, title, doc_type, summary, keywords, analysis, model,"
-            " sha256, file_path, file_size, mime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (filename, sum(len(c) for c in chunks), meta.get("title", ""), meta.get("doc_type", ""),
-             meta.get("summary", ""), ", ".join(meta.get("keywords", [])), analysis, model,
-             sha if data is not None else None, file_path, len(data) if data is not None else None,
-             mime if data is not None else None),
-        )
-        doc_id = cur.lastrowid
-        con.execute(
-            "INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords) VALUES (?,?,?,?,?,?)",
-            (doc_id, filename, meta.get("title", ""), meta.get("doc_type", ""),
-             meta.get("summary", ""), ", ".join(meta.get("keywords", []))),
-        )
-        for i, text in enumerate(chunks):
-            cid = con.execute(
-                "INSERT INTO chunks (doc_id, idx, text) VALUES (?,?,?)", (doc_id, i, text)
-            ).lastrowid
-            con.execute("INSERT INTO chunks_fts (rowid, text) VALUES (?,?)", (cid, text))
+    kept = data is not None
+    with _files_lock:
+        wrote = False
+        try:
+            with connect() as con:
+                if replace and sha:
+                    old = [r[0] for r in con.execute("SELECT id FROM documents WHERE sha256=?", (sha,))]
+                    _delete_rows(con, old)  # the file stays: the new row points at it
+                cur = con.execute(
+                    "INSERT INTO documents (filename, char_count, title, doc_type, summary, keywords, analysis,"
+                    " model, sha256, file_path, file_size, mime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (filename, sum(len(c) for c in chunks), meta.get("title", ""), meta.get("doc_type", ""),
+                     meta.get("summary", ""), ", ".join(meta.get("keywords", [])), analysis, model,
+                     sha if kept else None, sha if kept else None, len(data) if kept else None,
+                     mime if kept else None),
+                )
+                doc_id = cur.lastrowid
+                con.execute(
+                    "INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords) VALUES (?,?,?,?,?,?)",
+                    (doc_id, filename, meta.get("title", ""), meta.get("doc_type", ""),
+                     meta.get("summary", ""), ", ".join(meta.get("keywords", []))),
+                )
+                for i, text in enumerate(chunks):
+                    cid = con.execute(
+                        "INSERT INTO chunks (doc_id, idx, text) VALUES (?,?,?)", (doc_id, i, text)
+                    ).lastrowid
+                    con.execute("INSERT INTO chunks_fts (rowid, text) VALUES (?,?)", (cid, text))
+                if kept:  # last, so a failed insert leaves no file behind
+                    wrote = _store(sha, data)
+        except BaseException:
+            if wrote:  # written for rows that never committed
+                _remove(sha)
+            raise
     return doc_id
 
 
@@ -201,6 +239,8 @@ def _delete_rows(con, ids):
             f"SELECT file_path FROM documents WHERE id IN ({marks}) AND file_path IS NOT NULL", part)}
         con.execute(f"DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE doc_id IN ({marks}))", part)
         con.execute(f"DELETE FROM docs_fts WHERE rowid IN ({marks})", part)
+        # SQLite hands a deleted id to the next document: keep the cost, drop the link.
+        con.execute(f"UPDATE usage SET doc_id = NULL WHERE doc_id IN ({marks})", part)
         deleted += con.execute(f"DELETE FROM documents WHERE id IN ({marks})", part).rowcount
     return deleted, files
 
@@ -208,17 +248,14 @@ def _delete_rows(con, ids):
 def delete_documents(ids):
     """Delete several documents in one transaction, and the stored files no other
     document still uses. Returns how many existed."""
-    ids = list(dict.fromkeys(int(i) for i in ids))
+    ids = [i for i in dict.fromkeys(int(i) for i in ids) if -2**63 <= i < 2**63]  # others can't exist
     with _files_lock:
         with connect() as con:
             deleted, files = _delete_rows(con, ids)
             unused = [p for p in files
                       if not con.execute("SELECT 1 FROM documents WHERE file_path=?", (p,)).fetchone()]
         for p in unused:  # only after the commit: a rollback must not lose a file
-            try:
-                os.remove(os.path.join(files_dir(), os.path.basename(p)))
-            except FileNotFoundError:
-                pass
+            _remove(p)
     return deleted
 
 

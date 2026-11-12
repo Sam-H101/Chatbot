@@ -1,13 +1,28 @@
 """HTTP API + single-page UI."""
 import mimetypes
 import os
+import re
+import threading
+import time
 
 import anthropic
 from flask import Flask, jsonify, request, send_file, send_from_directory
+from werkzeug.routing import IntegerConverter
 
 from . import db, extract, llm, ollama
 
+
+class RowId(IntegerConverter):
+    """<id:...> in routes. SQLite ids are 64-bit, so a larger number names no row: it
+    becomes 0, which no row has either, and the route answers its usual 404 instead of
+    overflowing inside sqlite3."""
+    def to_python(self, value):
+        n = int(value)
+        return n if n < 2**63 else 0
+
+
 app = Flask(__name__, static_folder="static")
+app.url_map.converters["id"] = RowId
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 # Default model choice when the browser doesn't send one:
@@ -25,6 +40,11 @@ INLINE_TYPES = {"application/pdf", "text/plain"}
 # The slim image has no /etc/mime.types, and Python's own table lacks these two.
 mimetypes.add_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx")
 mimetypes.add_type("text/plain", ".log")
+# Uploads being read right now, by hash: [(file name, start time UTC), ...]. A copy that
+# arrives meanwhile (the page was reloaded and the file picked again) is not in the
+# library yet, but must still count as a duplicate. One gunicorn worker, so a dict will do.
+_reading = {}
+_reading_lock = threading.Lock()
 
 
 class MissingKey(Exception):
@@ -94,6 +114,21 @@ def _call(kind, backend, model, usage):
     return kind, backend, model, usage, llm.cost(model, usage) if backend == "claude" else 0.0
 
 
+def _log_usage(calls, doc_id=None):
+    """Best effort: if the log can't be written (say the database stays locked), the
+    answer or upload that already succeeded is still returned, and the reason a request
+    failed is not replaced by a logging error."""
+    try:
+        db.add_usage(calls, doc_id)
+    except Exception:
+        app.logger.exception("Could not log %d model call(s)", len(calls))
+
+
+def _clean_name(name):
+    """Control characters (CR/LF from a crafted request) can't go into a response header."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", name or "").strip()
+
+
 @app.errorhandler(MissingKey)
 def _no_key(e):
     return jsonify(error="Enter your Claude API key first"), 401
@@ -127,6 +162,11 @@ def _api_error(e):
 @app.errorhandler(anthropic.APIConnectionError)
 def _no_network(e):
     return jsonify(error="Could not reach the Claude API"), 502
+
+
+@app.errorhandler(llm.Refused)
+def _refused(e):
+    return jsonify(error=f"{e}. Try rewording it, or another model."), 502
 
 
 @app.errorhandler(ollama.OllamaUnavailable)
@@ -177,7 +217,8 @@ def search():
 @app.post("/api/upload")
 def upload():
     f = request.files.get("file")
-    if not f or not f.filename:
+    name = _clean_name(f.filename) if f else ""
+    if not name:
         return jsonify(error="No file"), 400
     choice = _choice(request.form.get("model"))
     # A file already in the library is refused (409) unless the browser says what to do:
@@ -185,14 +226,21 @@ def upload():
     on_duplicate = request.form.get("on_duplicate", "")
     if on_duplicate not in ("", "replace", "keep"):
         raise BadChoice("on_duplicate must be 'replace' or 'keep'")
-    name, data = f.filename, f.read()
+    data = f.read()
     sha = db.file_hash(data)
-    dups = db.find_duplicates(sha)
-    if dups and not on_duplicate:  # checked before any model spends time on it
-        d = dups[0]
-        return jsonify(error=f"{name} is already in the library", duplicate={
-            "id": d["id"], "filename": d["filename"], "title": d["title"], "created_at": d["uploaded_at"],
-            "model": d["model"], "copies": len(dups)}), 409
+    with _reading_lock:  # check and claim together: two uploads of one file can't both pass
+        dups, reading = db.find_duplicates(sha), _reading.get(sha)
+        if reading and on_duplicate != "keep":  # a copy is still being read: nothing to replace yet
+            first, started = reading[0]
+            return jsonify(error=f"{name} is being read right now", duplicate={
+                "in_progress": True, "filename": first, "started_at": started, "copies": len(dups)}), 409
+        if dups and not on_duplicate:  # checked before any model spends time on it
+            d = dups[0]
+            return jsonify(error=f"{name} is already in the library", duplicate={
+                "id": d["id"], "filename": d["filename"], "title": d["title"], "created_at": d["uploaded_at"],
+                "model": d["model"], "copies": len(dups)}), 409
+        claim = (name, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+        _reading.setdefault(sha, []).append(claim)
     is_pdf = name.lower().endswith(".pdf") and PDF_EXTRACTOR != "local"
     calls = []  # every model call, logged even if the upload then fails
 
@@ -235,12 +283,16 @@ def upload():
                                  mime=mimetypes.guess_type(name)[0] or f.mimetype or "application/octet-stream",
                                  replace=replace)
     finally:
-        db.add_usage(calls, doc_id)
+        with _reading_lock:  # added (so find_duplicates sees it) or failed
+            _reading[sha].remove(claim)
+            if not _reading[sha]:
+                del _reading[sha]
+        _log_usage(calls, doc_id)
     return jsonify(id=doc_id, chunks=len(chunks), analysis=analysis, has_file=True,
                    replaced=[d["id"] for d in dups] if replace else [], **_used(used, note), **meta)
 
 
-@app.get("/api/documents/<int:doc_id>/file")
+@app.get("/api/documents/<id:doc_id>/file")
 def document_file(doc_id):
     f = db.stored_file(doc_id)
     if not f:  # also documents uploaded before originals were kept
@@ -251,7 +303,7 @@ def document_file(doc_id):
     return resp
 
 
-@app.delete("/api/documents/<int:doc_id>")
+@app.delete("/api/documents/<id:doc_id>")
 def delete(doc_id):
     return ("", 204) if db.delete_document(doc_id) else (jsonify(error="Not found"), 404)
 
@@ -305,7 +357,7 @@ def add_instruction():
     return jsonify(next(r for r in db.list_instructions() if r["id"] == rule_id)), 201
 
 
-@app.patch("/api/instructions/<int:rule_id>")
+@app.patch("/api/instructions/<id:rule_id>")
 def edit_instruction(rule_id):
     body = request.get_json(force=True) or {}
     enabled = body.get("enabled")
@@ -316,7 +368,7 @@ def edit_instruction(rule_id):
     return jsonify(next(r for r in db.list_instructions() if r["id"] == rule_id))
 
 
-@app.delete("/api/instructions/<int:rule_id>")
+@app.delete("/api/instructions/<id:rule_id>")
 def delete_instruction(rule_id):
     return ("", 204) if db.delete_instruction(rule_id) else (jsonify(error="Not found"), 404)
 
@@ -333,15 +385,21 @@ def chat():
     user_message = llm.build_user_message(question, hits)
 
     system = llm.system_prompt(db.active_instructions())
+    calls = []
+
+    def on_usage(*call):
+        calls.append(_call(*call))
 
     def answer(backend, model):
         if backend == "ollama":
-            return ollama.chat(None, history, user_message, model, system=system)
-        return llm.chat(_client(), history, user_message, model, system=system)
+            return ollama.chat(None, history, user_message, model, system=system, on_usage=on_usage)
+        return llm.chat(_client(), history, user_message, model, system=system, on_usage=on_usage)
 
     fits = ollama.fits([{"content": system}, *history, {"content": user_message}])
-    (text, usage), used, note = _run(choice, answer, fits_local=fits)
-    db.add_usage([_call("chat", *used, usage)])
+    try:
+        (text, usage), used, note = _run(choice, answer, fits_local=fits)
+    finally:
+        _log_usage(calls)  # a refused Claude answer is billed too
     return jsonify(
         answer=text,
         usage=usage,

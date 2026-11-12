@@ -121,9 +121,12 @@ def transcribe_pdf(data, on_usage=None):
     return "\n\n".join(out)
 
 
-def chat(_client, history, user_message, model=MODEL, system=SYSTEM):
+def chat(_client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):
     """Same contract as llm.chat. Ollama reuses the KV cache for an unchanged prefix
     on its own, so resending identical history is cheap here too."""
     r = _chat(model, [{"role": "system", "content": system}, *history,
                       {"role": "user", "content": user_message}], think=False)
-    return r["message"]["content"], _usage(r)
+    usage = _usage(r)
+    if on_usage:
+        on_usage("chat", "ollama", model, usage)
+    return r["message"]["content"], usage

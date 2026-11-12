@@ -59,6 +59,9 @@
   .dupask button { font-size: 12px; padding: 3px 10px; }
   a.open { color: var(--accent); font-weight: 600; text-decoration: none; }
   a.open:hover { text-decoration: underline; }
+  @media (pointer: coarse), (max-width: 820px) {  /* a finger-sized target; the negative margin keeps the layout */
+    a.open { display: inline-block; padding: 7px 6px; margin: -7px -6px; }
+  }
   .spin { width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(1turn); } }
   .shelfhead { display: flex; align-items: center; gap: 10px; padding: 18px 20px 8px; }
@@ -644,8 +647,8 @@ async function loadUsage() {
     tiles.append(tile);
   }
   const note = el('p', 'muted', 'Every model call is logged: reading pages, analyzing documents and answering. '
-    + 'Local models cost nothing. Claude costs come from the price table in app/llm.py (cache reads at 0.1× '
-    + 'and cache writes at 1.25× the input price) and are estimates, not your invoice. Input includes cached tokens. Days are UTC.');
+    + 'Local models cost nothing. Claude costs come from the list prices in app/llm.py, including each model’s '
+    + 'cheaper cache-read price, and are estimates, not your invoice. Input includes cached tokens. Days are UTC.');
   if (!t.calls) {
     box.replaceChildren(tiles, el('div', 'muted', `No model calls in the last ${days} days.`), note);
     return;
@@ -711,17 +714,25 @@ async function uploadOne(f, onDuplicate = '', job = null) {
 
 function askDuplicate(f, job, state, dup) {
   job.classList.add('dup');
-  state.textContent = 'Already added';
-  const by = dup.model ? `, read by ${dup.model}` : '';
-  const copies = dup.copies > 1 ? ` (${dup.copies} copies)` : '';
   const ask = el('div', 'dupask');
-  ask.append(el('span', '', `The same file is in the library as “${dup.filename}”${copies}, added ${dup.created_at} UTC${by}.`));
-  const buttons = el('div');
-  for (const [label, how, tip] of [
+  const choices = [
     ['Replace', 'replace', 'Read this file and delete the copy already in the library'],
     ['Keep both', 'keep', 'Add this file as another copy'],
     ['Skip', '', 'Leave the library as it is'],
-  ]) {
+  ];
+  if (dup.in_progress) {  // e.g. the page was reloaded during an upload: the server is still reading it
+    state.textContent = 'Being read';
+    ask.append(el('span', '', `The same file is being read right now as “${dup.filename}” (started ${dup.started_at} UTC). `
+      + 'It appears in the library when done, even after a reload.'));
+    choices.shift();  // nothing to replace yet
+  } else {
+    state.textContent = 'Already added';
+    const by = dup.model ? `, read by ${dup.model}` : '';
+    const copies = dup.copies > 1 ? ` (${dup.copies} copies)` : '';
+    ask.append(el('span', '', `The same file is in the library as “${dup.filename}”${copies}, added ${dup.created_at} UTC${by}.`));
+  }
+  const buttons = el('div');
+  for (const [label, how, tip] of choices) {
     const b = Object.assign(el('button', '', label), { type: 'button', title: tip });
     b.onclick = () => how ? uploadOne(f, how, job) : job.remove();
     buttons.append(b);

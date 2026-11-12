@@ -42,6 +42,16 @@ Everything below is uncommitted in the working tree.
   588 chunks: lists, searches, answers, 404 for originals). 52 tests pass. Staging with qwen3.5, minicpm and
   a few Claude Haiku calls ($0.0007), UI in light/dark and at 320-480px. Fixed on the way: the phone
   header squashed its icon buttons, and the drawer closed when a clicked button removed itself.
+- 2026-11-12: Review fixes for items 6, 7 and 16. Cache reads are now priced per model (Opus/Sonnet 5.5
+  0.05x, Fable 5.2 0.025x, Haiku 0.1x); before, all four were charged 0.1x, which overstated Claude chat cost.
+  The schema update runs once per process under a lock: the page's two parallel first requests sometimes
+  got a 500 "duplicate column name" (about 4% of new and 9% of old databases in a stress test, now 0 of
+  500 each). A copy of a file still being read counts as a duplicate (reload mid-upload, then pick it again);
+  the prompt offers Keep both / Skip. Usage logging can't fail a paid answer or a stored upload any more;
+  refused Claude chats are logged (and get a JSON 502); deleting a document clears its usage rows' doc_id
+  (ids get reused). Also: a failed insert no longer leaves its file behind, CR/LF in an uploaded file name
+  no longer breaks its Open link, ids past 64 bits give 404 instead of 500, and Open is a bigger tap target
+  on phones. 60 tests pass.
 
 ## To do
 
