@@ -13,8 +13,9 @@ def client(tmp_path, monkeypatch):
     # No embedding model unless a test brings one (fake_embedder): search is by keywords, and
     # vectors.py starts each test with no pause and nothing cached.
     monkeypatch.setattr(ollama, "embed", no_embedder)
-    monkeypatch.setattr(vectors, "_retry_at", 0.0)
-    monkeypatch.setattr(vectors, "_last_error", None)
+    monkeypatch.setattr(vectors, "_paused", {})
+    monkeypatch.setattr(vectors, "_singly", set())
+    monkeypatch.setattr(vectors, "_aside", {})
     monkeypatch.setattr(vectors, "_cache", None)
     monkeypatch.setattr(db, "FILES_DIR", "")  # originals go to tmp_path / "files"
     monkeypatch.setattr(main, "BACKEND", "claude")
@@ -157,8 +158,8 @@ def test_chat_grounds_on_excerpts(client):
     assert e["text"] == LEASE.decode() and (e["match"], e["page_start"], e["idx"]) == ("keywords", None, 0)
     assert '<excerpt file="lease.txt">\nThe monthly rent is 900 euros.' in client.seen["msg"]
     assert r.json["turns"][0]["content"] == client.seen["msg"]
-    assert client.post("/api/chat", json={"question": "hi", "history": "none"}, headers=H).status_code == 400
-    assert client.post("/api/chat", json={"question": "hi", "history": ["x"]}, headers=H).status_code == 400
+    for bad in ("none", ["x"], [{"role": "user", "content": 5}], [{"role": "system", "content": "hi"}], [{"content": "hi"}]):
+        assert client.post("/api/chat", json={"question": "hi", "history": bad}, headers=H).status_code == 400
 
 
 def test_requires_key(client, monkeypatch):
@@ -2190,8 +2191,10 @@ def test_answers_cite_the_pages_of_their_excerpts(local, monkeypatch):
     from app import llm
     r = local.post("/api/chat", json={"question": "How much free travel has the brake pedal?"}).json
     msg = local.calls[-1]["messages"][-1]["content"]
-    assert f"</excerpt>\n</excerpts>\n\n{llm.PAGE_NOTE}\n\nHow much free travel" in msg   # asked to cite pages
-    assert "like (Chapter 7 Brake.pdf, p. 12)" in llm.PAGE_NOTE and "p. 12" not in llm.SYSTEM
+    note = llm.PAGE_NOTE.format(file="Chapter 7 Brake.pdf", page=r["excerpts"][0]["page_start"])
+    assert f"</excerpt>\n</excerpts>\n\n{note}\n\nHow much free travel" in msg              # asked to cite pages
+    assert f"like (Chapter 7 Brake.pdf, p. {r['excerpts'][0]['page_start']})" in note     # the example is a real excerpt
+    assert ".pdf" not in llm.SYSTEM + llm.PAGE_NOTE and "p. " not in llm.SYSTEM            # no made-up file to copy
     for label in ('page="1"', 'page="2"', 'pages="2-3"'):
         assert f'<excerpt file="Chapter 7 Brake.pdf" {label}>' in msg
     assert r["sources"] == [{"doc_id": doc_id, "filename": "Chapter 7 Brake.pdf", "title": "Scan", "has_file": True,
@@ -2216,13 +2219,28 @@ def test_questions_are_searched_without_their_stopwords(client):
     """"what is the" matched nearly every passage, ranked them by how often they say "the",
     and in the blend with search by meaning counted as a keyword match."""
     from app.db import fts_query
-    assert fts_query("What is the hydraulic oil capacity?") == '"hydraulic" OR "oil" OR "capacity"'
-    assert fts_query("What is 2 + 2?") == ""                                              # nothing to search for
+    for question in (True, False):
+        assert fts_query("What is the hydraulic oil capacity?", question) == '"hydraulic" OR "oil" OR "capacity"'
+    assert fts_query("What is 2 + 2?", question=True) == ""                               # nothing to search for
     add(client, "gearbox.txt", GEARBOX)
     assert client.get("/api/search?q=What is the oil capacity?").json == []               # "the" alone doesn't match
-    assert client.get("/api/search?q=what is the").json == []
     r = client.post("/api/chat", json={"question": "What is the use of it?"}, headers=H).json
-    assert r["excerpts"] == [] and client.seen["msg"] == "What is the use of it?"
+    assert r["excerpts"] == [] and client.seen["msg"].endswith("</library>\nWhat is the use of it?")
+
+
+def test_the_search_box_still_finds_a_will_by_its_name(client):
+    """Typed alone in the library's search box, a common word is what the user is looking
+    for: a will, an IT policy, the WHO. Questions still leave such words out."""
+    from app.db import fts_query
+    assert fts_query("will") == '"will"' and fts_query("will", question=True) == ""
+    assert fts_query("the will") == '"the" OR "will"' and fts_query("IT policy") == '"policy"'
+    will = add(client, "Last Will.txt", b"LAST WILL AND TESTAMENT\n\nI leave my tractor to my nephew.")["doc_id"]
+    add(client, "IT policy.txt", b"Passwords are changed every 90 days.")
+    assert [d["filename"] for d in client.get("/api/documents?q=will").json] == ["Last Will.txt"]  # by its name
+    assert [h["doc_id"] for h in client.get("/api/search?q=will").json] == [will]               # by its text
+    assert [d["filename"] for d in client.get("/api/documents?q=IT").json] == ["IT policy.txt"]
+    r = client.post("/api/chat", json={"question": "What will it do?"}, headers=H).json         # a question: nothing to look for
+    assert r["excerpts"] == []
 
 
 def test_search_by_meaning_finds_what_keywords_miss(client, monkeypatch):
@@ -2243,7 +2261,7 @@ def test_search_by_meaning_finds_what_keywords_miss(client, monkeypatch):
     assert [r["kind"] for r in _usage_rows()][-2:] == ["embed-query", "chat"]             # logged with the answer
     # A question near nothing (cosine under MIN_SIMILARITY everywhere) is sent no passages.
     r = client.post("/api/chat", json={"question": "brake pedal"}, headers=H).json
-    assert r["excerpts"] == [] and r["sources"] == [] and client.seen["msg"] == "brake pedal"
+    assert r["excerpts"] == [] and r["sources"] == [] and client.seen["msg"].endswith("</library>\nbrake pedal")
     monkeypatch.setattr(vectors, "MIN_SIMILARITY", -1.0)                                   # no floor: the nearest anyway
     assert len(client.post("/api/chat", json={"question": "brake pedal"}, headers=H).json["excerpts"]) == 2
 
@@ -2296,11 +2314,12 @@ def test_without_the_embedding_model_uploads_and_questions_go_on(local, monkeypa
     assert vectors.backfill() == 0 and add(local, "engine.txt", ENGINE)["result"]["embedded"] is False
     assert tries == ["embed"]                                                              # paused meanwhile
     fake_embedder(monkeypatch)
-    monkeypatch.setattr(vectors, "_retry_at", 0.0)                                         # RETRY_SECONDS later
+    monkeypatch.setattr(vectors, "_paused", {})                                            # RETRY_SECONDS later
     assert vectors.backfill() == 2 and vectors.backfill() == 0
     status = local.get("/api/search/status").json
     assert (status["embedded"], status["error"]) == (2, None)
     assert [(r["kind"], r["doc_id"]) for r in _usage_rows() if r["kind"] == "embed"] == [("embed", 1), ("embed", 2)]
+    monkeypatch.setattr(vectors, "MEANING_MARGIN", 1.0)
     r = local.post("/api/chat", json={"question": "hydraulic capacity"}).json              # no word in common
     assert [(e["filename"], e["match"]) for e in r["excerpts"]] == [("gearbox.txt", "meaning"), ("engine.txt", "meaning")]
 
@@ -2354,7 +2373,7 @@ def test_the_worker_embeds_chunks_that_have_no_vectors(client, monkeypatch):
     add(client)                                                                           # no embedding model yet
     assert db.vector_counts(ollama.EMBED_MODEL) == (1, 0)
     fake_embedder(monkeypatch)
-    monkeypatch.setattr(vectors, "_retry_at", 0.0)
+    monkeypatch.setattr(vectors, "_paused", {})
     monkeypatch.setattr(jobs, "BACKGROUND", True)
     monkeypatch.setattr(jobs, "_thread", None)
     try:
@@ -2395,6 +2414,102 @@ def test_a_question_can_be_limited_to_chosen_documents(client, monkeypatch):
     names = [f"f{i}.pdf" for i in range(12)]
     assert llm.build_user_message("Why?", [], names) == (
         "<scope>Only these documents were searched: " + ", ".join(names[:10]) + " and 2 more</scope>\nWhy?")
+
+
+def test_a_broad_question_still_gets_something_to_answer_from(client, monkeypatch):
+    """"What is this document about?" is near no passage in particular (under MIN_SIMILARITY)
+    and shares no keyword with them. Asked of chosen documents, it gets their nearest
+    passages however far, and their opening ones when too few are found (no vectors yet).
+    Asked of all documents, the model gets the library's titles and summaries instead."""
+    from app import llm, vectors
+    monkeypatch.setenv("TOP_K", "3")
+    lease = add(client, "lease.txt", LEASE)["doc_id"]
+    manual = add(client, "manual.txt", "\n\n".join(f"Part {i}: brake " + "word " * 200 for i in range(4)).encode())["doc_id"]
+
+    def ask(**kw):
+        r = client.post("/api/chat", json={"question": "What is this document about?", **kw}, headers=H).json
+        return [(e["doc_id"], e["idx"], e["match"]) for e in r["excerpts"]], r["overview"]
+
+    assert ask(doc_ids=[manual]) == ([(manual, 0, "opening"), (manual, 1, "opening"), (manual, 2, "opening")], False)
+    assert ask(doc_ids=[lease, manual]) == ([(lease, 0, "opening"), (manual, 0, "opening"), (manual, 1, "opening")], False)
+    fake_embedder(monkeypatch)
+    monkeypatch.setattr(vectors, "_paused", {})
+    assert vectors.backfill() == 5
+    assert ask(doc_ids=[lease]) == ([(lease, 0, "meaning")], False)                       # under the floor, still sent
+    assert "The monthly rent is 900 euros." in client.seen["msg"]
+    assert ask() == ([], True)                                                             # all documents: none near
+    assert ("<library>\nNo excerpt matched the question. The documents in the library, newest first:\n"
+            "- manual.txt: Lease (contract). A flat lease.\n- lease.txt: Lease (contract). A flat lease.\n</library>\n"
+            "What is this document about?") == client.seen["msg"]
+    monkeypatch.setattr(llm, "LIBRARY_CHARS", 50)
+    ask()
+    assert "A flat lease.\n- and 1 more\n</library>" in client.seen["msg"]
+    for doc_id in (lease, manual):
+        client.delete(f"/api/documents/{doc_id}")
+    assert ask() == ([], False) and client.seen["msg"] == "What is this document about?"  # an empty library
+
+
+def test_passages_far_behind_the_nearest_are_left_out(client, monkeypatch):
+    """Found by meaning alone, a passage much less near the question than the nearest one
+    (MEANING_MARGIN) takes no place: it would be a source the answer has nothing from.
+    Found by keywords too, or asked of chosen documents, it counts."""
+    fake_embedder(monkeypatch)
+    engine, gearbox = (add(client, name, body)["doc_id"] for name, body in (("engine.txt", ENGINE), ("gearbox.txt", GEARBOX)))
+
+    def ask(question, **kw):
+        r = client.post("/api/chat", json={"question": question, **kw}, headers=H).json
+        return [(e["filename"], e["match"]) for e in r["excerpts"]]
+
+    assert ask("hydraulic capacity") == [("gearbox.txt", "meaning")]                      # engine.txt: 0.71 to 0.89
+    assert ask("hydraulic capacity of the engine") == [("engine.txt", "both"), ("gearbox.txt", "meaning")]
+    assert ask("hydraulic capacity", doc_ids=[engine, gearbox]) == [("gearbox.txt", "meaning"), ("engine.txt", "meaning")]
+
+
+def _flaky_embedder(monkeypatch, sizes):
+    """fake_embedder, except that a call with "BAD" in a text, or with more than two texts
+    (too much for one call), fails. Records each call's number of texts in `sizes`."""
+    from app import ollama
+    fake_embedder(monkeypatch)
+    good = ollama.embed
+
+    def embed(texts, **kw):
+        sizes.append(len(texts))
+        if any("BAD" in t for t in texts):
+            raise ollama.OllamaError(f"{ollama.EMBED_MODEL}: cannot embed this")
+        if len(texts) > 2:
+            raise ollama.OllamaUnavailable("timed out")
+        return good(texts, **kw)
+
+    monkeypatch.setattr(ollama, "embed", embed)
+
+
+def test_a_passage_that_cannot_be_embedded_holds_up_nothing_else(client, monkeypatch):
+    """A batch that fails (more than one call can do in EMBED_TIMEOUT, say) is sent a
+    passage per call. A passage that fails even alone is set aside for ASIDE_SECONDS, so
+    the documents after it are embedded on the next round instead of it being tried again
+    and again, and questions are still searched by meaning meanwhile."""
+    from app import db, ollama, vectors
+    three = "\n\n".join(f"Part {i}: the transmission fluid. " + "x" * 1000 for i in range(3)).encode()
+    for name, body in (("a.txt", b"BAD hydraulic fluid notes."), ("b.txt", three), ("c.txt", GEARBOX)):
+        add(client, name, body)                                                          # no embedding model yet
+    monkeypatch.setattr(vectors, "_paused", {})
+    sizes = []
+    _flaky_embedder(monkeypatch, sizes)
+    assert vectors.backfill() == 0 and sizes == [1]                                       # a.txt's passage, alone
+    assert not vectors.indexing() and vectors.ready()                                     # passages wait; questions don't
+    assert "cannot embed this" in client.get("/api/search/status").json["error"]
+    monkeypatch.setattr(vectors, "_paused", {})                                            # RETRY_SECONDS later
+    assert vectors.backfill() == 3 and sizes[1:] == [3, 1, 1, 1]                           # b.txt: a passage a call
+    assert vectors.backfill() == 1 and vectors.backfill() == 0                             # c.txt; a.txt waits
+    assert db.vector_counts(ollama.EMBED_MODEL) == (5, 4) and client.get("/api/search/status").json["error"] is None
+    r = client.post("/api/chat", json={"question": "lubricant quantity"}, headers=H).json  # no word in common
+    assert (r["excerpts"][0]["filename"], r["excerpts"][0]["match"]) == ("c.txt", "meaning")
+    monkeypatch.setattr(vectors, "_aside", dict.fromkeys(vectors._aside, 0.0))            # ASIDE_SECONDS later
+    assert vectors.backfill() == 0 and sizes[-1] == 1 and not vectors.indexing()          # tried again, once
+    # An upload whose batch fails is embedded a passage a call too.
+    monkeypatch.setattr(vectors, "_paused", {})
+    job = add(client, "d.txt", three.replace(b"transmission", b"brake"))
+    assert job["result"]["embedded"] is True and sizes[-4:] == [3, 1, 1, 1]
 
 
 @pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())

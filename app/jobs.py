@@ -361,7 +361,7 @@ def _index(chunks, progress, on_usage):
     """The chunks' vectors for search by meaning (vectors.for_chunks), or None when the
     embedding model is unavailable: the document is still added, searchable by keywords,
     and the worker embeds it later (vectors.backfill)."""
-    if not vectors.ready():
+    if not vectors.indexing():
         return None
 
     def say(done, total=len(chunks)):

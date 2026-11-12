@@ -136,6 +136,23 @@ Everything below is uncommitted in the working tree.
   a library made by 894b984 was migrated and its 8 chunks embedded at start, cited by file name only, scoped and
   searched by meaning; a missing embedding model left uploads and chat working and the backfill caught up after; 29/29
   browser checks (light, dark, 390, 360 and 320 px).
+- 2026-11-12: Review fixes for items 2, 1 and 11. Broad questions got no passages: "What is this document about?"
+  scores 0.19-0.30 against any passage, under the 0.35 floor. Asked of chosen documents, a question now gets their
+  nearest passages with no floor, filled up with their opening passages when fewer than `TOP_K` are found; asked of all
+  documents and matching nothing ("Summarise everything in my library", "hi"), the model is given the documents' titles
+  and summaries (`<library>`, up to 6,000 characters) and the answer says so. A new `SEARCH_MEANING_MARGIN` (0.12)
+  leaves out meaning-only passages far behind the nearest: on staging it took the workshop guide's parts lists off
+  the warranty, rent and grease questions and kept the "38.0 litres" passage for "hydraulic oil capacity" (0.10
+  behind; 0.08 would have dropped it). The prompts name no example file: qwen3.5 cited the made-up "Chapter 7
+  Brake.pdf" in 4 of 24 brake answers, and 0 of 24 with the page note's example made from the first paged excerpt
+  (right page 20 of 24, before 10); page-less excerpts still got no made-up page (0 of 8). Embedding: a failed batch
+  is sent a passage per call, a passage that fails alone is set aside for 30 minutes so the backfill goes on with the
+  rest, and questions and passages pause separately. The search box keeps common words when they are all there is
+  ("will", "IT"). UI: when every chosen document is deleted the chip says **Chosen document deleted** and questions
+  wait (the ids are dropped, since SQLite reuses them); **Replace** keeps a chosen document chosen as its new copy; the
+  400 refreshes the library; `[Page n]` lines in a passage open that page. `/api/chat` gives 400 for a history turn
+  whose role isn't user/assistant or whose content isn't text. 147 tests pass. Staging (qwen3.5, qwen3-embedding, one
+  Haiku call, $0.0002): 14/14 API checks and 18/18 browser checks (light, dark, 390 and 320 px).
 
 ## To do
 

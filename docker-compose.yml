@@ -25,6 +25,7 @@ services:
       - SYSTEM_PROMPT
       - TOP_K
       - SEARCH_MIN_SIMILARITY
+      - SEARCH_MEANING_MARGIN
       - PDF_EXTRACTOR
       # Which PDF pages count as scanned (read by a model, and paid for with Claude), and
       # how Claude's reading is split up.

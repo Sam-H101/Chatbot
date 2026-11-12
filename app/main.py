@@ -533,7 +533,9 @@ def chat():
     choice = _choice(body.get("model"))
     scope = _scope(body.get("doc_ids"))
     history = body.get("history") or []
-    if not isinstance(history, list) or not all(isinstance(t, dict) for t in history):
+    if not isinstance(history, list) or not all(
+            isinstance(t, dict) and t.get("role") in ("user", "assistant") and isinstance(t.get("content"), str)
+            for t in history):
         raise BadChoice("history must be a list of turns, as earlier answers returned them")
     system = llm.system_prompt(db.active_instructions())
     calls = []
@@ -543,7 +545,10 @@ def chat():
 
     try:
         hits = vectors.search(question, int(os.environ.get("TOP_K", "5")), scope and list(scope), on_usage=on_usage)
-        user_message = llm.build_user_message(question, hits, scope and list(scope.values()))
+        # No passage at all ("Summarise everything in my library", or small talk): the model is
+        # given the documents' titles and summaries instead, so it can say what the library holds.
+        library = db.library_overview() if not hits and scope is None else None
+        user_message = llm.build_user_message(question, hits, scope and list(scope.values()), library)
 
         def answer(backend, model):
             if backend == "ollama":
@@ -560,6 +565,7 @@ def chat():
         usage=usage,
         sources=sources,
         excerpts=excerpts,
+        overview=bool(library and library[1]),  # given the library's summaries instead of passages
         scope=scope and list(scope),
         **jobs.used(used, note),
         # The client stores these and sends them back as `history` next turn.

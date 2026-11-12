@@ -227,11 +227,14 @@
   #sourceview .tvhead h2, #scopeview .tvhead h2 { flex: 1; overflow-wrap: anywhere; min-width: 0; }
   #sourceview .tvhead .grow, #scopeview .tvhead .grow { display: none; }
   .finding .quote { white-space: pre-wrap; overflow-wrap: anywhere; font: 14.5px/1.55 var(--serif); }
+  .finding .quote a.open { font: 600 13px/1.55 var(--mono); }
   .scopechip { display: inline-flex; align-items: center; min-width: 0; max-width: 250px; border: 1px solid var(--line); border-radius: 999px; background: var(--paper); }
   .scopechip:hover { border-color: var(--accent); }
   .scopechip.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--paper)); }
   .scopechip button { border: 0; background: none; border-radius: 999px; padding: 4px 10px; font: 12px/1.2 var(--mono); color: var(--ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .scopechip.on #scopebtn { color: var(--accent); font-weight: 600; padding-right: 3px; }
+  .scopechip.gone { border-color: var(--bad); background: var(--paper); }
+  .scopechip.gone #scopebtn { color: var(--bad); }
   #scopeclear { flex: none; padding: 4px 9px 4px 6px; color: var(--soft); overflow: visible; }
   @media (pointer: coarse), (max-width: 820px) { .scopechip button { padding-block: 7px; } }
   #scopeq { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
@@ -1104,7 +1107,11 @@ async function pollJobs() {
       const row = jobRows.get(j.id);
       // Unknown here and already finished: done before this page saw it (the library shows it).
       if (!row && ((!ACTIVE.has(j.status) && j.status !== 'failed') || gone.has(j.id))) continue;
-      if (row?.job && row.job.status !== 'done' && j.status === 'done') finished = true;
+      if (row?.job && row.job.status !== 'done' && j.status === 'done') {
+        finished = true;
+        // Seen finishing here, so the ids it replaced were freed just now, not since given to other uploads.
+        if (j.result?.replaced?.length) rescope(j.result.replaced, j.doc_id);
+      }
       showJob(row || jobRow(j.id), j);
       active ||= ACTIVE.has(j.status);
     }
@@ -1201,31 +1208,45 @@ addEventListener('drop', e => { if (e.dataTransfer.files.length) uploadAll([...e
 
 // ---- scope: the documents questions search (all of them when none are chosen) ----
 // Kept in this browser. The server drops documents deleted meanwhile; so does the page,
-// whenever it lists the whole library.
-let scope = [], docNames = new Map();  // chosen ids; id -> document, from the last full listing
+// whenever it lists the whole library. When all of them are gone, the chip says so rather
+// than turning into every document unasked, and questions wait for a new choice. Only how
+// many were chosen is kept then, not their ids: SQLite gives a freed id to the next upload.
+let scope = [], docNames = null;  // chosen ids; id -> document, from the last full listing (none yet)
+let scopeGone = +store.get('chatScopeGone') || 0;  // how many chosen documents were all deleted
 try { scope = (JSON.parse(store.get('chatScope') || '[]') || []).filter(Number.isInteger); } catch { scope = []; }
-const docName = id => { const d = docNames.get(id); return d ? d.title || d.filename : `document ${id}`; };
-const scopeText = ids => !ids.length ? 'All documents' : ids.length === 1 ? docName(ids[0]) : `${ids.length} documents`;
+const docName = id => { const d = docNames?.get(id); return d ? d.title || d.filename : `document ${id}`; };
+const scopeText = ids => scopeGone ? `Chosen document${scopeGone > 1 ? 's' : ''} deleted` : !ids.length ? 'All documents'
+  : ids.length === 1 ? docName(ids[0]) : `${ids.length} documents`;
+const GONE = 'The documents chosen for questions were deleted. Choose others with the chip under the question box, or ✕ to ask all documents.';
 
-function setScope(ids) {
-  scope = [...new Set(ids)];
+function setScope(ids, gone = 0) {
+  scope = gone ? [] : [...new Set(ids)];
+  scopeGone = gone;
   store.set('chatScope', scope.length ? JSON.stringify(scope) : '');
+  store.set('chatScopeGone', gone ? String(gone) : '');
   showScope();
 }
 
 function showScope() {
   const on = scope.length > 0, names = scope.slice(0, 8).map(docName).join(', ') + (scope.length > 8 ? ', …' : '');
   $('scopechip').classList.toggle('on', on);
+  $('scopechip').classList.toggle('gone', !!scopeGone);
   $('scopebtn').textContent = scopeText(scope);
-  $('scopebtn').title = on ? `Questions search only ${names}. Click to change.` : 'Questions search every document. Click to choose some.';
-  $('scopebtn').setAttribute('aria-label', `${scopeText(scope)}: ` + (on ? `questions search only ${names}. Change` : 'questions search every document. Choose some'));
-  $('scopeclear').hidden = !on;
+  $('scopebtn').title = scopeGone ? GONE : on ? `Questions search only ${names}. Click to change.`
+    : 'Questions search every document. Click to choose some.';
+  $('scopebtn').setAttribute('aria-label', `${scopeText(scope)}: ` + (scopeGone ? 'choose other documents'
+    : on ? `questions search only ${names}. Change` : 'questions search every document. Choose some'));
+  $('scopeclear').hidden = !on && !scopeGone;
 }
 
 function knowDocs(docs) {  // the whole library, as just listed
   docNames = new Map(docs.map(d => [d.id, d]));
   const kept = scope.filter(id => docNames.has(id));
-  kept.length === scope.length ? showScope() : setScope(kept);
+  kept.length === scope.length ? showScope() : setScope(kept, kept.length ? 0 : scope.length);
+}
+
+function rescope(old, now) {  // "Replace" gave a chosen document a new id: questions follow it
+  if (now && old.some(id => scope.includes(id))) setScope(scope.map(id => old.includes(id) ? now : id));
 }
 
 function askAbout(ids) {  // from a library card or the table: ask these from now on
@@ -1306,7 +1327,20 @@ $('scopeview').addEventListener('click', e => { if (e.target === $('scopeview'))
 showScope();
 
 // ---- an answer's sources: the passages it was given, by document ----
-const MATCH = { keywords: 'found by keywords', meaning: 'found by meaning', both: 'found by keywords and by meaning' };
+const MATCH = { keywords: 'found by keywords', meaning: 'found by meaning', both: 'found by keywords and by meaning',
+  opening: 'the start of the document' };
+
+function quoteText(e) {  // a passage, with its "[Page n]" lines opening that page of the kept PDF
+  const q = el('div', 'quote');
+  e.text.split(/^\[Page (\d+)\]$/m).forEach((part, i) => {
+    const n = +part;
+    q.append(!(i % 2) ? part : e.has_file && e.pdf && n >= e.page_start && n <= e.page_end
+      ? Object.assign(el('a', 'open', `[Page ${n}]`), { href: `/api/documents/${e.doc_id}/file#page=${n}`, target: '_blank',
+          rel: 'noopener', title: `Open page ${n} of the original` })
+      : `[Page ${part}]`);
+  });
+  return q;
+}
 
 function sourceChip(s, excerpts) {
   if (typeof s === 'string') return el('span', 'chip', s);  // an answer from before sources had pages
@@ -1336,7 +1370,7 @@ function showSource(s, excerpts) {
         title: page ? 'Open the original at this page' : 'Open the original file' }));
     }
     head.append(el('span', 'muted', MATCH[e.match] || ''));
-    item.append(head, el('div', 'quote', e.text));
+    item.append(head, quoteText(e));
     return item;
   });
   $('source').replaceChildren(intro, ...items);
@@ -1347,7 +1381,7 @@ $('srcclose').onclick = () => $('sourceview').close();
 $('sourceview').addEventListener('click', e => { if (e.target === $('sourceview')) $('sourceview').close(); });
 
 // ---- chat ----
-const IDEAS =['Summarise everything in my library', 'What are the key dates and amounts?', 'Which documents disagree with each other?'];
+const IDEAS = ['Summarise everything in my library', 'What are the key dates and amounts?', 'Which documents disagree with each other?'];
 function emptyState() {
   const box = el('div', 'empty');
   box.append(el('h2', '', 'Ask your documents anything.'),
@@ -1379,6 +1413,7 @@ async function ask(question) {
   bot.append(body);
   scroll();
   try {
+    if (scopeGone) throw new Error(GONE);  // never every document unasked
     const r = await api('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question, history, model: $('chatModel').value, ...(scope.length ? { doc_ids: scope } : {}) }),
@@ -1394,12 +1429,16 @@ async function ask(question) {
     tok.title = `in ${u.input} · out ${u.output} · cache read ${u.cache_read} · cache write ${u.cache_write}`;
     foot.append(copy, tok);
     bot.append(foot);
+    if (r.overview) bot.append(el('div', 'switched', 'No passage matched this question, so the model was given the titles and summaries of your documents.'));
     if (r.switched) bot.append(el('div', 'switched', `Switched to ${r.model_label}: ${r.switched}`));
   } catch (err) {
     bot.classList.add('err');
     body.textContent = err.message;
     if (/key/i.test(err.message)) { $('settings').hidden = false; key.focus(); }
-    if (err.data?.error?.startsWith('None of the chosen documents')) api('/api/documents').then(knowDocs).catch(() => {});
+    if (err.data?.error?.startsWith('None of the chosen documents')) {  // the library and the Ask chip both catch up
+      loadDocs();
+      if ($('q').value.trim()) api('/api/documents').then(knowDocs).catch(() => {});  // a filtered listing isn't all of it
+    }
   }
   busy = false; $('send').disabled = false;
   scroll();

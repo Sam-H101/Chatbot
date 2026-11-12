@@ -588,11 +588,14 @@ STOPWORDS = frozenset(
     "when where which who whom why will with would you your".split())
 
 
-def fts_query(text):
+def fts_query(text, question=False):
     """Turn free text into a safe FTS5 query: quoted terms OR-ed together, without the
-    STOPWORDS. Empty when that leaves nothing ("What is 2 + 2?"): nothing to search for."""
-    terms = [t for t in re.findall(r"\w+", text.lower()) if len(t) > 1 and t not in STOPWORDS]
-    return " OR ".join(f'"{t}"' for t in dict.fromkeys(terms))
+    STOPWORDS. A question that is nothing else ("What is 2 + 2?") searches for nothing; in
+    the library's search box they are kept when they are all there is, since "will", "IT"
+    or "WHO" typed alone are names there (a will, an IT policy)."""
+    terms = [t for t in re.findall(r"\w+", text.lower()) if len(t) > 1]
+    rare = [t for t in terms if t not in STOPWORDS]
+    return " OR ".join(f'"{t}"' for t in dict.fromkeys(rare if rare or question else terms))
 
 
 def search_documents(text, limit=10):
@@ -628,10 +631,10 @@ def _among(doc_ids):
     return " AND c.doc_id IN (SELECT value FROM json_each(?))", (json.dumps(list(doc_ids)),)
 
 
-def search_chunks(text, limit=5, doc_ids=None):
+def search_chunks(text, limit=5, doc_ids=None, question=False):
     """Chunks with the words of `text`, best first (bm25), each with a snippet that marks
-    them [like this]; only in the documents `doc_ids`, if given."""
-    q = fts_query(text)
+    them [like this]; only in the documents `doc_ids`, if given. `question`: as fts_query."""
+    q = fts_query(text, question)
     if not q:
         return []
     scope, args = _among(doc_ids)
@@ -651,6 +654,25 @@ def chunks_by_id(ids):
             " WHERE c.id IN (SELECT value FROM json_each(?))", (json.dumps(list(ids)),))}
 
 
+def opening_chunks(doc_ids, limit):
+    """The first `limit` chunks of these documents, as search_chunks has them: each one's
+    first chunk, then each one's second, and so on."""
+    scope, args = _among(doc_ids)
+    with connect() as con:
+        return [_hit(r) for r in con.execute(
+            f"SELECT {_HIT} FROM chunks c JOIN documents d ON d.id = c.doc_id WHERE 1{scope}"
+            " ORDER BY c.idx, c.doc_id LIMIT ?", (*args, limit))]
+
+
+def library_overview(limit=60):
+    """(the newest `limit` documents' file names, titles, types and summaries, how many
+    documents there are): what a question that matched no passage is given instead."""
+    with connect() as con:
+        docs = [dict(r) for r in con.execute(
+            "SELECT filename, title, doc_type, summary FROM documents ORDER BY id DESC LIMIT ?", (limit,))]
+        return docs, con.execute("SELECT count(*) FROM documents").fetchone()[0]
+
+
 def document_names(ids):
     """{id: filename} of the documents among `ids` that exist, in the order given."""
     with connect() as con:
@@ -668,14 +690,15 @@ def all_vectors(model):
                            " WHERE v.model=?", (model,)).fetchall()
 
 
-def missing_vectors(model, limit):
+def missing_vectors(model, limit, skip=()):
     """Up to `limit` chunks, all of one document, that have no vector from this embedding
     model (indexed before search by meaning, while the model was unavailable, or by
-    another model): [(chunk id, document id, text)], in order."""
+    another model): [(chunk id, document id, text)], in order. Chunks `skip` are passed over."""
     with connect() as con:
         rows = con.execute("SELECT c.id, c.doc_id, c.text FROM chunks c LEFT JOIN chunk_vectors v"
                            " ON v.chunk_id = c.id AND v.model = ? WHERE v.chunk_id IS NULL"
-                           " ORDER BY c.doc_id, c.idx LIMIT ?", (model, limit)).fetchall()
+                           " AND c.id NOT IN (SELECT value FROM json_each(?))"
+                           " ORDER BY c.doc_id, c.idx LIMIT ?", (model, json.dumps(list(skip)), limit)).fetchall()
     return [tuple(r) for r in rows if r[1] == rows[0][1]]
 
 

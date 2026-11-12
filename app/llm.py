@@ -86,21 +86,28 @@ def _report(on_usage, kind, model, response):
     if on_usage and getattr(response, "usage", None) is not None:
         on_usage(kind, "claude", model, _usage(response))
 
-# Kept byte-stable (no timestamps, no per-request data) so it stays cacheable.
+# Kept byte-stable (no timestamps, no per-request data) so it stays cacheable. It names no
+# file as an example: with "(Chapter 7 Brake.pdf)" here and in PAGE_NOTE, qwen3.5:9b cited
+# that file, not in the library, in 4 of 24 answers about a manual's brakes; with PAGE_NOTE's
+# example made from a real excerpt, in none, and it cited the right page in 20 of 24, not 10.
 SYSTEM = os.environ.get("SYSTEM_PROMPT") or (
     "You answer questions for the user of a document chatbot. Each user message may "
     "start with <excerpts> retrieved from the user's uploaded documents by search, and a "
     "<scope> naming the only documents the user wants searched. Use the excerpts when "
-    "relevant, and cite each one you use in parentheses with its file name, like "
-    "(Chapter 7 Brake.pdf). If the excerpts do not contain the answer, say so and answer "
-    "from general knowledge. Be concise."
+    "relevant, and cite each one you use in parentheses with the file name from its file "
+    "attribute. When no excerpt matched the question, a <library> lists the documents with "
+    "their summaries instead. If none of this contains the answer, say so and answer from "
+    "general knowledge. Be concise."
 )
-# Follows the excerpts only when some of them have pages. In the system prompt, it had a
-# local model (qwen3.5:9b) give excerpts without pages (documents read before pages were
-# kept) a made-up page in 7 of 15 answers; here, in none of 15, and pages were cited right.
-PAGE_NOTE = ("Excerpts with a page or pages attribute: cite the page too, like (Chapter 7 Brake.pdf, p. 12); "
+# Follows the excerpts only when some of them have pages, its example made from the first
+# that has. In the system prompt, it had a local model (qwen3.5:9b) give excerpts without
+# pages (documents read before pages were kept) a made-up page in 7 of 15 answers; here, in
+# none of 15, and pages were cited right.
+PAGE_NOTE = ("Excerpts with a page or pages attribute: cite the page too, like ({file}, p. {page}); "
              "a [Page n] line inside an excerpt marks where page n starts. Cite an excerpt without one by its "
              "file name alone.")
+# Of the documents' titles and summaries, the most a question that matched no passage is given.
+LIBRARY_CHARS = 6000
 
 def system_prompt(rules=()):
     """SYSTEM plus the operator's instructions. Changes only when the rules change,
@@ -245,25 +252,52 @@ def excerpt_text(hit):
     return extract.plain(text)
 
 
-def build_user_message(question, hits, scope=None):
+def library_text(docs, total):
+    """A question that matched no passage ("Summarise everything in my library") gets the
+    documents' titles and summaries instead (db.library_overview), up to LIBRARY_CHARS."""
+    lines, size = [], 0
+    for d in docs:
+        title = d["title"] if d["title"] and d["title"] != d["filename"] else ""
+        summary = " ".join((d["summary"] or "").split())
+        if len(summary) > 400:
+            summary = summary[:400].rsplit(" ", 1)[0] + " …"
+        line = (f"- {d['filename']}" + (f": {title}" if title else "") + (f" ({d['doc_type']})" if d["doc_type"] else "")
+                + (f". {summary}" if summary else ""))
+        if lines and size + len(line) > LIBRARY_CHARS:
+            break
+        lines.append(line)
+        size += len(line)
+    if total > len(lines):
+        lines.append(f"- and {total - len(lines)} more")
+    return ("<library>\nNo excerpt matched the question. The documents in the library, newest first:\n"
+            + "\n".join(lines) + "\n</library>\n")
+
+
+def build_user_message(question, hits, scope=None, library=None):
     """The question, after the excerpts retrieved for it. Each names its file and, for a
     PDF read since pages were kept, its page or pages, which PAGE_NOTE asks the answer to
-    cite. `scope`: the file names of the documents the user limited the question to."""
+    cite. `scope`: the file names of the documents the user limited the question to.
+    `library`: db.library_overview(), given when no excerpt was found."""
     head = ""
     if scope:
         names = ", ".join(scope[:10]) + (f" and {len(scope) - 10} more" if len(scope) > 10 else "")
         head = f"<scope>Only these documents were searched: {names}</scope>\n"
     if not hits:
-        return head + question
+        return head + (library_text(*library) if library and library[1] else "") + question
     parts = []
     for h in hits:
-        attrs = 'file="{}"'.format(h["filename"].replace('"', "'"))
+        attrs = 'file="{}"'.format(_attr(h["filename"]))
         if h.get("page_start"):
             first, last = h["page_start"], h["page_end"]
             attrs += f' page="{first}"' if first == last else f' pages="{first}-{last}"'
         parts.append(f"<excerpt {attrs}>\n{excerpt_text(h)}\n</excerpt>")
-    note = f"\n\n{PAGE_NOTE}" if any(h.get("page_start") for h in hits) else ""
+    paged = next((h for h in hits if h.get("page_start")), None)
+    note = "\n\n" + PAGE_NOTE.format(file=_attr(paged["filename"]), page=paged["page_start"]) if paged else ""
     return head + "<excerpts>\n" + "\n".join(parts) + "\n</excerpts>" + note + "\n\n" + question
+
+
+def _attr(name):
+    return name.replace('"', "'")
 
 
 def chat(client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):
