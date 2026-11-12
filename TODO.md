@@ -153,6 +153,27 @@ Everything below is uncommitted in the working tree.
   400 refreshes the library; `[Page n]` lines in a passage open that page. `/api/chat` gives 400 for a history turn
   whose role isn't user/assistant or whose content isn't text. 147 tests pass. Staging (qwen3.5, qwen3-embedding, one
   Haiku call, $0.0002): 14/14 API checks and 18/18 browser checks (light, dark, 390 and 320 px).
+- 2026-11-12: Plan items 9 and 10. Streaming: `POST /api/chat/stream` sends Server-Sent Events (`meta` with the
+  conversation, model, switch note and sources; `delta` pieces; `done` with usage, or `error` with `kept`), with
+  `Cache-Control: no-cache` and `X-Accel-Buffering: no`; Claude streams the same request as before (`llm.chat_stream`,
+  `text_stream`), Ollama `/api/chat` with `stream: true` (`ollama.chat_stream`). Auto decides by the fits check, and
+  switches to Claude when Ollama fails before its first words; a failure after them ends the answer there (kept, saved
+  as broken), a refusal drops its words. The page reads the stream with `fetch`, shows the text as it comes with a caret
+  and a **Stop** button (it aborts the fetch; the server closes the model's stream and keeps the answer, marked
+  stopped), and falls back to `/api/chat` without streaming. Stopped and broken answers are in the usage log with
+  estimated output tokens. Saved conversations: new `conversations` and `messages` tables (each question with what the
+  model was sent, each answer with its sources, model, usage and status); both chat routes take `conversation_id`
+  (a new conversation, titled by the question, without one) and read the history from the database; a client's own
+  `history` still works without it. `GET/PATCH/DELETE /api/conversations[/<id>]`. The page has **Chats**: a column
+  beside the chat from 1280 px (shown or hidden, remembered), a drawer below that and on phones (with **New chat**),
+  rename (✎) and delete (✕ twice); the open conversation survives a reload, and picking one brings back its model and
+  documents. Deleting a document takes it out of conversations' documents, and answers citing it no longer link to the
+  file (its id may go to a new upload). Also: one error wording for HTTP and streamed errors (`_failure`); header
+  buttons no longer shrink (the ◐ was clipped with a long title), and the header fits from 320 px up with an
+  instruction count. 170 tests pass. Staging (qwen3.5, qwen3-embedding, Haiku $0.001): 19/19 API checks (31 pieces
+  over 0.8 s through gunicorn, Ollama's log shows a stopped answer's generation cancelled), Auto's switch with a local
+  model that isn't pulled, a copy of the live library migrated and answered in a saved conversation (7/7), and 49/49
+  browser checks plus 30/30 header checks (light, dark, 320-1400 px).
 
 ## To do
 
@@ -203,8 +224,8 @@ Ordered by priority. Suggested start: 1 and 2, then 5. Item 12 is small and wort
 
 ### Phase 3: Chat experience
 
-- [ ] 9. Streaming answers, instead of the whole reply appearing after a wait.
-- [ ] 10. Saved conversations. History lives only in the browser tab; store it on the server.
+- [x] 9. Streaming answers, instead of the whole reply appearing after a wait.
+- [x] 10. Saved conversations. History lives only in the browser tab; store it on the server.
 - [x] 11. Scope a question to chosen documents ("ask only this manual").
 
 ### Phase 4: Safety and operations

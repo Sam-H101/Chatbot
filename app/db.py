@@ -109,6 +109,33 @@ CREATE TABLE IF NOT EXISTS instructions (
     enabled    INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS conversations (  -- saved chats: questions and their answers (messages)
+    id         INTEGER PRIMARY KEY,
+    title      TEXT NOT NULL DEFAULT '',    -- its first question, cut short, until renamed
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),  -- its last question
+    model      TEXT NOT NULL DEFAULT '',    -- the model choice of its last question: 'auto', 'ollama:<m>', 'claude:<m>'
+    doc_ids    TEXT                         -- JSON: the documents its last question was limited to (deleted
+                                            -- ones taken out, so [] when all were); NULL: every document
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role            TEXT NOT NULL,          -- 'user' or 'assistant'; a question and its answer are saved together
+    content         TEXT NOT NULL,          -- what the page shows: the question, or the answer
+    sent            TEXT,                   -- a question as the model got it, excerpts and all: what later questions
+                                            -- send as history (answers are sent as shown)
+    sources         TEXT,                   -- JSON, answers: sources, excerpts, overview, scope, scope_names
+    model           TEXT,                   -- answers: the model that wrote it, 'ollama:<m>' or 'claude:<m>'
+    model_label     TEXT,
+    switched        TEXT,                   -- why Auto switched to Claude, if it did
+    usage           TEXT,                   -- JSON: its tokens (input, output, cache_read, cache_write)
+    status          TEXT NOT NULL DEFAULT 'done',  -- answers: 'done', 'stopped' (by the user) or 'broken'
+                                                   -- (the model failed part way, error says why)
+    error           TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, id);
 CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
     filename, title, doc_type, summary, keywords, tokenize='porter unicode61'
 );
@@ -438,6 +465,10 @@ def _delete_rows(con, ids):
                     f" updated_at=datetime('now') WHERE kind='reread' AND doc_id IN ({marks})"
                     f" AND status IN ({','.join('?' * len(HOLDING_JOBS))})", [*part, *HOLDING_JOBS])
         con.execute(f"UPDATE jobs SET doc_id = NULL WHERE doc_id IN ({marks})", part)
+        # Conversations limited to it forget it: its id may go to the next upload.
+        con.execute(f"UPDATE conversations SET doc_ids = (SELECT json_group_array(value) FROM json_each(doc_ids)"
+                    f" WHERE value NOT IN ({marks})) WHERE doc_ids IS NOT NULL AND EXISTS"
+                    f" (SELECT 1 FROM json_each(doc_ids) WHERE value IN ({marks}))", [*part, *part])
         deleted += con.execute(f"DELETE FROM documents WHERE id IN ({marks})", part).rowcount
     return deleted, files
 
@@ -761,6 +792,140 @@ def usage_summary(days=30):
         start = con.execute("SELECT date('now', ?)", (since,)).fetchone()[0]
     total = {k: v or 0 for k, v in total.items()}  # SUM over no rows is NULL
     return {"days": days, "since": start, "total": total, "by_model": by_model, "by_day": by_day}
+
+
+# ---- saved conversations: each question and its answer, kept as two messages ----
+
+def _ids(doc_ids):
+    return None if doc_ids is None else json.dumps(list(doc_ids))
+
+
+def add_conversation(title, model="", doc_ids=None):
+    """A new, empty conversation (a streamed answer makes one before its first words, so
+    the page can follow it even if the answer is stopped). Returns its id."""
+    with connect() as con:
+        return con.execute("INSERT INTO conversations (title, model, doc_ids) VALUES (?,?,?)",
+                           (title, model, _ids(doc_ids))).lastrowid
+
+
+def conversation_exists(conv_id):
+    with connect() as con:
+        return con.execute("SELECT 1 FROM conversations WHERE id=?", (conv_id,)).fetchone() is not None
+
+
+def add_exchange(conv_id, question, sent, answer, model="", doc_ids=None, title=""):
+    """Keep a question and its answer, one after the other, in a conversation: a new one
+    titled `title` when conv_id is None. `sent`: the question as the model got it. `answer`:
+    {content, sources, model, model_label, switched, usage, status, error}. The conversation
+    takes the question's model choice and documents (doc_ids, None for all). Returns the
+    conversation's id, or None if it was deleted meanwhile (nothing is kept then)."""
+    with connect() as con:
+        if conv_id is None:
+            conv_id = con.execute("INSERT INTO conversations (title, model, doc_ids) VALUES (?,?,?)",
+                                  (title, model, _ids(doc_ids))).lastrowid
+        elif not con.execute("UPDATE conversations SET updated_at=datetime('now'), model=?, doc_ids=? WHERE id=?",
+                             (model, _ids(doc_ids), conv_id)).rowcount:
+            return None
+        con.execute("INSERT INTO messages (conversation_id, role, content, sent) VALUES (?, 'user', ?, ?)",
+                    (conv_id, question, sent))
+        con.execute("INSERT INTO messages (conversation_id, role, content, sources, model, model_label, switched,"
+                    " usage, status, error) VALUES (?, 'assistant', ?,?,?,?,?,?,?,?)",
+                    (conv_id, answer["content"], json.dumps(answer.get("sources"), ensure_ascii=False),
+                     answer.get("model"), answer.get("model_label"), answer.get("switched"),
+                     json.dumps(answer.get("usage")), answer.get("status", "done"), answer.get("error")))
+    return conv_id
+
+
+def drop_empty_conversation(conv_id):
+    """Delete a conversation that has no message (its first answer failed)."""
+    with connect() as con:
+        con.execute("DELETE FROM conversations WHERE id=? AND NOT EXISTS"
+                    " (SELECT 1 FROM messages WHERE conversation_id=?)", (conv_id, conv_id))
+
+
+def history(conv_id):
+    """A conversation's questions and answers as the model is sent them, oldest first:
+    [{role, content}], each question as it was sent (excerpts and all, byte for byte, so
+    Claude's prompt cache still hits). An empty answer is left out with its question:
+    Claude refuses an empty turn."""
+    with connect() as con:
+        rows = con.execute("SELECT role, content, sent FROM messages WHERE conversation_id=? ORDER BY id",
+                           (conv_id,)).fetchall()
+    turns = []
+    for q, a in zip(rows[::2], rows[1::2]):  # saved in pairs
+        if q["role"] == "user" and a["role"] == "assistant" and a["content"].strip():
+            turns += [{"role": "user", "content": q["sent"] or q["content"]},
+                      {"role": "assistant", "content": a["content"]}]
+    return turns
+
+
+_CONVERSATION = ("c.id, c.title, c.created_at, c.updated_at, c.model, c.doc_ids, (SELECT count(*) FROM messages m"
+                 " WHERE m.conversation_id = c.id AND m.role = 'user') AS questions")
+
+
+def _conversation(row):
+    c = dict(row)
+    c["doc_ids"] = None if c["doc_ids"] is None else json.loads(c["doc_ids"])
+    return c
+
+
+def list_conversations(limit=500):
+    """The latest conversations, the one asked last first, with how many questions each has."""
+    with connect() as con:
+        return [_conversation(r) for r in con.execute(
+            f"SELECT {_CONVERSATION} FROM conversations c ORDER BY c.updated_at DESC, c.id DESC LIMIT ?", (limit,))]
+
+
+def get_conversation(conv_id, messages=True):
+    """A conversation as list_conversations has it, with its messages in order (questions:
+    id, role, content, created_at; answers also their sources, model, usage, status and
+    error). None if there is no such conversation."""
+    with connect() as con:
+        row = con.execute(f"SELECT {_CONVERSATION} FROM conversations c WHERE c.id=?", (conv_id,)).fetchone()
+        if not row:
+            return None
+        c = _conversation(row)
+        if messages:
+            c["messages"] = [_message(r) for r in con.execute(
+                "SELECT id, role, content, sources, model, model_label, switched, usage, status, error, created_at"
+                " FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))]
+            _mark_gone(con, c["messages"])
+    return c
+
+
+def _mark_gone(con, messages):
+    """Answers' sources whose document has been deleted since, or whose id a later upload was
+    given (SQLite reuses the highest one), are marked gone: their file can't be opened from
+    here any more. The passages the answer was given are kept with it all the same."""
+    ids = {s["doc_id"] for m in messages for s in m.get("sources") or ()}
+    if not ids:
+        return
+    now = dict(con.execute("SELECT id, filename FROM documents WHERE id IN (SELECT value FROM json_each(?))",
+                           (json.dumps(list(ids)),)).fetchall())
+    for m in messages:
+        for item in [*(m.get("sources") or ()), *(m.get("excerpts") or ())]:
+            if now.get(item["doc_id"]) != item["filename"]:
+                item.update(has_file=False, pdf=False, gone=True)
+
+
+def _message(row):
+    m = dict(row)
+    if m["role"] == "user":
+        return {k: m[k] for k in ("id", "role", "content", "created_at")}
+    m["usage"] = json.loads(m["usage"]) if m["usage"] else None
+    found = json.loads(m.pop("sources") or "null") or {}
+    return {**m, **{k: found.get(k) for k in ("sources", "excerpts", "overview", "scope", "scope_names")}}
+
+
+def rename_conversation(conv_id, title):
+    with connect() as con:
+        return con.execute("UPDATE conversations SET title=? WHERE id=?", (title, conv_id)).rowcount > 0
+
+
+def delete_conversation(conv_id):
+    """Delete a conversation and its messages. Its model calls stay in the usage log."""
+    with connect() as con:
+        return con.execute("DELETE FROM conversations WHERE id=?", (conv_id,)).rowcount > 0
 
 
 # ---- operator instructions added to the chat system prompt ----

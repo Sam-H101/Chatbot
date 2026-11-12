@@ -300,11 +300,10 @@ def _attr(name):
     return name.replace('"', "'")
 
 
-def chat(client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):
-    """history: prior [{role, content}] turns exactly as previously sent, so the
-    conversation prefix is byte-identical between requests and hits the cache.
-    Returns (answer, usage); on_usage also hears of a refusal, which is billed."""
-    with client.beta.messages.stream(
+def _chat_request(client, history, user_message, model, system):
+    """The chat request, streamed: chat() and chat_stream() send the same one, so either
+    reads the other's prompt cache."""
+    return client.beta.messages.stream(
         model=model,
         max_tokens=16000,
         system=system,
@@ -312,10 +311,51 @@ def chat(client, history, user_message, model=MODEL, system=SYSTEM, on_usage=Non
         output_config={"effort": EFFORT},
         messages=[*history, {"role": "user", "content": user_message}],
         **_fallback(model),
-    ) as stream:
+    )
+
+
+def chat(client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):
+    """history: prior [{role, content}] turns exactly as previously sent, so the
+    conversation prefix is byte-identical between requests and hits the cache.
+    Returns (answer, usage); on_usage also hears of a refusal, which is billed."""
+    with _chat_request(client, history, user_message, model, system) as stream:
         response = stream.get_final_message()
     _report(on_usage, "chat", model, response)
     return _text(response), _usage(response)
+
+
+def chat_stream(client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):
+    """chat(), a piece at a time: yields the answer's text as Claude writes it (after a
+    server-side fallback, the fallback model's text carries on from the declined one's),
+    and returns its usage. on_usage hears of the call however it ends. One that ends early
+    (the generator closed because the user stopped it, or the stream broke off) is reported
+    with the input Claude counted at its start and the output estimated from the text so
+    far, about 4 characters a token; one that never started (say a bad key) is not. A
+    refusal is reported, then raised after the text already yielded: the caller drops it."""
+    text, response = [], None
+    with _chat_request(client, history, user_message, model, system) as stream:
+        try:
+            for piece in stream.text_stream:
+                text.append(piece)
+                yield piece
+            response = stream.get_final_message()
+        finally:
+            if response is None and on_usage and (usage := _usage_so_far(stream, "".join(text))):
+                on_usage("chat", "claude", model, usage)
+    _report(on_usage, "chat", model, response)
+    _text(response)  # raises Refused
+    return _usage(response)
+
+
+def _usage_so_far(stream, text):
+    """The usage of a stream that ended early, None if it had not started (no message_start:
+    nothing billed). Output tokens are only counted at the end, so they are estimated."""
+    try:
+        usage = _usage(stream.current_message_snapshot)
+    except Exception:  # no snapshot yet
+        return None
+    usage["output"] = max(usage["output"], round(len(text) / 4))
+    return usage
 
 
 def client_for(api_key):

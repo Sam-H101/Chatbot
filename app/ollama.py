@@ -1,6 +1,7 @@
 """Local models through Ollama: the same jobs as llm.py, with no API key and
 nothing leaving the machine. Talks to Ollama's HTTP API with the standard library."""
 import base64
+import http.client
 import json
 import os
 import re
@@ -65,37 +66,78 @@ class ContextExceeded(OllamaError, sections.TooLong):
     the start of the context (shift); sections.py then reads the text in smaller pieces."""
 
 
-def _chat(model, messages, think=None, temperature=None, num_predict=None, **extra):
+def _chat_body(model, messages, think=None, temperature=None, num_predict=None, stream=False, **extra):
     options = {"num_ctx": NUM_CTX}
     if temperature is not None:
         options["temperature"] = temperature
     if num_predict is not None:  # the most tokens the reply may have
         options["num_predict"] = num_predict
-    body = {"model": model, "messages": messages, "stream": False,
+    body = {"model": model, "messages": messages, "stream": stream,
             "keep_alive": KEEP_ALIVE, "options": options, **extra}
     if think is not None:  # only sent to models that support thinking
         body["think"] = think
-    return _post("/api/chat", body)
+    return body
+
+
+def _chat(model, messages, **kw):
+    return _post("/api/chat", _chat_body(model, messages, **kw))
+
+
+def _request(path, body):
+    return urllib.request.Request(f"{URL}{path}", data=json.dumps(body).encode(),
+                                  headers={"Content-Type": "application/json"})
+
+
+def _http_error(model, e):
+    """The OllamaError for an error status from Ollama."""
+    detail = e.read().decode(errors="replace")
+    try:
+        detail = json.loads(detail).get("error", detail)
+    except ValueError:
+        pass
+    # "request (17012 tokens) exceeds the available context size (16384 tokens)": truncate=False
+    error = ContextExceeded if re.search(r"exceeds .*context", str(detail), re.I) else OllamaError
+    return error(f"{model}: {detail}")
 
 
 def _post(path, body, timeout=TIMEOUT):
     model = body["model"]
-    req = urllib.request.Request(f"{URL}{path}", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(_request(path, body), timeout=timeout) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:  # before URLError: it is a subclass
-        detail = e.read().decode(errors="replace")
-        try:
-            detail = json.loads(detail).get("error", detail)
-        except ValueError:
-            pass
-        # "request (17012 tokens) exceeds the available context size (16384 tokens)": truncate=False
-        error = ContextExceeded if re.search(r"exceeds .*context", str(detail), re.I) else OllamaError
-        raise error(f"{model}: {detail}") from e
+        raise _http_error(model, e) from e
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         raise OllamaUnavailable(f"Could not reach Ollama at {URL}") from e
+
+
+def _stream(model, messages, **kw):
+    """/api/chat streamed: Ollama's reply chunks as they come, the last one marked done
+    with the token counts. An error before the first chunk (Ollama down, model not pulled)
+    is raised as _post raises it; one after it as an OllamaError saying the answer broke off."""
+    try:
+        r = urllib.request.urlopen(_request("/api/chat", _chat_body(model, messages, stream=True, **kw)),
+                                   timeout=TIMEOUT)
+    except urllib.error.HTTPError as e:
+        raise _http_error(model, e) from e
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        raise OllamaUnavailable(f"Could not reach Ollama at {URL}") from e
+    with r:  # closing it (the generator closed: the user stopped the answer) stops Ollama writing
+        while True:
+            try:
+                line = r.readline()
+                chunk = json.loads(line) if line.strip() else None
+            except (OSError, ValueError, http.client.HTTPException) as e:  # timeouts and resets are OSErrors
+                raise OllamaError(f"{model}: the answer broke off ({e or type(e).__name__})") from e
+            if not line:
+                raise OllamaError(f"{model}: the answer broke off before its end")
+            if chunk is None:
+                continue
+            if chunk.get("error"):  # say the model ran out of memory part way
+                raise OllamaError(f"{model}: {chunk['error']}")
+            yield chunk
+            if chunk.get("done"):
+                return
 
 
 def models():
@@ -221,3 +263,27 @@ def chat(_client, history, user_message, model=MODEL, system=SYSTEM, on_usage=No
     if on_usage:
         on_usage("chat", "ollama", model, usage)
     return r["message"]["content"], usage
+
+
+def chat_stream(_client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):
+    """Same contract as llm.chat_stream: yields the answer's text as the model writes it,
+    and returns its usage. Ollama counts tokens only in its last chunk, so an answer that
+    ends early (stopped, or broken off) is reported with both counts estimated (tokens);
+    one that failed before its first words (Ollama down) is not reported."""
+    messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": user_message}]
+    text, usage = [], None
+    try:
+        for chunk in _stream(model, messages, think=False):
+            piece = (chunk.get("message") or {}).get("content") or ""
+            if piece:
+                text.append(piece)
+                yield piece
+            if chunk.get("done"):
+                usage = _usage(chunk)
+    finally:
+        if usage is None and text:
+            usage = {"input": sum(tokens(m["content"]) for m in messages), "output": tokens("".join(text)),
+                     "cache_read": 0, "cache_write": 0}
+        if usage and on_usage:
+            on_usage("chat", "ollama", model, usage)
+    return usage

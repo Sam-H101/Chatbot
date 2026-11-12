@@ -1,14 +1,19 @@
 """HTTP API + single-page UI. Uploads and re-reads are queued as jobs (see jobs.py)."""
+import itertools
+import json
+import logging
 import mimetypes
 import os
 import re
 from urllib.parse import urlsplit
 
 import anthropic
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, jsonify, request, send_file, send_from_directory, stream_with_context
 from werkzeug.routing import IntegerConverter
 
 from . import db, extract, jobs, llm, ollama, vectors
+
+log = logging.getLogger(__name__)
 
 
 class RowId(IntegerConverter):
@@ -36,6 +41,8 @@ INLINE_TYPES = {"application/pdf", "text/plain"}
 mimetypes.add_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx")
 mimetypes.add_type("text/plain", ".log")
 MissingKey = llm.MissingKey
+# Most characters of a new conversation's title, taken from its first question.
+TITLE_CHARS = 80
 
 
 class BadChoice(ValueError):
@@ -99,12 +106,18 @@ def _choice(raw):
     raise BadChoice(f"Unknown model choice: {raw}")
 
 
+def _choice_text(choice):
+    """(backend, model) -> 'auto' | 'ollama:<model>' | 'claude:<model>', as jobs and conversations keep it."""
+    backend, model = choice
+    return "auto" if backend == "auto" else f"{backend}:{model}"
+
+
 def _job_choice(raw):
     """A model choice for a job, checked now: a Claude model needs a key up front."""
-    backend, model = _choice(raw)
-    if backend == "claude" and not _has_key():
+    choice = _choice(raw)
+    if choice[0] == "claude" and not _has_key():
         raise MissingKey()
-    return "auto" if backend == "auto" else f"{backend}:{model}"
+    return _choice_text(choice)
 
 
 def _claude_pages(raw):
@@ -122,7 +135,9 @@ def _run(choice, fn, fits_local=True):
     """Run fn(backend, model) for the chosen chat model. Auto runs locally and switches
     to Claude when the prompt is too long for the local model or Ollama fails, provided
     a Claude key is available. Returns (result, model used, why it switched or None).
-    Uploads do the same in the background (jobs._read)."""
+    A streamed answer's fn starts the stream and waits for its first piece, so Ollama
+    failing before it writes anything switches too (_answer_events). Uploads do the same
+    in the background (jobs._read)."""
     backend, model = choice
     if backend != "auto":
         return fn(backend, model), (backend, model), None
@@ -152,59 +167,50 @@ def _clean_name(name):
     return re.sub(r"[\x00-\x1f\x7f]+", " ", name or "").strip()
 
 
-@app.errorhandler(MissingKey)
-def _no_key(e):
-    return jsonify(error="Enter your Claude API key first"), 401
+class NotFound(LookupError):
+    pass
+
+
+def _failure(e):
+    """(what went wrong, HTTP status) for an error a request or a model call raises; None
+    for an unexpected one. A streamed answer sends it as its error event."""
+    if isinstance(e, MissingKey):
+        return "Enter your Claude API key first", 401
+    if isinstance(e, (BadChoice, extract.Unsupported)):
+        return str(e), 400
+    if isinstance(e, NotFound):
+        return str(e), 404
+    if isinstance(e, anthropic.AuthenticationError):
+        return "Invalid Claude API key", 401
+    if isinstance(e, anthropic.RateLimitError):
+        return "Rate limited by the Claude API, try again shortly", 429
+    if isinstance(e, anthropic.APIStatusError):
+        return f"Claude API error: {e.message}", 502
+    if isinstance(e, anthropic.APIConnectionError):
+        return "Could not reach the Claude API", 502
+    if isinstance(e, llm.Refused):
+        return f"{e}. Try rewording it, or another model.", 502
+    if isinstance(e, ollama.OllamaUnavailable):
+        return f"{e}. Is it running?", 502
+    if isinstance(e, ollama.OllamaError):
+        return f"Ollama error: {e}", 502
+    return None
+
+
+def _error_reply(e):
+    error, status = _failure(e)
+    return jsonify(error=error), status
+
+
+for _cls in (MissingKey, BadChoice, extract.Unsupported, NotFound, anthropic.AuthenticationError,
+             anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError, llm.Refused,
+             ollama.OllamaError):  # the most specific handler wins, so each gets _failure's wording
+    app.register_error_handler(_cls, _error_reply)
 
 
 @app.errorhandler(413)
 def _too_large(e):
     return jsonify(error=f"File is larger than the {MAX_UPLOAD_MB} MB upload limit (MAX_UPLOAD_MB)"), 413
-
-
-@app.errorhandler(BadChoice)
-def _bad_choice(e):
-    return jsonify(error=str(e)), 400
-
-
-@app.errorhandler(extract.Unsupported)
-def _unsupported(e):
-    return jsonify(error=str(e)), 400
-
-
-@app.errorhandler(anthropic.AuthenticationError)
-def _bad_key(e):
-    return jsonify(error="Invalid Claude API key"), 401
-
-
-@app.errorhandler(anthropic.RateLimitError)
-def _rate_limited(e):
-    return jsonify(error="Rate limited by the Claude API, try again shortly"), 429
-
-
-@app.errorhandler(anthropic.APIStatusError)
-def _api_error(e):
-    return jsonify(error=f"Claude API error: {e.message}"), 502
-
-
-@app.errorhandler(anthropic.APIConnectionError)
-def _no_network(e):
-    return jsonify(error="Could not reach the Claude API"), 502
-
-
-@app.errorhandler(llm.Refused)
-def _refused(e):
-    return jsonify(error=f"{e}. Try rewording it, or another model."), 502
-
-
-@app.errorhandler(ollama.OllamaUnavailable)
-def _ollama_down(e):
-    return jsonify(error=f"{e}. Is it running?"), 502
-
-
-@app.errorhandler(ollama.OllamaError)
-def _ollama_error(e):
-    return jsonify(error=f"Ollama error: {e}"), 502
 
 
 @app.before_request
@@ -521,53 +527,230 @@ def _cited(hits):
     return excerpts, list(sources.values())
 
 
-@app.post("/api/chat")
-def chat():
-    """Answer a question from the passages that best match it, by keywords and by meaning
-    (vectors.search), in all documents or only those in doc_ids."""
-    body = _body()
+def _title(question):
+    """A new conversation's title: its first question on one line, cut at a word."""
+    title = " ".join(question.split())
+    if len(title) <= TITLE_CHARS:
+        return title
+    return title[:TITLE_CHARS - 1].rsplit(" ", 1)[0].rstrip(" ,.;:") + "…"
+
+
+def _question(body):
+    """A question's request, checked: (question, model choice, scope, conversation or None,
+    history). A saved conversation's history comes from the database, so a client's
+    `history` is ignored then; without conversation_id (a new chat, or an API client that
+    keeps its own), the client's is used: the turns earlier answers returned."""
     question = body.get("question")
     question = question.strip() if isinstance(question, str) else ""
     if not question:
-        return jsonify(error="Empty question"), 400
-    choice = _choice(body.get("model"))
-    scope = _scope(body.get("doc_ids"))
+        raise BadChoice("Empty question")
+    choice, scope = _choice(body.get("model")), _scope(body.get("doc_ids"))
+    conv_id = body.get("conversation_id")
+    if conv_id is not None:
+        if not isinstance(conv_id, int) or isinstance(conv_id, bool):
+            raise BadChoice("conversation_id must be the id of a conversation")
+        conv = -2**63 <= conv_id < 2**63 and db.get_conversation(conv_id, messages=False)
+        if not conv:
+            raise NotFound("This conversation was deleted.")
+        return question, choice, scope, conv, db.history(conv_id)
     history = body.get("history") or []
     if not isinstance(history, list) or not all(
             isinstance(t, dict) and t.get("role") in ("user", "assistant") and isinstance(t.get("content"), str)
             for t in history):
         raise BadChoice("history must be a list of turns, as earlier answers returned them")
+    return question, choice, scope, None, history
+
+
+def _prompt(question, scope, history, on_usage):
+    """What the model is sent for a question: (system prompt, the user turn with the passages
+    that best match it, by keywords and by meaning (vectors.search), what the page shows of
+    them (sources, excerpts, ...), whether it all fits the local model's context)."""
     system = llm.system_prompt(db.active_instructions())
+    hits = vectors.search(question, int(os.environ.get("TOP_K", "5")), scope and list(scope), on_usage=on_usage)
+    # No passage at all ("Summarise everything in my library", or small talk): the model is
+    # given the documents' titles and summaries instead, so it can say what the library holds.
+    library = db.library_overview() if not hits and scope is None else None
+    user_message = llm.build_user_message(question, hits, scope and list(scope.values()), library)
+    excerpts, sources = _cited(hits)
+    found = {"sources": sources, "excerpts": excerpts,
+             "overview": bool(library and library[1]),  # given the library's summaries instead of passages
+             "scope": scope and list(scope), "scope_names": scope and list(scope.values())}
+    fits = ollama.fits([{"content": system}, *history, {"content": user_message}])
+    return system, user_message, found, fits
+
+
+def _save(conv, question, user_message, text, found, choice, used, note, usage, status="done", error=None):
+    """Keep a question and its answer in their conversation, a new one (titled by the
+    question) when conv is None. Returns {conversation_id, title}, both None when it couldn't
+    be kept (the conversation was deleted meanwhile, or the database stayed locked): the
+    answer is given all the same."""
+    answer = {"content": text, "sources": found, "usage": usage, "status": status, "error": error,
+              **jobs.used(used, note)}
+    try:
+        conv_id = db.add_exchange(conv and conv["id"], question, user_message, answer, model=_choice_text(choice),
+                                  doc_ids=found["scope"], title=_title(question))
+    except Exception:
+        log.exception("Could not keep an answer in its conversation")
+        conv_id = None
+    title = (conv["title"] if conv else _title(question)) if conv_id else None
+    return {"conversation_id": conv_id, "title": title}
+
+
+def _turns(user_message, text):
+    # What an API client without conversation_id sends back as `history` next time.
+    return [{"role": "user", "content": user_message}, {"role": "assistant", "content": text}]
+
+
+@app.post("/api/chat")
+def chat():
+    """Answer a question from the passages that best match it, in all documents or only
+    those in doc_ids, and keep both in the conversation conversation_id (a new one without).
+    The whole answer at once; /api/chat/stream sends it as it is written."""
+    question, choice, scope, conv, history = _question(_body())
     calls = []
 
     def on_usage(*call):
         calls.append(jobs.priced(*call))
 
     try:
-        hits = vectors.search(question, int(os.environ.get("TOP_K", "5")), scope and list(scope), on_usage=on_usage)
-        # No passage at all ("Summarise everything in my library", or small talk): the model is
-        # given the documents' titles and summaries instead, so it can say what the library holds.
-        library = db.library_overview() if not hits and scope is None else None
-        user_message = llm.build_user_message(question, hits, scope and list(scope.values()), library)
+        system, user_message, found, fits = _prompt(question, scope, history, on_usage)
 
         def answer(backend, model):
             if backend == "ollama":
                 return ollama.chat(None, history, user_message, model, system=system, on_usage=on_usage)
             return llm.chat(_client(), history, user_message, model, system=system, on_usage=on_usage)
 
-        fits = ollama.fits([{"content": system}, *history, {"content": user_message}])
         (text, usage), used, note = _run(choice, answer, fits_local=fits)
     finally:
         jobs.log_usage(calls)  # the question's embedding, and a refused Claude answer (billed too)
-    excerpts, sources = _cited(hits)
-    return jsonify(
-        answer=text,
-        usage=usage,
-        sources=sources,
-        excerpts=excerpts,
-        overview=bool(library and library[1]),  # given the library's summaries instead of passages
-        scope=scope and list(scope),
-        **jobs.used(used, note),
-        # The client stores these and sends them back as `history` next turn.
-        turns=[{"role": "user", "content": user_message}, {"role": "assistant", "content": text}],
-    )
+    return jsonify(answer=text, usage=usage, **found, **jobs.used(used, note),
+                   **_save(conv, question, user_message, text, found, choice, used, note, usage),
+                   turns=_turns(user_message, text))
+
+
+@app.post("/api/chat/stream")
+def chat_stream():
+    """/api/chat, sent as it is written: Server-Sent Events (text/event-stream), each with
+    a JSON data line. "meta" when the model has begun: the conversation, the model, why
+    Auto switched, the sources; "delta": the next piece of the answer's text; then "done"
+    (the answer, its usage, the conversation) or "error" ({error, status, kept}: kept when
+    the text so far stands). A request that is wrong (an empty question, an unknown model,
+    a deleted conversation, a Claude model and no key) gets a plain HTTP error instead,
+    as from /api/chat. Closing the stream stops the answer, which is kept as far as it got.
+    Nothing may buffer it on the way: no-cache, and X-Accel-Buffering for nginx-like proxies."""
+    question, choice, scope, conv, history = _question(_body())
+    if choice[0] == "claude" and not _has_key():
+        raise MissingKey()
+    events = _answer_events(question, choice, scope, conv, history)
+    return Response(stream_with_context(_sse(events)), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _sse(events):
+    """Events as Server-Sent Events. A comment goes first, so the headers leave at once."""
+    try:
+        yield ": answering\n\n"
+        for name, data in events:
+            yield f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    finally:
+        events.close()  # the page went away: the answer stops and is kept (_answer_events)
+
+
+def _answer_events(question, choice, scope, conv, history):
+    """A streamed answer's events (chat_stream). Auto picks its model as _run does: by the
+    fits check, and by switching to Claude when Ollama fails before its first words; a model
+    that fails after them ends the answer where it got to. The question and its answer are
+    kept in the conversation when the answer is done, stopped (the stream closed:
+    GeneratorExit) or broken off part way (an error event with kept: true); not when nothing
+    was written, nor after a refusal, whose words are dropped (kept: false). A new
+    conversation is made just before "meta", so the page has its id even if it stops the
+    answer; it goes again if nothing ends up in it."""
+    calls, pieces, gen, found, used, note, status, error, made = [], [], None, None, None, None, None, None, False
+
+    def on_usage(*call):
+        calls.append(jobs.priced(*call))
+
+    try:
+        system, user_message, found, fits = _prompt(question, scope, history, on_usage)
+
+        def begin(backend, model):  # the model's stream, and its first piece ([] if it wrote nothing)
+            if backend == "ollama":
+                g = ollama.chat_stream(None, history, user_message, model, system=system, on_usage=on_usage)
+            else:
+                g = llm.chat_stream(_client(), history, user_message, model, system=system, on_usage=on_usage)
+            return g, list(itertools.islice(g, 1))
+
+        (gen, first), used, note = _run(choice, begin, fits_local=fits)
+        if conv is None:
+            conv = {"id": db.add_conversation(_title(question), _choice_text(choice), found["scope"]),
+                    "title": _title(question)}
+            made = True
+        yield "meta", {"conversation_id": conv["id"], "title": conv["title"], **found, **jobs.used(used, note)}
+        for piece in itertools.chain(first, gen):
+            pieces.append(piece)
+            yield "delta", piece
+        status = "done"
+    except GeneratorExit:  # stopped: the page closed the stream
+        status = "stopped"
+        raise
+    except Exception as e:
+        status = "broken" if pieces and not isinstance(e, llm.Refused) else "failed"
+        error = _failure(e)
+        if not error:
+            log.exception("A streamed answer failed")
+            error = f"The answer failed: {e}", 500
+    finally:
+        try:  # the model's stream ends with the answer, however it ended, and reports what it used
+            if gen:
+                gen.close()
+        except Exception:
+            log.exception("Could not close an answer's stream")
+        jobs.log_usage(calls)
+        text = "".join(pieces)
+        usage = next((c[3] for c in reversed(calls) if c[0] == "chat"), None)
+        if status == "done" or (status in ("stopped", "broken") and text):
+            saved = _save(conv, question, user_message, text, found, choice, used, note, usage, status,
+                          error and error[0])
+        elif made:
+            db.drop_empty_conversation(conv["id"])
+    if status == "done":
+        yield "done", {"answer": text, "usage": usage, **saved, "turns": _turns(user_message, text)}
+    else:
+        yield "error", {"error": error[0], "status": error[1], "kept": status == "broken"}
+
+
+# ---- saved conversations ----
+
+@app.get("/api/conversations")
+def conversation_list():
+    """Saved conversations, the one asked last first: id, title, created_at, updated_at,
+    model (the choice of its last question), doc_ids (the documents it was limited to:
+    null for all, [] when they were all deleted) and questions (how many it has)."""
+    return jsonify(db.list_conversations())
+
+
+@app.get("/api/conversations/<id:conv_id>")
+def conversation_get(conv_id):
+    """A conversation and its messages, oldest first: each question as asked, and its
+    answer with the sources, excerpts, model, usage and status (done, stopped or broken)."""
+    c = db.get_conversation(conv_id)
+    return jsonify(c) if c else (jsonify(error="Not found"), 404)
+
+
+@app.patch("/api/conversations/<id:conv_id>")
+def conversation_rename(conv_id):
+    title = _body().get("title")
+    title = " ".join(title.split()) if isinstance(title, str) else ""
+    if not title:
+        raise BadChoice("A conversation's title can't be empty")
+    if len(title) > 200:
+        raise BadChoice("Title is too long (200 characters at most)")
+    if not db.rename_conversation(conv_id, title):
+        return jsonify(error="Not found"), 404
+    return jsonify(db.get_conversation(conv_id, messages=False))
+
+
+@app.delete("/api/conversations/<id:conv_id>")
+def conversation_delete(conv_id):
+    """Delete a conversation and its messages; its model calls stay in the usage log."""
+    return ("", 204) if db.delete_conversation(conv_id) else (jsonify(error="Not found"), 404)

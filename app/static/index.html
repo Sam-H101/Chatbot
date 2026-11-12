@@ -27,7 +27,7 @@
   }
   * { box-sizing: border-box; }
   body { margin: 0; font: 15px/1.55 var(--sans); background: var(--paper); color: var(--ink);
-         display: grid; grid-template-columns: 360px 1fr; height: 100dvh; }
+         display: grid; grid-template-columns: 360px auto 1fr; height: 100dvh; }
   button, input, textarea { font: inherit; color: inherit; }
   button { cursor: pointer; border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: 6px 13px; }
   button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
@@ -40,7 +40,7 @@
   .muted { color: var(--soft); font-size: 13px; }
 
   /* ---- shelf (left) ---- */
-  aside { border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  aside { grid-column: 1; border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
   .brand { padding: 20px 20px 14px; display: flex; align-items: baseline; gap: 10px; }
   .brand h1 { font: 600 24px/1 var(--serif); margin: 0; letter-spacing: -.01em; }
   .brand h1 i { color: var(--accent); }
@@ -92,10 +92,42 @@
   .hit { font-size: 13px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; }
   mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 2px; }
 
+  /* ---- saved conversations: a column beside the chat on wide screens (Chats hides it), a drawer below 1280px ---- */
+  #chats { grid-column: 2; width: 250px; border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; background: var(--paper); }
+  .chatshead { display: flex; align-items: center; gap: 8px; padding: 20px 14px 8px 16px; min-height: 58px; }
+  .chatshead .grow { flex: 1; }
+  #chatsnew, #chatsclose { display: none; }
+  @media (min-width: 1280px) { body.nochats #chats { display: none; } }
+  @media (max-width: 1279px) {
+    #chats { position: fixed; inset: 0 auto 0 0; width: min(330px, 90vw); z-index: 10; transform: translateX(-100%);
+             visibility: hidden; transition: transform .2s, visibility .2s; }
+    body.chatsopen #chats { transform: none; visibility: visible; box-shadow: 0 0 0 100vw #0006; }
+    #chatsclose { display: grid; }
+  }
+  #chatlist { flex: 1; overflow-y: auto; padding: 2px 10px 16px; display: grid; gap: 3px; align-content: start; }
+  #chatlist > .muted { padding: 4px 6px; }
+  .conv { display: flex; align-items: center; min-width: 0; border: 1px solid transparent; border-radius: 10px; }
+  .conv:hover { background: var(--card); border-color: var(--line); }
+  .conv.on { background: var(--card); border-color: var(--accent); }
+  button.cbtn { flex: 1; min-width: 0; display: grid; gap: 1px; text-align: left; border: 0; border-radius: 10px; background: none; padding: 7px 2px 7px 10px; }
+  button.cbtn:hover:not(:disabled) { color: inherit; }
+  .cbtn b { font-weight: 500; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .conv.on .cbtn b { font-weight: 600; }
+  .cbtn small { font: 11px/1.3 var(--mono); color: var(--soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .conv .x { flex: none; border: 0; background: none; padding: 4px 6px; color: var(--soft); opacity: 0; }
+  .conv .x:last-child { margin-right: 3px; }
+  .conv:hover .x, .conv:focus-within .x, .conv.on .x, .conv .x.sure { opacity: 1; }
+  .conv .x.sure { color: var(--bad); font-size: 12px; font-weight: 600; }
+  .conv input { flex: 1; min-width: 0; margin: 3px; padding: 6px 8px; border: 1px solid var(--accent); border-radius: 8px; background: var(--paper); font-size: 13.5px; }
+  .conv input:focus { outline: 0; }
+  @media (pointer: coarse) { .conv .x { opacity: 1; padding: 10px 8px; } }
+
   /* ---- desk (right) ---- */
-  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  main { grid-column: 3; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   header { display: flex; align-items: center; gap: 8px; padding: 12px 20px; border-bottom: 1px solid var(--line); }
   header .grow { flex: 1; }
+  #chatsbtn[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+  #convtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 600 16px/1.3 var(--serif); }
   #menu { display: none; position: relative; }
   /* On a phone the upload list is in the closed drawer: the ☰ button counts jobs under way or waiting for you. */
   #jobcount:not(:empty) { position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 5px;
@@ -120,6 +152,11 @@
   .turn .foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0 0 18px; }
   .turn .foot .tok { font: 11px/1 var(--mono); color: var(--soft); margin-left: auto; }
   .turn .foot button { font-size: 12px; padding: 3px 10px; }
+  .turn.bot.live .body::after { content: "▍"; color: var(--accent); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .switched.bad { color: var(--bad); }
+  #stop { font-weight: 600; border-color: var(--accent); color: var(--accent); white-space: nowrap; }
+  #stop::before { content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 7px; border-radius: 2px; background: currentColor; }
   .dots i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 4px; animation: bob 1s infinite; }
   .dots i:nth-child(2) { animation-delay: .15s; } .dots i:nth-child(3) { animation-delay: .3s; }
   @keyframes bob { 50% { transform: translateY(-5px); opacity: .4; } }
@@ -251,26 +288,33 @@
   .svfoot { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; padding: 12px 18px; border-top: 1px solid var(--line); }
   .svfoot .grow { flex: 1; }
   .turn.user .scoped { font-size: 12px; color: var(--soft); max-width: 85%; overflow-wrap: anywhere; text-align: right; }
-  header button { white-space: nowrap; }
+  header button { white-space: nowrap; flex: none; }  /* only the conversation's title gives way */
   header .narrow { display: none; }
   @media (max-width: 820px) {
     #rulesview, #usageview, #unitsview, #sourceview, #scopeview { width: 100vw; max-width: 100vw; max-height: 100dvh; height: 100dvh; border-radius: 0; }
     .ubody { padding: 12px 16px 16px; }
     .utable th, .utable td { padding: 6px 5px; }
+  }
+  @media (max-width: 1100px) {  /* the chat beside the library: no room for the conversation's title */
     header { gap: 6px; padding: 10px 12px; }
-    header .label { display: none; }
     header button:not(.icon) { padding: 5px 10px; font-size: 13px; }
+    #convtitle { display: none; }
   }
   @media (max-width: 820px) { #tableview { width: 100vw; height: 100dvh; border-radius: 0; } .tvbody { padding: 10px 16px; } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
   @media (max-width: 820px) {
     body { grid-template-columns: 1fr; }
+    main { grid-column: 1; }
     aside { position: fixed; inset: 0 auto 0 0; width: min(360px, 90vw); background: var(--paper); z-index: 10; transform: translateX(-100%); transition: transform .2s; }
     body.shelf aside { transform: none; box-shadow: 0 0 0 100vw #0006; }
     #menu { display: grid; }
     .empty h2 { font-size: 26px; }
+    /* The header has no room for New chat: it is at the top of the Chats drawer. */
+    .chatshead { padding: 14px 12px 8px 16px; }
+    #chatsnew { display: inline-block; }
+    #newchat { display: none; }
   }
-  @media (max-width: 480px) {  /* five buttons and two icons on one phone-wide row */
+  @media (max-width: 480px) {  /* four buttons and two icons on one phone-wide row (New chat is in the Chats drawer) */
     .hint .keys { display: none; }  /* no Enter key to speak of on a phone */
     header { gap: 4px; }
     header button.icon { flex: none; width: 32px; height: 32px; }
@@ -279,7 +323,7 @@
   /* Short labels, so the row still fits with the instruction count on the Instructions button. */
   @media (max-width: 420px) { header .wide { display: none; } header .narrow { display: inline; } }
   @media (max-width: 340px) {
-    header { padding: 10px 8px; }
+    header { padding: 10px 8px; gap: 2px; }
     header button:not(.icon) { padding: 5px 6px; }
     header button.icon { width: 30px; }
     #rulecount:not(:empty) { margin-left: 3px; padding: 2px 4px; }
@@ -301,12 +345,22 @@
   <div class="shelfhead"><span class="label">Library</span><input id="q" type="search" placeholder="Search titles and text…" aria-label="Search documents"><button id="tablebtn" type="button" title="Show all documents in a table">Table</button></div>
   <div id="docs"></div>
 </aside>
+<nav id="chats" aria-label="Saved conversations">
+  <div class="chatshead">
+    <span class="label">Chats</span>
+    <span class="grow"></span>
+    <button class="primary" id="chatsnew" type="button">New chat</button>
+    <button class="icon" id="chatsclose" type="button" aria-label="Close the conversations">✕</button>
+  </div>
+  <div id="chatlist"></div>
+</nav>
 <main>
   <header>
     <button class="icon" id="menu" type="button" aria-label="Show library">☰<span id="jobcount"></span></button>
-    <span class="label">Conversation</span>
+    <button id="chatsbtn" type="button" aria-controls="chats" aria-expanded="false" title="Saved conversations">Chats</button>
+    <span id="convtitle">New conversation</span>
     <span class="grow"></span>
-    <button id="newchat" type="button" title="Start a new conversation">New<span class="wide"> chat</span></button>
+    <button id="newchat" type="button" title="Start a new conversation">New chat</button>
     <button id="rulesbtn" type="button" title="Instructions added to every question">Instructions<span id="rulecount"></span></button>
     <button id="usagebtn" type="button" title="Model calls, tokens and cost">Usage</button>
     <button id="keybtn" type="button" title="Claude API key"><span id="keydot"></span><span class="wide">API key</span><span class="narrow">Key</span></button>
@@ -404,6 +458,7 @@
     <div class="composer">
       <textarea id="question" rows="1" placeholder="Ask about your documents…" aria-label="Question"></textarea>
       <button class="primary" id="send">Ask</button>
+      <button id="stop" type="button" hidden title="Stop the answer here">Stop</button>
     </div>
     <div class="hint muted">
       <label class="pick">Answer with <select id="chatModel" aria-label="Model that answers questions"></select></label>
@@ -419,7 +474,7 @@ const store = { get: k => { try { return localStorage.getItem(k); } catch { retu
                 set: (k, v) => { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch {} } };
 const key = $('key');
 key.value = store.get('claudeKey') || '';
-let history = [], busy = false;
+let busy = false;
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { 'X-API-Key': key.value, ...(opts.headers || {}) } });
@@ -479,7 +534,12 @@ key.oninput = () => { store.set('claudeKey', key.value); showKey(); fillPickers(
 $('keybtn').onclick = () => { $('settings').hidden = !$('settings').hidden; if (!$('settings').hidden) key.focus(); };
 $('keydone').onclick = () => $('settings').hidden = true;
 $('keyclear').onclick = () => { key.value = ''; key.oninput(); key.focus(); };
-$('menu').onclick = e => { e.stopPropagation(); document.body.classList.toggle('shelf'); };
+$('menu').onclick = e => {
+  e.stopPropagation();
+  document.body.classList.remove('chatsopen');  // one drawer at a time
+  document.body.classList.toggle('shelf');
+  syncChatsButton();
+};
 document.addEventListener('click', e => {
   // The path as dispatched: still right when a handler has already removed the clicked button
   // or closed its dialog. A dialog (opened from the drawer, say unit fixes) leaves the drawer
@@ -487,11 +547,15 @@ document.addEventListener('click', e => {
   const path = e.composedPath(), inside = sel => path.some(n => n.matches?.(sel));
   if (!inside('#settings, #keybtn')) $('settings').hidden = true;
   if (!inside('aside, dialog')) document.body.classList.remove('shelf');
+  if (!inside('#chats, #chatsbtn, dialog')) { document.body.classList.remove('chatsopen'); syncChatsButton(); }
 });
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   $('settings').hidden = true;
-  if (!document.querySelector('dialog[open]')) document.body.classList.remove('shelf');  // Escape closes the dialog only
+  if (!document.querySelector('dialog[open]')) {  // Escape closes the dialog only
+    document.body.classList.remove('shelf', 'chatsopen');
+    syncChatsButton();
+  }
 });
 showKey();
 
@@ -1241,6 +1305,11 @@ function showScope() {
 
 function knowDocs(docs) {  // the whole library, as just listed
   docNames = new Map(docs.map(d => [d.id, d]));
+  pruneScope();
+}
+
+function pruneScope() {  // chosen documents deleted meanwhile drop out
+  if (!docNames) { showScope(); return; }
   const kept = scope.filter(id => docNames.has(id));
   kept.length === scope.length ? showScope() : setScope(kept, kept.length ? 0 : scope.length);
 }
@@ -1357,8 +1426,9 @@ function showSource(s, excerpts) {
   const used = s.excerpts.map(i => excerpts[i]).filter(Boolean), n = used.length;
   $('srctitle').textContent = `${n} passage${n === 1 ? '' : 's'} · ${s.title || s.filename}`;
   const intro = el('p', 'muted', `From ${s.filename}, as the model read ${n === 1 ? 'it' : 'them'} (with any litre/gallon `
-    + 'misprints corrected). ' + (s.pages?.length ? '' : /\.pdf$/i.test(s.filename)
-      ? 'This document was read before page numbers were kept, so its passages have none.' : 'This kind of file has no pages.'));
+    + 'misprints corrected). ' + (s.gone ? 'It has been deleted from the library since. ' : '') + (s.pages?.length ? ''
+      : /\.pdf$/i.test(s.filename) ? 'This document was read before page numbers were kept, so its passages have none.'
+      : 'This kind of file has no pages.'));
   const items = used.map(e => {
     const item = el('div', 'finding'), head = el('div', 'head');
     head.append(el('b', '', e.page_start ? (e.page_start === e.page_end ? `Page ${e.page_start}` : `Pages ${e.page_start}-${e.page_end}`)
@@ -1380,6 +1450,173 @@ function showSource(s, excerpts) {
 $('srcclose').onclick = () => $('sourceview').close();
 $('sourceview').addEventListener('click', e => { if (e.target === $('sourceview')) $('sourceview').close(); });
 
+// ---- saved conversations: the Chats list, and the one shown ----
+// The server keeps every question and its answer; the page remembers which conversation is
+// open, so a reload comes back to it. Chats shows the list: a column beside the chat on wide
+// screens (shown or hidden at will), a drawer over the library below 1280px, where the chat
+// would be left too narrow.
+let chat = null;     // the open conversation, {id, title}; null for a new chat
+let chats = [];      // the list, as last loaded
+let chatShown = 0;   // moves whenever another conversation is shown: news of the one before is dropped
+let renaming = false;
+const drawer = matchMedia('(max-width: 1279px)');
+
+function syncChatsButton() {
+  const open = drawer.matches ? document.body.classList.contains('chatsopen') : !document.body.classList.contains('nochats');
+  $('chatsbtn').setAttribute('aria-expanded', String(open));
+}
+if (store.get('chatsOpen') === '0') document.body.classList.add('nochats');
+drawer.addEventListener('change', () => { document.body.classList.remove('chatsopen'); syncChatsButton(); });
+syncChatsButton();
+$('chatsbtn').onclick = e => {
+  e.stopPropagation();
+  if (drawer.matches) {  // the drawer; one at a time
+    document.body.classList.remove('shelf');
+    if (document.body.classList.toggle('chatsopen')) loadChats();
+  } else {
+    store.set('chatsOpen', document.body.classList.toggle('nochats') ? '0' : '1');
+  }
+  syncChatsButton();
+};
+$('chatsclose').onclick = () => { document.body.classList.remove('chatsopen'); syncChatsButton(); };
+
+// '2026-11-12 14:02:11' (UTC, as the server keeps time) -> '15:02' today, 'Yesterday', '3 Nov'.
+function whenText(utc) {
+  const d = new Date(String(utc).replace(' ', 'T') + 'Z'), now = new Date();
+  if (isNaN(d)) return '';
+  const day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((day(now) - day(d)) / 864e5);
+  if (days === 0) return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  if (days === 1) return 'Yesterday';
+  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', ...(d.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}) });
+}
+
+function setChat(c) {  // where questions go from now on (null: a new conversation, made by the first)
+  chat = c ? { id: c.id, title: c.title || '' } : null;
+  store.set('chatConversation', chat ? String(chat.id) : '');
+  $('convtitle').textContent = chat?.title || 'New conversation';
+  $('convtitle').title = chat?.title || '';
+  document.title = chat?.title ? `${chat.title} · Document Chatbot` : 'Document Chatbot';
+}
+
+let chatsLoading = 0;
+async function loadChats() {
+  const mine = ++chatsLoading;
+  let list;
+  try { list = await api('/api/conversations'); } catch (err) {
+    if (mine === chatsLoading && !chats.length) $('chatlist').replaceChildren(el('div', 'muted', err.message));
+    return;
+  }
+  if (mine !== chatsLoading) return;
+  chats = list;
+  drawChats();
+}
+
+function drawChats() {
+  if (renaming) return;  // the title being typed stays; drawn when it is done
+  $('chatlist').replaceChildren(...(chats.length ? chats.map(chatItem)
+    : [el('div', 'muted', 'No saved conversations yet. Every question and its answer are kept here.')]));
+}
+
+function chatItem(c) {
+  const on = chat?.id === c.id, item = el('div', 'conv' + (on ? ' on' : ''));
+  const pick = Object.assign(el('button', 'cbtn'), { type: 'button', title: c.title, onclick: () => openChat(c.id, true) });
+  pick.append(el('b', '', c.title || 'Untitled'),
+    el('small', '', `${whenText(c.updated_at)} · ${c.questions} question${c.questions === 1 ? '' : 's'}`));
+  if (on) pick.setAttribute('aria-current', 'true');
+  const edit = Object.assign(el('button', 'x', '✎'), { type: 'button', title: 'Rename', onclick: () => renameChat(item, c) });
+  edit.setAttribute('aria-label', `Rename “${c.title}”`);
+  const del = Object.assign(el('button', 'x', '✕'), { type: 'button', title: 'Delete' });
+  del.setAttribute('aria-label', `Delete “${c.title}”`);
+  del.onclick = async () => {
+    if (!del.classList.contains('sure')) {  // second click confirms
+      del.classList.add('sure'); del.textContent = 'Delete?';
+      setTimeout(() => { del.classList.remove('sure'); del.textContent = '✕'; }, 3000);
+      return;
+    }
+    if (chat?.id === c.id) newChat(false);
+    try { await api('/api/conversations/' + c.id, { method: 'DELETE' }); } catch (err) { if (err.status !== 404) alert(err.message); }
+    loadChats();
+  };
+  item.append(pick, edit, del);
+  return item;
+}
+
+function renameChat(item, c) {
+  renaming = true;
+  const input = Object.assign(el('input'), { value: c.title, maxLength: 200 });
+  input.setAttribute('aria-label', 'Conversation title');
+  let over = false;
+  const finish = async save => {  // Enter or leaving the box saves; Escape keeps the old title
+    if (over) return;
+    over = true;
+    const title = input.value.trim();
+    if (save && title && title !== c.title) {
+      try {
+        const r = await api('/api/conversations/' + c.id, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) });
+        c.title = r.title;
+        if (chat?.id === c.id) setChat(r);
+      } catch (err) { alert(err.message); }
+    }
+    renaming = false;
+    drawChats();
+  };
+  input.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); }
+  };
+  input.onblur = () => finish(true);
+  item.replaceChildren(input);
+  input.focus();
+  input.select();
+}
+
+// A saved conversation, shown with its answers as they were given. Picked from the list, it
+// also brings back its model and the documents its questions were limited to (a reload keeps
+// the page's own choice instead).
+async function openChat(id, picked = false) {
+  if (picked) { document.body.classList.remove('chatsopen'); syncChatsButton(); }
+  if (picked && busy && chat?.id === id) return;  // the one being answered: it carries on
+  stopAnswer();
+  const mine = ++chatShown;
+  let c;
+  try { c = await api('/api/conversations/' + id); } catch (err) {
+    if (mine !== chatShown) return;
+    if (err.status === 404) { newChat(false); loadChats(); return; }  // deleted meanwhile, say in another tab
+    setChat({ id, title: chats.find(x => x.id === id)?.title });
+    $('log').replaceChildren(el('div', 'empty muted', `Could not load this conversation: ${err.message}`));
+    return;
+  }
+  if (mine !== chatShown) return;
+  setChat(c);
+  $('log').replaceChildren();
+  for (let i = 0; i < c.messages.length; i += 2) showExchange(c.messages[i], c.messages[i + 1]);
+  if (!c.messages.length) emptyState();
+  if (picked) {
+    if (c.model && [...$('chatModel').options].some(o => o.value === c.model)) {
+      $('chatModel').value = c.model;
+      store.set('chatModel', c.model);
+    }
+    setScope(c.doc_ids || [], c.doc_ids?.length === 0 ? 1 : 0);  // [] : its documents were all deleted
+    pruneScope();
+  }
+  drawChats();
+  scroll();
+}
+
+function newChat(focus = true) {
+  stopAnswer();
+  ++chatShown;
+  setChat(null);
+  emptyState();
+  drawChats();
+  document.body.classList.remove('chatsopen');
+  syncChatsButton();
+  if (focus) $('question').focus();
+}
+$('newchat').onclick = $('chatsnew').onclick = () => newChat();
+
 // ---- chat ----
 const IDEAS = ['Summarise everything in my library', 'What are the key dates and amounts?', 'Which documents disagree with each other?'];
 function emptyState() {
@@ -1391,7 +1628,6 @@ function emptyState() {
   box.append(ideas);
   $('log').replaceChildren(box);
 }
-$('newchat').onclick = () => { if (!busy) { history = []; emptyState(); $('question').focus(); } };
 
 function turn(cls) {
   $('log').querySelector('.empty')?.remove();
@@ -1400,48 +1636,178 @@ function turn(cls) {
   return t;
 }
 const scroll = () => $('log').scrollTop = $('log').scrollHeight;
+const nearBottom = () => { const l = $('log'); return l.scrollHeight - l.scrollTop - l.clientHeight < 80; };
+
+function showQuestion(text, only) {
+  const t = turn('user');
+  t.append(el('div', '', text));
+  if (only) t.append(el('span', 'scoped', 'Only in ' + only));
+}
+
+function answerTurn() {
+  const bot = turn('bot'), body = el('div', 'body');
+  bot.append(body);
+  return { bot, body };
+}
+
+// What follows an answer: its sources, Copy, the model and its tokens, and how it came about.
+// r: an answer as /api/chat returns it, a stream's meta and done events together, or a saved one.
+function finishAnswer(bot, r) {
+  const foot = el('div', 'foot');
+  for (const s of r.sources || []) foot.append(sourceChip(s, r.excerpts || []));
+  const copy = Object.assign(el('button', '', 'Copy'), { type: 'button' });
+  copy.onclick = async () => { await navigator.clipboard.writeText(r.answer).catch(() => {}); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy', 1500); };
+  foot.append(copy);
+  const u = r.usage;
+  if (r.model_label) {
+    const tok = el('span', 'tok', u ? `${r.model_label} · ${fmtInt(u.input + u.output)} tokens` : r.model_label);
+    if (u) tok.title = `in ${u.input} · out ${u.output} · cache read ${u.cache_read} · cache write ${u.cache_write}`
+      + (r.status && r.status !== 'done' ? ' (estimated: the answer ended early)' : '');
+    foot.append(tok);
+  }
+  bot.append(foot);
+  if (r.overview) bot.append(el('div', 'switched', 'No passage matched this question, so the model was given the titles and summaries of your documents.'));
+  if (r.switched) bot.append(el('div', 'switched', `Switched to ${r.model_label}: ${r.switched}`));
+  if (r.status === 'stopped') bot.append(el('div', 'switched', 'Stopped. The answer ends here.'));
+  if (r.status === 'broken') bot.append(el('div', 'switched bad', `The answer broke off here. ${r.error || ''}`));
+}
+
+function showExchange(q, a) {  // a saved question and its answer
+  const only = a?.scope_names?.length ? (a.scope_names.length === 1 ? a.scope_names[0] : `${a.scope_names.length} documents`) : '';
+  showQuestion(q.content, only);
+  if (!a) return;
+  const { bot, body } = answerTurn();
+  body.textContent = a.content;
+  finishAnswer(bot, { ...a, answer: a.content });
+}
+
+// Answers come from /api/chat/stream as Server-Sent Events, read from fetch's body as they
+// arrive, so the text shows as it is written. Without that (an older browser, or a server
+// without the route), /api/chat gives the whole answer at once.
+const canStream = typeof TextDecoder === 'function' && typeof ReadableStream === 'function' && 'body' in Response.prototype;
+let answering = null;  // the answer being written (its AbortController): Stop aborts the fetch
+const stopAnswer = () => answering?.abort();
+$('stop').onclick = () => { stopAnswer(); $('question').focus(); };
+
+async function fetchAnswer(req, signal, on) {
+  const opts = { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req) };
+  if (canStream) {
+    const res = await fetch('/api/chat/stream', { ...opts, headers: { ...opts.headers, 'X-API-Key': key.value } });
+    const type = res.headers.get('content-type') || '';
+    if (type.startsWith('text/event-stream')) return readEvents(res, on);
+    if (!((res.status === 404 || res.status === 405) && !type.includes('json'))) {  // not "no such route": the server's answer
+      const data = await res.json().catch(() => ({ error: `${res.status} ${res.statusText}` }));
+      if (!res.ok) throw Object.assign(new Error(data.error || res.statusText), { status: res.status, data });
+      on.meta(data);
+      return data;
+    }
+  }
+  const r = await api('/api/chat', opts);
+  on.meta(r);
+  return r;
+}
+
+// The events: meta, delta (a piece of text), then done, or error ({error, status, kept}: kept
+// when the words so far stand). A stream that ends without either broke off on the way.
+async function readEvents(res, on) {
+  let done = null;
+  const handle = block => {
+    let name = 'message', data = '';
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) name = line.slice(6).trim();
+      else if (line.startsWith('data:')) data += line.slice(5).replace(/^ /, '');
+    }
+    if (!data) return;  // a comment
+    const d = JSON.parse(data);
+    if (name === 'meta') on.meta(d);
+    else if (name === 'delta') on.delta(d);
+    else if (name === 'done') done = d;
+    else if (name === 'error') throw Object.assign(new Error(d.error), { status: d.status, kept: d.kept, data: d });
+  };
+  const reader = res.body?.getReader();
+  if (!reader) (await res.text()).split('\n\n').forEach(handle);  // nothing to read as it comes: all of it at once
+  else {
+    const dec = new TextDecoder();
+    let buf = '';
+    try {
+      for (;;) {
+        let part;
+        try { part = await reader.read(); } catch (err) {
+          if (err.name === 'AbortError') throw err;
+          throw Object.assign(new Error('The connection to the server was lost.'), { kept: true });
+        }
+        if (part.done) break;
+        buf += dec.decode(part.value, { stream: true });
+        for (let i; (i = buf.indexOf('\n\n')) >= 0; buf = buf.slice(i + 2)) handle(buf.slice(0, i));
+      }
+    } catch (err) {
+      reader.cancel().catch(() => {});
+      throw err;
+    }
+  }
+  if (!done) throw Object.assign(new Error('The connection to the server was lost.'), { kept: true });
+  return done;
+}
 
 async function ask(question) {
   if (busy || !question) return;
-  busy = true; $('send').disabled = true;
-  const asked = turn('user');
-  asked.append(el('div', '', question));
-  if (scope.length) asked.append(el('span', 'scoped', 'Only in ' + scopeText(scope)));
-  const bot = turn('bot');
-  const body = el('div', 'body');
+  busy = true;
+  $('send').hidden = true; $('stop').hidden = false;
+  const shown = chatShown, ctl = answering = new AbortController();
+  showQuestion(question, scope.length ? scopeText(scope) : '');
+  const { bot, body } = answerTurn();
   body.append(Object.assign(el('span', 'dots'), { innerHTML: '<i></i><i></i><i></i>' }));
-  bot.append(body);
   scroll();
+  let meta = {}, text = '', stopped = false;
+  const follow = m => {  // the conversation the server keeps this in (null: it couldn't)
+    if (shown !== chatShown || !('conversation_id' in m)) return;
+    if (!m.conversation_id) setChat(null);
+    else if (m.conversation_id !== chat?.id || m.title !== chat.title) { setChat({ id: m.conversation_id, title: m.title }); loadChats(); }
+  };
   try {
     if (scopeGone) throw new Error(GONE);  // never every document unasked
-    const r = await api('/api/chat', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, history, model: $('chatModel').value, ...(scope.length ? { doc_ids: scope } : {}) }),
+    const req = { question, model: $('chatModel').value, ...(scope.length ? { doc_ids: scope } : {}),
+                  ...(chat ? { conversation_id: chat.id } : {}) };
+    const r = await fetchAnswer(req, ctl.signal, {
+      meta: m => { meta = m; follow(m); },
+      delta: piece => {
+        const pinned = nearBottom();
+        if (!text) { body.replaceChildren(); bot.classList.add('live'); }
+        text += piece;
+        body.append(piece);
+        if (pinned) scroll();
+      },
     });
-    history.push(...r.turns);
+    const pinned = nearBottom();
+    bot.classList.remove('live');
     body.textContent = r.answer;
-    const foot = el('div', 'foot');
-    for (const s of r.sources) foot.append(sourceChip(s, r.excerpts || []));
-    const copy = el('button', '', 'Copy');
-    copy.type = 'button';
-    copy.onclick = async () => { await navigator.clipboard.writeText(r.answer).catch(() => {}); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy', 1500); };
-    const u = r.usage, tok = el('span', 'tok', `${r.model_label} · ${u.input + u.output} tokens`);
-    tok.title = `in ${u.input} · out ${u.output} · cache read ${u.cache_read} · cache write ${u.cache_write}`;
-    foot.append(copy, tok);
-    bot.append(foot);
-    if (r.overview) bot.append(el('div', 'switched', 'No passage matched this question, so the model was given the titles and summaries of your documents.'));
-    if (r.switched) bot.append(el('div', 'switched', `Switched to ${r.model_label}: ${r.switched}`));
+    finishAnswer(bot, { ...meta, ...r });
+    follow(r);
+    if (pinned) scroll();
   } catch (err) {
-    bot.classList.add('err');
-    body.textContent = err.message;
-    if (/key/i.test(err.message)) { $('settings').hidden = false; key.focus(); }
-    if (err.data?.error?.startsWith('None of the chosen documents')) {  // the library and the Ask chip both catch up
-      loadDocs();
-      if ($('q').value.trim()) api('/api/documents').then(knowDocs).catch(() => {});  // a filtered listing isn't all of it
+    bot.classList.remove('live');
+    stopped = err.name === 'AbortError';
+    if ((stopped || err.kept) && text) {  // the words so far stand, and are kept with the conversation
+      finishAnswer(bot, { ...meta, answer: text, status: stopped ? 'stopped' : 'broken', error: err.message });
+    } else {
+      bot.classList.add('err');
+      body.textContent = stopped ? 'Stopped before the answer began.' : err.message;
+      if (/key/i.test(err.message)) { $('settings').hidden = false; key.focus(); }
+      if (err.data?.error?.startsWith('None of the chosen documents')) {  // the library and the Ask chip both catch up
+        loadDocs();
+        if ($('q').value.trim()) api('/api/documents').then(knowDocs).catch(() => {});  // a filtered listing isn't all of it
+      }
+      if (err.status === 404 && shown === chatShown && chat) {  // the conversation was deleted (another tab)
+        setChat(null);
+        body.textContent += ' Ask again to start a new one.';
+      }
     }
   }
-  busy = false; $('send').disabled = false;
-  scroll();
+  if (answering === ctl) answering = null;
+  busy = false;
+  $('send').hidden = false; $('stop').hidden = true;
+  if (shown === chatShown) loadChats();
+  if (stopped) setTimeout(loadChats, 1500);  // the server keeps a stopped answer once it notices
 }
 
 const qbox = $('question');
@@ -1455,7 +1821,9 @@ $('ask').onsubmit = e => {
   ask(question);
 };
 
-emptyState();
+const lastChat = +store.get('chatConversation');
+if (lastChat) openChat(lastChat); else emptyState();  // the conversation open before a reload
+loadChats();
 loadModels();
 loadDocs();
 loadRules();
