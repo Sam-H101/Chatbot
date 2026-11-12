@@ -300,28 +300,60 @@ Everything below is committed (as of 2026-11-12); nothing after 894b984 has been
   upload on one runner, restart mid-answer then an upload) and 19/19 browser checks (light, dark, 320-390 px drawer).
   The deploy script now tags a rollback image (`chatbot-chatbot:894b984`, tagged already), copies the library first,
   logs in when a password is set, and deletes its smoke-test conversation.
+- 2026-11-12: Deployed the enhancement plan to the live app (code of c495ea6; 216 tests passed first). Before it, two
+  copies of the library made with SQLite's backup API: `/data/metabase-before-enhancements-20261112.db` in the volume
+  (97 MB; 14 documents, 588 chunks, 1 instruction, integrity ok, the same counts as the live file) and the deploy
+  script's `~/chatbot-predeploy/metabase-20261112-195436.db` in WSL; the old code is still tagged `chatbot-chatbot:894b984`.
+  `docker compose up -d --build chatbot backup`: the library gained the new tables and columns at the first start, all
+  14 documents were unit-checked (chapters 4, 5, 6-1 and 6-2 show **1 unit fix** each, the quarts misprint), and all 588
+  passages were embedded by the worker within about two minutes. No password is set (`APP_PASSWORD` unset), so there
+  is no login. Live checks, changing nothing of the library: `/api/models` (Auto, qwen3.5:9b, no embedding model in the
+  pickers); the 14 documents with their ids and names, no Open link or original (404); keyword search for "hydraulic oil"
+  (10 hits); a streamed Auto answer (first words 2.9 s, 671 pieces, qwen3.5:9b with no switch) whose five passages were
+  all found by both keywords and meaning and which cited the DK20 manual and "Chapter 6 Hydraulic System-2.pdf" by name
+  (the live documents have no page numbers); its conversation saved whole, then deleted; `/api/usage` (400 for `days=0`);
+  an upload of `zz-deploy-check-20261112.txt` with qwen3.5:9b (done in 3 s, embedded, Open gave it back byte for byte,
+  the same file again got 409), then deleted with its kept file. The checks' delete steps hit a bug in the check script
+  after the requests had gone out; a second run confirmed the conversation and the document gone and `/data/files`
+  empty. Backups: the first snapshot was taken at start (8.1 MB) and `--now` made a second (10.8 MB, integrity ok, 588
+  vectors), in the new `chatbot_backups` volume. Browser (Playwright on `localhost:8000`): 42/42 in light and dark at
+  1400, 390 and 320 px: library cards with 4 unit badges and the unit dialog, the table view with 14 rows and Re-read
+  disabled, Usage, Chats, the Ask dialog ("searched by keywords and by meaning"), a question streamed in the page with
+  its source chips and passage dialog (that conversation deleted again), no console or page errors, no sideways scroll.
+  From Windows, `http://192.168.112.184:8000` answers (page, search status, 14 documents), and a DELETE and a POST
+  naming that address as their origin pass the other-site check (404 for ids that don't exist; another origin gets 403).
+  The checks left 32 rows in the usage log (embedding and qwen3.5 calls, all local, $0) and the test upload's finished
+  job row. No Claude calls were made. The chatbot log shows no errors or warnings.
 
 ## To do
 
-- Deploy the enhancement plan to the live container, which still runs 894b984: `docker compose up -d --build`
-  inside WSL `vostok` (this also starts the new `backup` service; naming services, as in `up -d --build chatbot`,
-  would leave it out: name `chatbot backup` then). Before it, keep a way back: the old code is tagged as
-  `chatbot-chatbot:894b984` (it runs on the migrated library), and a copy of `/data/metabase.db` made with SQLite's
-  backup API is worth taking, since the backup service's first snapshot is already of the migrated library. On its first start the library gains the new tables and
-  columns and its 588 passages are embedded. Afterwards, check from the LAN address that the page, uploads and
-  deletes work (and logging in, if `APP_PASSWORD` is set), and that `docker compose ps backup` shows it up and
-  `docker compose logs backup` its first snapshot.
 - Install the port proxy task once, from an elevated PowerShell (README, "Reach it from the LAN").
+- Decide the backup time zone: nightly backups run at 03:00 UTC (10 or 11 p.m. Eastern) unless `TZ` is set in `.env`
+  (e.g. `TZ=America/New_York`, then `docker compose up -d backup`).
+- Decide on a password: the live app has no login until `APP_PASSWORD` is set in `.env` (README, Login), and
+  `docker compose up -d chatbot`.
 - Try a real scanned manual through the live app. Scanned test PDFs have been read end to end on staging, by
-  minicpm-v4.6 and by Claude Haiku (see the log).
+  minicpm-v4.6 and by Claude Haiku (see the log). The 14 live documents have no kept original, so they can't be
+  re-read or opened, and they have no page numbers: uploading a manual again (and deleting its old copy) gives it both.
+- Once the new version has proven itself, delete the pre-deploy copies: `/data/metabase-before-enhancements-20261112.db`
+  in the volume (97 MB) and `~/chatbot-predeploy/` in WSL.
+- Before pushing: ae11627, 42a0a88, c31bf23, 3e9eb52 and 7a86b66 end with a `Co-Authored-By: Claude` trailer. Removing
+  it means rewording those commits (a history rewrite of 2ca20b9..master), which needs the owner's go-ahead.
 - Push, when wanted.
-- Done: the Windows NVIDIA driver is 582.78 and Ollama runs on the GPU (GTX 1080 Ti). The UI has been checked in a
-  browser, light and dark, at phone widths (Playwright, see the log). Everything is committed.
+- Done: the enhancement plan is deployed (see the log). The Windows NVIDIA driver is 582.78 and Ollama runs on the GPU
+  (GTX 1080 Ti). The UI has been checked in a browser, light and dark, at phone widths (Playwright, see the log).
+  Everything is committed.
 
 ## Left on the machine
 
-- Containers `chatbot-chatbot-1` (the 894b984 code) and `chatbot-ollama-1` are running inside WSL `vostok`,
-  with `restart: unless-stopped`; the library is in volume `chatbot_metabase`.
+- Containers `chatbot-chatbot-1` (the enhancement plan, deployed 2026-11-12), `chatbot-backup-1` and `chatbot-ollama-1`
+  are running inside WSL `vostok`, with `restart: unless-stopped`; the library is in volume `chatbot_metabase`, the
+  nightly snapshots in `chatbot_backups`.
+- A way back: the old code is tagged `chatbot-chatbot:894b984` and runs on the migrated library. In the repo folder in
+  WSL: `docker compose stop chatbot backup`, then `docker run -d --name chatbot-rollback --restart unless-stopped
+  --network chatbot_default -p 0.0.0.0:8000:8000 -v chatbot_metabase:/data --env-file .env chatbot-chatbot:894b984`.
+  Copies of the library from just before the deploy are in the volume (`/data/metabase-before-enhancements-20261112.db`)
+  and in WSL (`~/chatbot-predeploy/`).
 - WSL is kept running by a `wsl -d vostok -- sleep infinity` started from a Claude Code session on 2026-11-11.
   After a reboot, nothing starts WSL until the port proxy task (plan item 13) is installed.
 - Open to the LAN through the port proxy `0.0.0.0:8000` to WSL's address and the firewall rule "Chatbot 8000".
