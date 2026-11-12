@@ -33,6 +33,16 @@ MODELS = [
 ]
 if MODEL not in dict(MODELS):
     MODELS.append((MODEL, MODEL))
+# USD per million tokens (input, output), for the usage log. Cache reads cost 0.1x the
+# input price and cache writes 1.25x. Models missing here are logged at $0.
+PRICES = {
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-fable-5-2": (8.00, 40.00),
+}
+# Haiku charges more once a prompt passes 100K tokens: (threshold, input, output).
+LONG_PROMPT_PRICES = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
 # Routes a safety-classifier decline to a fallback model instead of failing.
 # Only these models take server-side fallbacks; others are sent without it.
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-5"}
@@ -46,6 +56,30 @@ def _fallback(model):
 
 def label(model):
     return dict(MODELS).get(model, model)
+
+
+def cost(model, usage):
+    """USD for one call, from a usage dict (input, output, cache_read, cache_write)."""
+    get = lambda k: usage.get(k) or 0
+    p_in, p_out = PRICES.get(model, (0, 0))
+    threshold, long_in, long_out = LONG_PROMPT_PRICES.get(model, (None, 0, 0))
+    if threshold and get("input") + get("cache_read") + get("cache_write") > threshold:
+        p_in, p_out = long_in, long_out
+    return (get("input") * p_in + get("cache_write") * p_in * 1.25 + get("cache_read") * p_in * 0.1
+            + get("output") * p_out) / 1_000_000
+
+
+def _usage(response):
+    u = response.usage
+    return {"input": u.input_tokens or 0, "output": u.output_tokens or 0,
+            "cache_read": getattr(u, "cache_read_input_tokens", 0) or 0,
+            "cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0}
+
+
+def _report(on_usage, kind, model, response):
+    """Pass one call's token counts to the caller's on_usage(kind, backend, model, usage)."""
+    if on_usage and getattr(response, "usage", None) is not None:
+        on_usage(kind, "claude", model, _usage(response))
 
 # Kept byte-stable (no timestamps, no per-request data) so it stays cacheable.
 SYSTEM = os.environ.get("SYSTEM_PROMPT") or (
@@ -86,7 +120,7 @@ def _text(response):
     return "".join(b.text for b in response.content if b.type == "text")
 
 
-def analyze(client, filename, text, model=MODEL):
+def analyze(client, filename, text, model=MODEL, on_usage=None):
     """Return (metadata dict, 'full' | 'partial')."""
     excerpt = text[:ANALYZE_CHARS]
     response = client.beta.messages.create(
@@ -100,17 +134,19 @@ def analyze(client, filename, text, model=MODEL):
         }],
         **_fallback(model),
     )
+    _report(on_usage, "analyze", model, response)
     return json.loads(_text(response)), "full" if len(text) <= ANALYZE_CHARS else "partial"
 
 
-def transcribe_pdf(client, batches, model=MODEL):
+def transcribe_pdf(client, batches, model=MODEL, on_usage=None):
     """Have Claude read the PDF pages (as text and image) and return their text.
-    `batches` comes from extract.pdf_batches; pieces are read in parallel."""
+    `batches` comes from extract.pdf_batches; pieces are read in parallel, so
+    on_usage is called from worker threads."""
     with ThreadPoolExecutor(max_workers=PDF_CONCURRENCY) as pool:
-        return "\n\n".join(pool.map(lambda b: _transcribe(client, model, *b), batches))
+        return "\n\n".join(pool.map(lambda b: _transcribe(client, model, *b, on_usage=on_usage), batches))
 
 
-def _transcribe(client, model, first, last, total, pdf_bytes):
+def _transcribe(client, model, first, last, total, pdf_bytes, on_usage=None):
     with client.beta.messages.stream(
         model=model,
         max_tokens=64000,
@@ -124,6 +160,7 @@ def _transcribe(client, model, first, last, total, pdf_bytes):
         **_fallback(model),
     ) as stream:
         response = stream.get_final_message()
+    _report(on_usage, "transcribe", model, response)  # billed even when the reply is unusable
     if response.stop_reason == "max_tokens":
         raise RuntimeError(f"pages {first}-{last} hold more text than one call can return; "
                            "lower PDF_PAGES_PER_CALL")
@@ -152,14 +189,7 @@ def chat(client, history, user_message, model=MODEL, system=SYSTEM):
         **_fallback(model),
     ) as stream:
         response = stream.get_final_message()
-    u = response.usage
-    usage = {
-        "input": u.input_tokens,
-        "output": u.output_tokens,
-        "cache_read": u.cache_read_input_tokens or 0,
-        "cache_write": u.cache_creation_input_tokens or 0,
-    }
-    return _text(response), usage
+    return _text(response), _usage(response)
 
 
 def client_for(api_key):

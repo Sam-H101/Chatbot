@@ -81,7 +81,14 @@ def fits(messages, reply_tokens=2000):
     return chars / 3 + reply_tokens <= NUM_CTX
 
 
-def analyze(_client, filename, text, model=MODEL):
+def _usage(r):
+    """Token counts from an /api/chat reply. Ollama leaves prompt_eval_count out when
+    the whole prompt came from its cache."""
+    return {"input": r.get("prompt_eval_count") or 0, "output": r.get("eval_count") or 0,
+            "cache_read": 0, "cache_write": 0}
+
+
+def analyze(_client, filename, text, model=MODEL, on_usage=None):
     """Return (metadata dict, 'full' | 'partial'). Same contract as llm.analyze."""
     excerpt = text[:ANALYZE_CHARS]
     r = _chat(model, [{
@@ -89,11 +96,13 @@ def analyze(_client, filename, text, model=MODEL):
         "content": f"Extract metadata for the document below.\n\nFile name: {filename}\n\n"
                    f"<document>\n{excerpt}\n</document>",
     }], think=False, temperature=0, format=META_SCHEMA)
+    if on_usage:
+        on_usage("analyze", "ollama", model, _usage(r))
     meta = json.loads(r["message"]["content"])
     return meta, "full" if len(text) <= ANALYZE_CHARS else "partial"
 
 
-def transcribe_pdf(data):
+def transcribe_pdf(data, on_usage=None):
     """Embedded text where the PDF has it; the vision model reads only scanned pages."""
     pages = extract.pdf_pages(data)
     out = []
@@ -106,6 +115,8 @@ def transcribe_pdf(data):
             "content": PAGE_PROMPT.format(page=n, total=len(pages)),
             "images": [base64.standard_b64encode(png).decode("ascii")],
         }], temperature=0)
+        if on_usage:
+            on_usage("transcribe", "ollama", VISION_MODEL, _usage(r))
         out.append(r["message"]["content"])
     return "\n\n".join(out)
 
@@ -115,6 +126,4 @@ def chat(_client, history, user_message, model=MODEL, system=SYSTEM):
     on its own, so resending identical history is cheap here too."""
     r = _chat(model, [{"role": "system", "content": system}, *history,
                       {"role": "user", "content": user_message}], think=False)
-    usage = {"input": r.get("prompt_eval_count", 0), "output": r.get("eval_count", 0),
-             "cache_read": 0, "cache_write": 0}
-    return r["message"]["content"], usage
+    return r["message"]["content"], _usage(r)

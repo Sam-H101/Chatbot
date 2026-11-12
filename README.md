@@ -23,7 +23,7 @@ To use the Claude API instead, run `LLM_BACKEND=claude docker compose up --build
 
 The key stays in your browser's localStorage and goes along with each request. The server never stores it. If you'd rather set it on the server, export `ANTHROPIC_API_KEY` before running `docker compose up`.
 
-The database is a single file, `/data/metabase.db`, kept in the `metabase` Docker volume. No database server is needed.
+The database is a single file, `/data/metabase.db`, kept in the `metabase` Docker volume. No database server is needed. The original uploaded files are kept beside it, in `/data/files`.
 
 ## What it does
 
@@ -32,7 +32,10 @@ The database is a single file, `/data/metabase.db`, kept in the `metabase` Docke
 | Upload | PDF (text or scanned), DOCX, and any UTF-8 text file (txt, md, csv, json, code…) |
 | PDF reading | PDFs are sent to Claude, which sees each page as text and as an image. Scans, tables, multi-column layouts and charts all come out as clean Markdown. Long PDFs are split into `PDF_PAGES_PER_CALL`-page pieces that are read in parallel |
 | Analyze | One Claude call per document with structured JSON output: title, doc type, summary, keywords |
-| Metadata base | SQLite tables `documents` and `chunks`, plus FTS5 indexes over the metadata and the full text (porter stemming) |
+| Metadata base | SQLite tables `documents` and `chunks`, plus FTS5 indexes over the metadata and the full text (porter stemming). Older databases gain new columns and tables automatically when the app starts |
+| Originals | Every uploaded file is kept in `FILES_DIR` (default `/data/files`), stored once per distinct content and named by its SHA-256. **Open** in the library and in the table view shows it: PDFs open in the browser's viewer and plain text as text; other types download. `GET /api/documents/<id>/file` serves it. Deleting a document removes its file once no other document uses it. Documents uploaded before originals were kept have no file and no Open link |
+| Duplicates | Uploads are hashed (SHA-256). If the same file is already in the library, the upload stops before any model reads it, and its row in the upload queue asks: **Replace** (read the new upload, then delete the earlier copies), **Keep both**, or **Skip**. Through the API: the form field `on_duplicate` is `replace` or `keep`; without it the answer is 409 with the earlier copy's id, file name, date and model. Documents uploaded before hashing never count as duplicates |
+| Usage | Every model call (reading PDF pages, analyzing a document, answering) is logged with its model, tokens and cost in the `usage` table, including calls made by uploads that then failed. The **Usage** button shows totals per model and per day for the last 7, 30, 90 or 365 days; `GET /api/usage?days=30` returns the same. Claude costs come from the price table `PRICES` in `app/llm.py` (cache reads at 0.1x and cache writes at 1.25x the input price) and are estimates, not the invoice; models missing from the table count as $0. Local models cost nothing |
 | Search | The sidebar search box matches documents by metadata and lists matching passages with highlighted snippets |
 | Chat | Each question runs a full-text search for the top 5 passages, which go into the prompt. Answers cite file names |
 | Model pickers | "Read with" (in the upload box) picks the model that reads and analyzes uploads; "Answer with" (under the question box) picks the chat model. Each offers **Auto**, every model pulled into Ollama, and the Claude models. The page remembers both choices, and every answer and upload shows which model did the work |
@@ -72,6 +75,7 @@ The database is a single file, `/data/metabase.db`, kept in the `metabase` Docke
 | `MAX_UPLOAD_MB` | `200` | Maximum upload size. The page checks it before uploading |
 | `PDF_MAX_BATCH_MB` | `20` | Largest PDF piece sent to Claude in one request (about 27 MB once base64-encoded, under the API's 32 MB limit). Pieces over it are split further |
 | `DB_PATH` | `/data/metabase.db` | Location of the SQLite file |
+| `FILES_DIR` | `files` next to `DB_PATH` (`/data/files`) | Where the original uploads are kept, one file per distinct content, named by its SHA-256 |
 
 Requests turn on server-side refusal fallbacks (`fallbacks: "default"`). If Claude's safety filter declines a request, the API retries it on a fallback model instead of failing.
 

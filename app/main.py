@@ -1,8 +1,9 @@
 """HTTP API + single-page UI."""
+import mimetypes
 import os
 
 import anthropic
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_file, send_from_directory
 
 from . import db, extract, llm, ollama
 
@@ -18,6 +19,12 @@ BACKEND = os.environ.get("LLM_BACKEND", "ollama")
 # to the vision model; with Claude every page is read as text and image.
 # "local": the PDF's embedded text layer only; scanned pages come out empty.
 PDF_EXTRACTOR = os.environ.get("PDF_EXTRACTOR", "model")
+# Kept originals shown in the browser: PDFs open in its viewer, plain text as text.
+# Everything else downloads, so an uploaded HTML or SVG file never runs script here.
+INLINE_TYPES = {"application/pdf", "text/plain"}
+# The slim image has no /etc/mime.types, and Python's own table lacks these two.
+mimetypes.add_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx")
+mimetypes.add_type("text/plain", ".log")
 
 
 class MissingKey(Exception):
@@ -80,6 +87,11 @@ def _run(choice, job, fits_local=True):
 def _used(used, note):
     backend, model = used
     return {"model": f"{backend}:{model}", "model_label": _label(backend, model), "switched": note}
+
+
+def _call(kind, backend, model, usage):
+    """One usage-log entry. Local models cost nothing."""
+    return kind, backend, model, usage, llm.cost(model, usage) if backend == "claude" else 0.0
 
 
 @app.errorhandler(MissingKey)
@@ -168,40 +180,75 @@ def upload():
     if not f or not f.filename:
         return jsonify(error="No file"), 400
     choice = _choice(request.form.get("model"))
+    # A file already in the library is refused (409) unless the browser says what to do:
+    # "replace" deletes the earlier copies once the new one is read, "keep" adds it anyway.
+    on_duplicate = request.form.get("on_duplicate", "")
+    if on_duplicate not in ("", "replace", "keep"):
+        raise BadChoice("on_duplicate must be 'replace' or 'keep'")
     name, data = f.filename, f.read()
+    sha = db.file_hash(data)
+    dups = db.find_duplicates(sha)
+    if dups and not on_duplicate:  # checked before any model spends time on it
+        d = dups[0]
+        return jsonify(error=f"{name} is already in the library", duplicate={
+            "id": d["id"], "filename": d["filename"], "title": d["title"], "created_at": d["uploaded_at"],
+            "model": d["model"], "copies": len(dups)}), 409
     is_pdf = name.lower().endswith(".pdf") and PDF_EXTRACTOR != "local"
+    calls = []  # every model call, logged even if the upload then fails
+
+    def on_usage(*call):
+        calls.append(_call(*call))
 
     def read(backend, model):
         if not is_pdf:
             text = extract.extract_text(name, data)
         elif backend == "ollama":
-            text = ollama.transcribe_pdf(data)  # scanned pages go to the vision model
+            text = ollama.transcribe_pdf(data, on_usage=on_usage)  # scanned pages go to the vision model
         else:
-            text = llm.transcribe_pdf(_client(), extract.pdf_batches(data), model)
+            text = llm.transcribe_pdf(_client(), extract.pdf_batches(data), model, on_usage=on_usage)
         if not extract.chunk_text(text):
             raise NoText()
         try:
             if backend == "ollama":
-                meta, analysis = ollama.analyze(None, name, text, model)
+                meta, analysis = ollama.analyze(None, name, text, model, on_usage=on_usage)
             else:
-                meta, analysis = llm.analyze(_client(), name, text, model)
+                meta, analysis = llm.analyze(_client(), name, text, model, on_usage=on_usage)
         except (anthropic.AuthenticationError, MissingKey, ollama.OllamaError):
             raise  # Ollama errors let Auto switch to Claude
         except Exception as e:  # still index the text so it is searchable
             meta, analysis = {"title": name}, f"none: {e}"
         return text, meta, analysis
 
+    doc_id = None
     try:
-        (text, meta, analysis), used, note = _run(choice, read)
-    except (MissingKey, anthropic.APIError, ollama.OllamaError):
-        raise  # handled by the error handlers above
-    except NoText:
-        return jsonify(error="No text found in file"), 400
-    except Exception as e:
-        return jsonify(error=f"Could not read {name}: {e}"), 400
-    chunks = extract.chunk_text(text)
-    doc_id = db.add_document(name, chunks, meta, analysis, _label(*used))
-    return jsonify(id=doc_id, chunks=len(chunks), analysis=analysis, **_used(used, note), **meta)
+        try:
+            (text, meta, analysis), used, note = _run(choice, read)
+        except (MissingKey, anthropic.APIError, ollama.OllamaError):
+            raise  # handled by the error handlers above
+        except NoText:
+            return jsonify(error="No text found in file"), 400
+        except Exception as e:
+            return jsonify(error=f"Could not read {name}: {e}"), 400
+        chunks = extract.chunk_text(text)
+        replace = on_duplicate == "replace"
+        doc_id = db.add_document(name, chunks, meta, analysis, _label(*used), data=data, sha=sha,
+                                 mime=mimetypes.guess_type(name)[0] or f.mimetype or "application/octet-stream",
+                                 replace=replace)
+    finally:
+        db.add_usage(calls, doc_id)
+    return jsonify(id=doc_id, chunks=len(chunks), analysis=analysis, has_file=True,
+                   replaced=[d["id"] for d in dups] if replace else [], **_used(used, note), **meta)
+
+
+@app.get("/api/documents/<int:doc_id>/file")
+def document_file(doc_id):
+    f = db.stored_file(doc_id)
+    if not f:  # also documents uploaded before originals were kept
+        return jsonify(error="No original file is kept for this document"), 404
+    resp = send_file(f["path"], mimetype=f["mime"], as_attachment=f["mime"] not in INLINE_TYPES,
+                     download_name=f["filename"], max_age=0)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
 
 
 @app.delete("/api/documents/<int:doc_id>")
@@ -215,6 +262,21 @@ def delete_many():
     if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
         return jsonify(error="Expected {\"ids\": [1, 2, ...]}"), 400
     return jsonify(deleted=db.delete_documents(ids))
+
+
+@app.get("/api/usage")
+def usage_report():
+    """Model calls, tokens and cost over the last `days` days, per model and per day."""
+    try:
+        days = int(request.args.get("days", "30"))
+    except ValueError:
+        days = 0
+    if not 1 <= days <= 3660:
+        raise BadChoice("days must be a whole number from 1 to 3660")
+    summary = db.usage_summary(days)
+    for m in summary["by_model"]:
+        m["label"] = _label(m["backend"], m["model"])
+    return jsonify(summary)
 
 
 @app.get("/api/instructions")
@@ -279,6 +341,7 @@ def chat():
 
     fits = ollama.fits([{"content": system}, *history, {"content": user_message}])
     (text, usage), used, note = _run(choice, answer, fits_local=fits)
+    db.add_usage([_call("chat", *used, usage)])
     return jsonify(
         answer=text,
         usage=usage,

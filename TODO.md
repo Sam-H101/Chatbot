@@ -31,6 +31,17 @@ Everything below is uncommitted in the working tree.
   them (litres trusted; also handles split table rows and a text layer that lost the ℓ). Stored text is
   unchanged. Real passages, qwen3.5:9b, 18 tries: 18 correct (was mostly "40.1 gallons"). 33 tests pass.
   Note: "Chapter 6 Hydraulic System-1.pdf" is in the library twice (one read by qwen, one by Claude).
+- 2026-11-12: Plan items 7, 6 and 16. Uploads are kept in `/data/files/<sha256>` (`FILES_DIR`), once per
+  content, with hash/path/size/mime on the document row; `GET /api/documents/<id>/file` serves them (PDF and
+  text inline, others as downloads) and the library and table show an **Open** link. Deletes remove a file
+  once no document uses it; `db.stored_file(id)` is the hook for re-reading later. Same-hash uploads get
+  409 and a Replace / Keep both / Skip prompt in the upload row (replace happens only after the new read
+  succeeds). New `usage` table logs every model call (Claude `response.usage` incl. cache tokens, Ollama
+  `prompt_eval_count`/`eval_count`), priced from `llm.PRICES`; `GET /api/usage` and a **Usage** dialog.
+  All schema changes are added on connect; checked on a read-only copy of the live library (14 docs,
+  588 chunks: lists, searches, answers, 404 for originals). 52 tests pass. Staging with qwen3.5, minicpm and
+  a few Claude Haiku calls ($0.0007), UI in light/dark and at 320-480px. Fixed on the way: the phone
+  header squashed its icon buttons, and the drawer closed when a clicked button removed itself.
 
 ## To do
 
@@ -51,3 +62,46 @@ Everything below is uncommitted in the working tree.
 - Still open to the LAN, from an elevated prompt remove with:
   `netsh interface portproxy delete v4tov4 listenport=8000 listenaddress=0.0.0.0`
   `netsh advfirewall firewall delete rule name="Chatbot 8000"`
+
+## Enhancement plan (2026-11-12)
+
+Ordered by priority. Suggested start: 1 and 2, then 5. Item 12 is small and worth doing early.
+
+### Phase 1: Answer quality
+
+- [ ] 1. Search by meaning, not just keywords. FTS5 only matches exact words ("hydraulic oil" missed
+      the "transmission fluid" passage). Add an embedding model in Ollama on the GPU and blend its
+      results with the keyword search.
+- [ ] 2. Page-numbered citations. Chunks don't record their page, so answers cite only a filename.
+      Store the page range per chunk, show "manual.pdf, p. 142", click to see the excerpt.
+- [ ] 3. Full analysis of long documents. Text over the character limit gets a "partial" analysis.
+      Summarise section by section, then combine, so local models cover the whole document.
+- [ ] 4. Unit checks at upload. `app/units.py` fixes litre/gallon misprints silently at question
+      time. Run it at upload too and list the suspected misprints on the document.
+
+### Phase 2: Uploads
+
+- [ ] 5. Background uploads with progress. An upload is one request with a 600 s gunicorn timeout;
+      a 200 MB scan on the local model can exceed it. Job queue, "page 40 of 312", resume on failure.
+- [x] 6. Duplicate detection. Hash the file and offer replace or skip
+      ("Chapter 6 Hydraulic System-1.pdf" is in the library twice).
+- [x] 7. Keep the original file. Only extracted text is stored. Keeping the PDF allows re-reading
+      with a different model without re-uploading, and viewing the cited page.
+- [ ] 8. Cheaper Claude reading. Send only scanned pages to Claude and use the text layer for the
+      rest (the Ollama path already does). Show an estimated cost before a large upload.
+
+### Phase 3: Chat experience
+
+- [ ] 9. Streaming answers, instead of the whole reply appearing after a wait.
+- [ ] 10. Saved conversations. History lives only in the browser tab; store it on the server.
+- [ ] 11. Scope a question to chosen documents ("ask only this manual").
+
+### Phase 4: Safety and operations
+
+- [ ] 12. A login. The app is open to the LAN on port 8000 with no password; anyone can delete
+      documents or change the instructions. A single shared password would close that.
+- [ ] 13. Stable network address. The Windows portproxy points at the WSL IP, which can change on
+      restart. Use WSL mirrored networking or a start-up script that re-points it.
+- [ ] 14. Backups. The library is one SQLite file in volume `chatbot_metabase`. Nightly copy.
+- [ ] 15. Run the tests on GitHub (Actions workflow on every push); today they run by hand.
+- [x] 16. Usage log. Record tokens and model per request to see what Claude costs.
