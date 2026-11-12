@@ -505,13 +505,14 @@ const OWN = { 'X-Requested-With': 'fetch' };
 // and are back in their boxes after logging in. A 401 without `login` is about the Claude key.
 const loginGone = (status, data) => status === 401 && data?.login === true;
 let asking = '';      // the question being sent, until its start event says the server kept it
-let leaving = false;  // on the way to the login page already (Log out, or a call before this one)
-// A page still here a while later (the server never answered, the browser stopped loading) or
-// back from the login page (Back) goes there again at the next call that finds the session ended.
-const leave = () => { leaving = true; setTimeout(() => { leaving = false; }, 10000); };
-addEventListener('pageshow', e => { if (e.persisted) leaving = false; });
+let leftAt = 0;  // when the page set off for the login page (Log out, or a call before this one)
+// A page still here 10 s after the latest start (the server never answered, the browser stopped
+// loading) or back from the login page (Back) goes there again at the next call that finds the
+// session ended. A time rather than a timer, so a second Log out gets its own full 10 s.
+const leave = () => { leftAt = Date.now(); };
+addEventListener('pageshow', e => { if (e.persisted) leftAt = 0; });
 const toLogin = () => {
-  if (!leaving) {
+  if (Date.now() - leftAt > 10000) {
     leave();
     const question = [asking, $('question').value.trim()].filter(Boolean).join('\n\n');
     try { sessionStorage.setItem('draft', JSON.stringify({ question, rule: $('newrule').value.trim() })); } catch {}

@@ -229,6 +229,10 @@ Everything below is uncommitted in the working tree.
   tightening now starts at 360 px, and buttons lose another pixel each side at 330 px and below. 196 tests pass.
   Staging (nothing spent on Claude): logout 9/9 plus 5/5 for Back, header fit at every width from 320 to 1000 px
   plus 1099-1400 with 1, 12, 99, 100 and 999 instructions, with and without a login, phone and desktop: 0 overflows.
+- 2026-11-12: Third review fix for item 12. A second Log out within 10 s of a first whose POST got no answer had its
+  wait cut short by the first one's timer; the page now keeps the time of the latest Log out instead of a timer, so
+  each gets its full 10 s. 196 tests pass. Staging (nothing spent on Claude): logout 15/15, including a second Log
+  out 7 s after the first holding until 10 s after the second, and 5/5 for Back.
 
 ## To do
 
