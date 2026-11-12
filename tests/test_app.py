@@ -1570,7 +1570,8 @@ def test_analysis_limits_differ_per_backend(monkeypatch):
     A local model reads a 100K-character text in three sections instead of its start."""
     from types import SimpleNamespace
     from app import llm, ollama, sections
-    assert llm.ANALYZE_CHARS == 500_000 and ollama.ANALYZE_CHARS == 40_000 and ollama.analyze_chars() == 40_000
+    assert llm.ANALYZE_CHARS == 500_000 and ollama.ANALYZE_CHARS == 40_000
+    assert round(ollama.analyze_tokens()) == 12_576                                     # (16384 - 2000) / 1.1 - 500
     text = "word " * 20_000  # 100,000 characters, one paragraph
     sent = {"claude": [], "local": []}
 
@@ -1596,6 +1597,9 @@ def test_analysis_limits_differ_per_backend(monkeypatch):
     bodies = [re.search(r"<part>\n(.*)\n</part>", m[0]["content"], re.S).group(1) for m, _ in parts]
     assert all(len(b) <= 40_000 for b in bodies) and " ".join(bodies).split() == text.split()   # every word, once
     assert all(ollama.fits(m, ollama.REPLY_TOKENS) and kw["num_predict"] == ollama.REPLY_TOKENS for m, kw in sent["local"])
+    # Ollama is told to refuse a prompt it would have to cut, and to stop a reply at the end
+    # of the context rather than drop the start of the text (test_text_denser_than_reckoned_...).
+    assert all(kw["truncate"] is False and kw["shift"] is False for _, kw in sent["local"])
     assert "## Part 3 of 3\nKey topics:\n- words" in final[0][0]["content"]
 
 
@@ -1668,7 +1672,7 @@ def test_sections_past_the_cap_are_sampled_evenly(local, monkeypatch):
     assert job["result"]["analysis"] == "partial: 3 of 6 sections, 50% of the text"
     read = [re.search(r"\(page (\d+)\)", s[4][0]["content"]).group(1) for s in seen if s[0] == "notes"]
     assert read == ["1", "3", "6"]                                                       # first, middle, last
-    assert seen[0][1] == "Analyzing section 1 of 3 (a sample of 6) with qwen3.5:9b"
+    assert seen[0][1] == "Analyzing section 1 of 3 (sampled from 6) with qwen3.5:9b"
     assert "Only 3 of its 6 parts were read" in seen[-1][4][0]["content"]
     assert local.get("/api/documents").json[0]["analysis"] == "partial: 3 of 6 sections, 50% of the text"
     assert sections.pick(61, 24)[:3] == [0, 3, 5] and sections.pick(61, 24)[-1] == 60 and len(set(sections.pick(61, 24))) == 24
@@ -1679,9 +1683,8 @@ def test_notes_too_long_for_one_call_are_merged_first(local, monkeypatch):
     """A small context: the sections' notes don't fit the final call together, so
     neighbouring notes are merged first, as many to a call as fit."""
     from app import ollama
-    long_note = {"topics": ["x" * 400], "specifications": [], "procedures": [], "warnings": []}
-    pdf, seen = long_pdf(local, monkeypatch, chars=40_000, ctx=3000, reps=43, notes=lambda n, kw: long_note)
-    assert ollama.analyze_chars() == 1500                                                 # (3000 - 2000) * 3 - 1500
+    pdf, seen = long_pdf(local, monkeypatch, chars=40_000, ctx=3000, reps=43, notes=lambda n, kw: LONG_NOTE)
+    assert round(ollama.analyze_tokens()) == 409                                          # (3000 - 2000) / 1.1 - 500
     job = add(local, "manual.pdf", pdf, model="ollama:qwen3.5:9b")
     assert job["status"] == "done" and job["result"]["analysis"] == "full"
     kinds = [s[0] for s in seen]
@@ -1690,6 +1693,51 @@ def test_notes_too_long_for_one_call_are_merged_first(local, monkeypatch):
     assert "## Parts 1-3 of 6 (pages 1-3)" in final and "## Parts 4-6 of 6 (pages 4-6)" in final
     assert all(ollama.fits(s[4], ollama.REPLY_TOKENS) for s in seen)                   # every call within the context
     assert [r["kind"] for r in _usage_rows()].count("analyze-merge") == 2
+    # The final call has a stage of its own again after the merges.
+    assert [s[1] for s in seen[-3:]] == ["Combining notes, group 1 of 2 with qwen3.5:9b",
+                                         "Combining notes, group 2 of 2 with qwen3.5:9b",
+                                         "Combining the notes of 6 sections with qwen3.5:9b"]
+
+
+# Notes on a section that take 118 of the 409 tokens a call carries with ctx=3000: three
+# fit one merge call, four don't.
+LONG_NOTE = {"topics": ["x" * 600], "specifications": [], "procedures": [], "warnings": []}
+
+
+def test_a_merge_whose_reply_is_unusable_leaves_its_notes_unmerged(local, monkeypatch, caplog):
+    """A merge reply cut off at num_predict (or not JSON) used to fail the whole analysis
+    after every section was read, and the same way on every retry. Its group's notes now
+    stay as they were, and later rounds merge fewer at a time, so the final call runs."""
+    from app import jobs, ollama
+    pdf, seen = long_pdf(local, monkeypatch, chars=40_000, ctx=3000, reps=43, notes=lambda n, kw: LONG_NOTE)
+    inner, broken = ollama._chat, {"cut off": 1}
+
+    def chat(model, messages, **kw):
+        if "format" in kw and "Merge them" in messages[0]["content"] and broken["cut off"]:
+            broken["cut off"] -= 1
+            return {"message": {"content": '{"topics": ["a", "b'}, "done_reason": "length",
+                    "prompt_eval_count": 1, "eval_count": ollama.REPLY_TOKENS}
+        if "format" in kw and "Merge them" in messages[0]["content"] and broken.get("not json"):
+            return {"message": {"content": "not json"}, "prompt_eval_count": 1, "eval_count": 2}
+        return inner(model, messages, **kw)
+
+    monkeypatch.setattr(ollama, "_chat", chat)
+    job = add(local, "manual.pdf", pdf, model="ollama:qwen3.5:9b")
+    assert job["status"] == "done" and job["result"]["analysis"] == "full" and job["result"]["title"] == "Scan"
+    final = seen[-1][4][0]["content"]
+    assert seen[-1][0] == "meta" and [s[0] for s in seen].count("merge") == 1           # the second group's
+    for n in (1, 2, 3):                                                                  # the first group's, as they were
+        assert f"## Part {n} of 6 (page {n})\nKey topics:\n- {'x' * 600}" in final
+    assert "## Parts 4-6 of 6 (pages 4-6)" in final
+    assert all(ollama.fits(s[4], ollama.REPLY_TOKENS) for s in seen)
+    assert "left unmerged" in caplog.text and "cut off at 2,000 tokens" in caplog.text
+    # A re-read whose merges never work still ends: each round merges half as many, then the
+    # notes are shortened to fit.
+    broken["not json"] = True
+    local.post(f"/api/documents/{job['doc_id']}/reread", json={"model": "ollama:qwen3.5:9b"})
+    jobs.drain()
+    assert local.get("/api/jobs").json[0]["status"] == "done" and seen[-1][0] == "meta"
+    assert seen[-1][4][0]["content"].count("## Part ") == 6 and ollama.fits(seen[-1][4], ollama.REPLY_TOKENS)
 
 
 def test_a_retry_keeps_the_notes_of_sections_already_analyzed(local, monkeypatch):
@@ -1817,6 +1865,206 @@ def test_unit_misprints_are_listed_at_upload(local, monkeypatch):
     assert local.get(f"/api/documents/{job['doc_id']}/units").json["findings"] == []
     assert [d["unit_fixes"] for d in local.get("/api/documents").json] == [0, 1]
     assert local.get("/api/documents/9999/units").status_code == 404
+
+
+# Text whose qwen3.5:9b token count was measured on the shared Ollama (prompt_eval_count).
+PROSE = ("Before starting the engine, make sure the PTO lever is in the OFF position and the range gear shift "
+         "lever is in neutral. Check the engine oil level with the dipstick and add oil if necessary. ") * 20
+TORQUE = "\n".join(f"| Bolt {i} | M{6 + i % 4 * 2} x 1.25 | {i * 7.31:.1f} to {i * 8.04:.1f} | "
+                   f"{i * 0.746:.2f} to {i * 0.82:.2f} |" for i in range(1, 121))
+FIGURES = "\n".join(",".join(f"{(i * 37 + j * 101) % 10000 / 7:.3f}" for j in range(8)) for i in range(100))
+
+
+def test_tokens_are_estimated_with_a_token_for_every_digit():
+    """qwen3.5 gives every digit a token: tables of figures run at 1-1.3 characters a token,
+    prose at 4-5. The 3 characters a token assumed before was 3 times under for figures:
+    a 31,728-character section of tables passed the old check but was about 17,000
+    tokens, Ollama cut its first half off, and the notes missed a warning at its start."""
+    from app import ollama
+    for text, measured in ((PROSE, 821), (TORQUE, 5300), (FIGURES, 6320)):
+        assert 0.99 <= ollama.tokens(text) / measured <= 1.1, text[:30]
+    assert ollama.tokens("") == 0 and ollama.tokens("7" * 2_500_000) == 2_500_000         # a megabyte at a time
+    assert abs(ollama.tokens("x" * 3_000_000) - 500_000) <= 3                             # a word cut at each megabyte
+    table = "\n".join([TORQUE] * 5)                                                       # 35,000 characters of figures
+    assert len(table) / 3 + 2000 <= ollama.NUM_CTX                                        # what the old check let through
+    assert not ollama.fits([{"content": table}])                                          # Auto now takes it to Claude
+
+
+def test_tables_of_figures_are_analyzed_in_smaller_sections(local, monkeypatch):
+    """Sections are sized by the token estimate: 35,000 characters of prose are one call,
+    of figures several, each prompt within the context."""
+    from app import ollama
+    sent = []
+
+    def chat(model, messages, **kw):
+        sent.append(messages)
+        notes = "topics" in kw["format"]["properties"]
+        return {"message": {"content": '{"topics": ["t"], "specifications": [], "procedures": [], "warnings": []}'
+                            if notes else '{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}'}}
+
+    monkeypatch.setattr(ollama, "_chat", chat)
+    prose = "\n\n".join([PROSE] * 9)                                                     # 34,600 characters
+    assert ollama.analyze(None, "a.txt", prose)[1] == "full" and len(sent) == 1
+    sent.clear()
+    table = "\n\n".join([TORQUE] * 5)
+    assert ollama.analyze(None, "b.txt", table)[1] == "full" and len(sent) == 4          # 3 sections and the final call
+    assert all(ollama.fits(m, ollama.REPLY_TOKENS) for m in sent)
+
+
+def _ollama_http(monkeypatch, answer):
+    """Ollama's HTTP API faked one level down from _chat: answer(body) returns the reply
+    dict, or raises (an urllib HTTPError, say). Returns the request bodies."""
+    import io
+    import json
+    from app import ollama
+    bodies = []
+
+    def urlopen(req, timeout):
+        bodies.append(json.loads(req.data))
+        return io.BytesIO(json.dumps(answer(bodies[-1])).encode())
+
+    monkeypatch.setattr(ollama.urllib.request, "urlopen", urlopen)
+    return bodies
+
+
+def test_text_denser_than_reckoned_is_read_in_smaller_pieces(monkeypatch):
+    """Analysis calls ask Ollama to refuse a prompt it would have to cut (truncate=False:
+    HTTP 400 "exceeds the available context size") and to stop a reply at the end of the
+    context (shift=False) rather than drop the start of the text. Either is
+    ContextExceeded, and that text is read again in smaller pieces, their notes put
+    together: nothing is cut off unnoticed."""
+    import io
+    import json
+    import urllib.error
+    from app import ollama
+    room = {"prompt": 9000, "reply": 99_999}  # the fake model's context, in prompt characters
+
+    def answer(body):
+        prompt = body["messages"][0]["content"]
+        assert body["truncate"] is False and body["shift"] is False
+        if len(prompt) > room["prompt"]:
+            raise urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(
+                b'{"error": "request (17012 tokens) exceeds the available context size (16384 tokens), try increasing it"}'))
+        if len(prompt) > room["reply"]:                                                   # the context ran out mid-reply
+            return {"message": {"content": '{"topics": ["cut'}, "done_reason": "length", "eval_count": 300}
+        if "topics" in body["format"]["properties"]:
+            steps = re.findall(r"Step (\d+)\.", prompt)
+            return {"message": {"content": json.dumps({"topics": steps, "specifications": [], "procedures": [],
+                                                       "warnings": []})}, "done_reason": "stop", "eval_count": 9}
+        return {"message": {"content": '{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}'},
+                "done_reason": "stop", "eval_count": 9}
+
+    bodies = _ollama_http(monkeypatch, answer)
+    text = "\n\n".join(f"Step {i}. Check pump {i} and fill it with oil." + " Then wipe it clean." * 25
+                       for i in range(1, 25))                                             # 13,100 characters
+    meta, analysis = ollama.analyze(None, "m.txt", text)                                  # one call by the estimate
+    prompts = [b["messages"][0]["content"] for b in bodies]
+    assert analysis == "full" and len(prompts[0]) > 9000 and len(prompts) > 2             # ... which was refused
+    final = prompts[-1]
+    assert sorted(map(int, re.findall(r"- (\d+)", final))) == list(range(1, 25))          # every step's notes, once
+    assert re.search(r"read in [23] parts", final)
+    # Sections refused in turn are read in pieces; so are pieces whose reply ran into the
+    # end of the context.
+    bodies.clear()
+    monkeypatch.setattr(ollama, "ANALYZE_CHARS", 12_000)                                  # sections of up to 12,000
+    room.update(prompt=9000, reply=4000)
+    meta, analysis = ollama.analyze(None, "m.txt", f"{text}\n\n{text}")
+    prompts = [b["messages"][0]["content"] for b in bodies]
+    answered = [p for p in prompts if len(p) <= 4000]
+    assert analysis == "full" and all(", piece " in p for p in answered[:-1])             # all but the final call
+    assert any(4000 < len(p) <= 9000 for p in prompts)                                    # one stopped mid-reply
+    assert sorted(map(int, re.findall(r"- (\d+)", prompts[-1]))) == sorted(list(range(1, 25)) * 2)
+    # Nothing left that fits: the error is the job's (Auto takes it to Claude).
+    room.update(prompt=10)
+    with pytest.raises(ollama.ContextExceeded, match="exceeds the available context"):
+        ollama.analyze(None, "m.txt", text)
+
+
+def test_a_reply_cut_off_at_its_token_limit_leaves_its_section_out(monkeypatch):
+    from app import ollama
+
+    def answer(body):
+        prompt = body["messages"][0]["content"]
+        if "topics" in body["format"]["properties"] and "page 2" in prompt:               # num_predict reached
+            return {"message": {"content": '{"topics": ["cut'}, "done_reason": "length", "eval_count": 2000}
+        notes = "topics" in body["format"]["properties"]
+        return {"message": {"content": '{"topics": ["t"], "specifications": [], "procedures": [], "warnings": []}'
+                            if notes else '{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}'}}
+
+    _ollama_http(monkeypatch, answer)
+    monkeypatch.setattr(ollama, "ANALYZE_CHARS", 1000)
+    text = "\f".join(f"Page {n}. " + "Torque the bolts. " * 40 for n in range(1, 5))
+    assert ollama.analyze(None, "m.pdf", text)[1] == "partial: 3 of 4 sections, 75% of the text"
+
+
+def test_long_file_names_are_cut_in_analysis_prompts(local, monkeypatch):
+    """Upload names have no length limit: a 6,000-character one made every section prompt
+    too long for the context, and the error blamed OLLAMA_NUM_CTX."""
+    from app import ollama
+    sent = []
+
+    def chat(model, messages, **kw):
+        sent.append(messages[0]["content"])
+        notes = "topics" in kw["format"]["properties"]
+        return {"message": {"content": '{"topics": ["t"], "specifications": [], "procedures": [], "warnings": []}'
+                            if notes else '{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}'}}
+
+    monkeypatch.setattr(ollama, "_chat", chat)
+    assert ollama.analyze(None, "n" * 6000 + ".txt", "word " * 40_000)[1] == "full"
+    assert len(sent) > 2 and all(f"File name: {'n' * 199}…\n" in p and ollama.fits([{"content": p}], 2000) for p in sent)
+
+
+def test_estimate_counts_the_sections_split_makes(monkeypatch):
+    """Pages are kept whole, so a text can take more sections than its characters suggest
+    (staging: "analysis in 3 of 5 sections" estimated, "partial: 3 of 6 sections" read).
+    The estimate counts them as analyze() will split them."""
+    from app import extract, jobs, llm, sections
+    pages = [f"Page {n}. " + "a" * 590 for n in range(1, 6)]                              # 5 pages of 598 characters
+    assert sections.plan("\f".join(pages), 1000) == (5, 5)                                # not ceil(3,000 / 1,000) = 3
+    assert sections.plan("x" * 900, 1000) == (1, 1) and sections.plan("x" * 3000, 1000, cap=2) == (3, 2)
+    monkeypatch.setattr(llm, "ANALYZE_CHARS", 1000)
+    assert jobs.estimate("a.txt", None, "claude-opus-5-5", False, "scanned", text="\f".join(pages))["sections"] == [5, 5]
+    monkeypatch.setattr(extract, "pdf_texts", lambda data: pages)                         # every page has its text layer
+    assert jobs.estimate("a.pdf", b"", "claude-opus-5-5", True, "scanned")["sections"] == [5, 5]
+    est = jobs.estimate("a.pdf", b"", "claude-opus-5-5", True, "all")                     # Claude reads every page
+    assert est["sections"][0] == len(sections.split("\f".join(["word " * 480] * 5), 1000)) == 15
+
+
+def test_a_one_page_pdf_has_page_numbers_too(local, monkeypatch):
+    """chunk_text drops page breaks no text follows, so a one-page PDF (or one with text on
+    its first page only) has none. Its findings still say page 1, and a later check of
+    its chunks (say after units.py changed) remembers it is a PDF's text."""
+    from app import db, extract, jobs
+    monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [("Fuel tank 38.0 ℓ / 40.1 U.S.gal", None), ("", None)])
+    job = add(local, "spec.pdf", blank_pdf(2), model="ollama:qwen3.5:9b")
+    r = local.get(f"/api/documents/{job['doc_id']}/units").json
+    assert r["pdf"] is True and [f["page"] for f in r["findings"]] == [1]
+    with db.connect() as con:                                                             # a check from another units.py
+        con.execute("UPDATE documents SET unit_findings=json_set(unit_findings, '$.version', 'older')")
+    assert jobs.check_units() == 1
+    assert [f["page"] for f in local.get(f"/api/documents/{job['doc_id']}/units").json["findings"]] == [1]
+    add(local, "spec.txt", b"Fuel tank 38.0 L / 40.1 U.S.gal")                           # text files have no pages
+    assert [f["page"] for f in local.get("/api/documents/2/units").json["findings"]] == [None]
+
+
+def test_a_long_list_of_unit_fixes_is_cut_and_counted(local, monkeypatch):
+    """A table whose figures all disagree stored a list as long as the document, parsed on
+    every library listing. The first MAX_FINDINGS are kept; all are counted, and listings
+    read only the count."""
+    from app import db, units
+    monkeypatch.setattr(units, "MAX_FINDINGS", 3)
+    rows = "\n".join(f"| Day {n} | {n + 10}.0 L | {n + 30}.0 gal |" for n in range(1, 8))
+    job = add(local, "fuel log.txt", rows.encode())
+    assert job["result"]["unit_fixes"] == 7
+    assert local.get("/api/documents").json[0]["unit_fixes"] == 7
+    assert local.get("/api/documents?q=fuel").json[0]["unit_fixes"] == 7                  # search lists it the same way
+    r = local.get(f"/api/documents/{job['doc_id']}/units").json
+    assert r["total"] == 7 and [f["context"][-5:] for f in r["findings"]] == ["Day 1", "Day 2", "Day 3"]
+    assert "recalculated" not in r["findings"][1]["context"]                              # the row before, as printed
+    with db.connect() as con:                                                             # a check from before the total
+        con.execute("UPDATE documents SET unit_findings=json_remove(unit_findings, '$.total')")
+    assert local.get("/api/documents").json[0]["unit_fixes"] == 3
+    assert local.get(f"/api/documents/{job['doc_id']}/units").json["total"] == 3
 
 
 def test_too_large_upload_gets_a_json_error(client, monkeypatch):

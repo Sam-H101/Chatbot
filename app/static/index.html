@@ -195,7 +195,7 @@
   button.ubadge { font: 600 11px/1.2 var(--mono); padding: 2px 7px; border-radius: 999px; border: 1px solid var(--accent);
     background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent); white-space: nowrap; }
   button.ubadge:hover:not(:disabled) { background: var(--accent); color: var(--accent-ink); }
-  @media (pointer: coarse), (max-width: 820px) { .doc button.ubadge { padding: 5px 9px; margin: 2px 0; } }
+  @media (pointer: coarse), (max-width: 820px) { .doc button.ubadge, #doctable button.ubadge { padding: 5px 9px; margin: 2px 0; } }
   #unitsview { width: min(760px, calc(100vw - 32px)); max-height: 88dvh; padding: 0; border: 1px solid var(--line); border-radius: 16px; background: var(--card); color: var(--ink); }
   #unitsview[open] { display: flex; flex-direction: column; }
   #unitsview::backdrop { background: #0007; }
@@ -391,12 +391,18 @@ $('keydone').onclick = () => $('settings').hidden = true;
 $('keyclear').onclick = () => { key.value = ''; key.oninput(); key.focus(); };
 $('menu').onclick = e => { e.stopPropagation(); document.body.classList.toggle('shelf'); };
 document.addEventListener('click', e => {
-  // The path as dispatched: still right when a handler has already removed the clicked button.
+  // The path as dispatched: still right when a handler has already removed the clicked button
+  // or closed its dialog. A dialog (opened from the drawer, say unit fixes) leaves the drawer
+  // open behind it, so closing it goes back to where it was opened.
   const path = e.composedPath(), inside = sel => path.some(n => n.matches?.(sel));
   if (!inside('#settings, #keybtn')) $('settings').hidden = true;
-  if (!inside('aside')) document.body.classList.remove('shelf');
+  if (!inside('aside, dialog')) document.body.classList.remove('shelf');
 });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { $('settings').hidden = true; document.body.classList.remove('shelf'); } });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  $('settings').hidden = true;
+  if (!document.querySelector('dialog[open]')) document.body.classList.remove('shelf');  // Escape closes the dialog only
+});
 showKey();
 
 // ---- model pickers ----
@@ -811,12 +817,13 @@ async function showUnits(id) {
   try { r = await api(`/api/documents/${id}/units`); } catch (err) { r = { error: err.message }; }
   if (mine !== unitsShown) return;
   if (r.error) { box.replaceChildren(el('div', 'muted', r.error)); return; }
-  const found = r.findings || [];
-  $('unvtitle').textContent = `${fixesText(found.length)} · ${r.title || r.filename}`;
+  const found = r.findings || [], total = r.total ?? found.length;
+  $('unvtitle').textContent = `${fixesText(total)} · ${r.title || r.filename}`;
   const intro = el('p', 'muted', found.length
     ? `${r.filename} prints these litre and gallon figures side by side, and they disagree. The litre figure is trusted: `
       + 'before a passage goes to a model, the gallon figure is replaced as shown, with what the document printed in brackets. '
       + 'The stored text and the original file keep what the document printed.'
+      + (total > found.length ? ` Only the first ${fmtInt(found.length)} of ${fmtInt(total)} are kept and listed.` : '')
     : `No litre and gallon figures that disagree were found in ${r.filename}.`);
   const items = found.map(f => {
     const item = el('div', 'finding'), head = el('div', 'head');

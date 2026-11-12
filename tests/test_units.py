@@ -1,6 +1,7 @@
 import re
 
-from app.units import SCRIPT_L, find, fix, scan
+from app import units
+from app.units import SCRIPT_L, check, find, fix, scan
 
 
 def test_kioti_quarts_misprint_is_corrected():
@@ -137,3 +138,33 @@ def test_scan_counts_pages_across_a_documents_chunks():
                                                                  (3, "19.0 L / 20.05 U.S.gal")]
     assert [f["page"] for f in scan([KIOTI[0], KIOTI[1]])] == [None, None]               # no pages to count
     assert scan([]) == []
+
+
+def test_a_pdf_without_page_breaks_starts_on_page_1():
+    """A one-page PDF, or one with text on its first page only, keeps no page break."""
+    assert [f["page"] for f in scan([KIOTI[0], KIOTI[1]], paged=True)] == [1, 1]
+    assert check([KIOTI[0]], paged=True)["paged"] is True and check([KIOTI[0]])["paged"] is False
+
+
+def test_findings_show_the_documents_own_text():
+    """Each rule reads the text the rules before it corrected. A finding's page, context
+    and printed figures come from the text as given: the second pair here showed the
+    first pair's correction (10.0 gal) as if the document printed it, and its printed
+    figures ended in a bracket that never closed."""
+    text = "Transmission fluid: 38.0 L / 40.1 U.S.gal\fWasher tank: 3.0 US gal (2.0 L) Fuel: 50 L"
+    first, second = find(text)
+    assert (first["page"], first["printed"]) == (1, "38.0 L / 40.1 U.S.gal")
+    assert second["page"] == 2 and second["context"] == "Washer tank:"
+    assert second["printed"] == "3.0 US gal (2.0 L)" and second["corrected"].startswith("0.5 US gal (2.0 L [gallon")
+    assert second["corrected"].endswith("misprint])") and fix(text).count("10.0 U.S.gal (40.1 U.S. qt)") == 1
+    (second,) = find(text.replace("\f", " "))[1:]                                        # on one page: the first pair too
+    assert second["context"] == "Transmission fluid: 38.0 L / 40.1 U.S.gal Washer tank:"
+    assert [f["printed"] for f in find("| 38.0 ℓ (40.1 U.S.gal) | 50 L (31 US gal)")] == [
+        "38.0 ℓ (40.1 U.S.gal)", "50 L (31 US gal)"]
+
+
+def test_a_check_keeps_the_first_findings_and_counts_them_all(monkeypatch):
+    monkeypatch.setattr(units, "MAX_FINDINGS", 2)
+    found = check([f"Tank {n}: 50 L / 31 US gal" for n in range(5)])
+    assert found["total"] == 5 and len(found["findings"]) == 2 and found["findings"][0]["context"] == "Tank 0:"
+    assert len(scan([f"Tank {n}: 50 L / 31 US gal" for n in range(5)])) == 5             # no cap without one

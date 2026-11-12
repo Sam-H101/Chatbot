@@ -97,6 +97,23 @@ Everything below is uncommitted in the working tree.
   4, 5, 6-1, 6-2), chapter 9 not flagged; a 98K-character manual in 3 sections by qwen3.5:9b (88 s, prompts at most
   9.3K tokens); Haiku in 2 sections plus the final call ($0.0018, estimated $0.0020); sampling with a cap of 2 and a
   re-read cancelled mid-analysis; 39/39 browser checks (light, dark, 390px).
+- 2026-11-12: Review fixes for items 3 and 4. Local analysis could overflow the context: sections were sized at 3
+  characters a token, but qwen3.5 gives every digit a token (tables run at 1.3 characters a token; on the live
+  library "Chapter 2 Engine-2" runs at 2.0), and Ollama silently dropped the start of a section. Sections are now
+  sized by a token estimate shaped like qwen's tokenizer (`ollama.tokens`, within 1% on tables and 1-20% over on
+  the library's manuals), analysis calls send `truncate: false` and `shift: false` so Ollama refuses an over-long
+  prompt instead of cutting it, and a refused section (or a reply that hit the end of the context) is read again in
+  halves; Auto's chat switch uses the same estimate. A merge reply that is cut off or not JSON no longer loses the
+  whole analysis: its notes stay unmerged and later rounds merge fewer. The estimate counts sections as `split()`
+  makes them (pages kept whole), the final call has its own stage again, sampling reads "(sampled from 61)", and
+  file names are cut to 200 characters in prompts. Unit checks: a one-page PDF's findings say page 1 (and a later
+  check remembers the text is a PDF's); context and printed figures come from the document's own text, not from what
+  an earlier rule corrected, and a bracket the pair opened is closed; at most 500 findings are stored, all counted,
+  and listings read the count in SQL (a 6.9 MB table with 196,389 mismatches: listing 450 ms -> 1 ms, list 54.8 MB ->
+  139 KB). UI: closing a dialog opened from the phone drawer (✕ or Escape) goes back to the drawer, and the table's
+  unit badge is 25 px tall on phones. 126 tests pass. Staging on a copy of the live library: the same 4 misprints,
+  a 66K-character half-table text in 4 sections (real prompts 8.5-9.7K tokens; 2 sections of about 17K each before),
+  page 1 on a one-page PDF, 515 findings capped at 500; 24/24 browser checks (light, dark, 390px).
 
 ## To do
 

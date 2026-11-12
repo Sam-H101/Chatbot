@@ -117,6 +117,10 @@ COLUMNS = {
     "unit_findings": "TEXT",  # litre/gallon misprints; checked at upload, older documents by jobs.check_units
 }
 USAGE_COLUMNS = {"job_id": "INTEGER"}  # usage rows from before jobs have none
+# A document's columns as the API lists it. Its unit check's findings stay here (they have
+# their own route, unit_findings()): listings read only how many there are (_doc_columns).
+_DOC_FIELDS = ("id", "filename", "uploaded_at", "char_count", "title", "doc_type", "summary", "keywords", "analysis",
+               *(c for c in COLUMNS if c != "unit_findings"))
 
 
 def connect():
@@ -147,13 +151,19 @@ def _migrate(con):
     con.execute("CREATE INDEX IF NOT EXISTS usage_job ON usage(job_id)")
 
 
+def _doc_columns(t):
+    """What a listing selects of documents (as `t`): _DOC_FIELDS, and unit_fixes, how many
+    misprints its unit check found (NULL: not checked yet). A check from before the total
+    was kept counts its list."""
+    return ", ".join(f"{t}.{c}" for c in _DOC_FIELDS) + (
+        f", COALESCE(json_extract({t}.unit_findings, '$.total'), json_array_length({t}.unit_findings, '$.findings'))"
+        " AS unit_fixes")
+
+
 def _doc(row):
-    """A documents row for the API: the stored file's location stays internal, and of the
-    unit check only the count shows (None: not checked yet); the list has its own route."""
+    """A documents row (_doc_columns) for the API: the stored file's location stays internal."""
     d = dict(row)
     d["has_file"] = bool(d.pop("file_path", None))
-    found = d.pop("unit_findings", None)
-    d["unit_fixes"] = None if found is None else len(json.loads(found)["findings"])
     return d
 
 
@@ -219,7 +229,8 @@ def find_duplicates(sha):
     """Documents holding a file with this hash, newest first. Documents from before
     hashing have none, so they never match."""
     with connect() as con:
-        return [_doc(r) for r in con.execute("SELECT * FROM documents WHERE sha256=? ORDER BY id DESC", (sha,))]
+        return [_doc(r) for r in con.execute(
+            f"SELECT {_doc_columns('d')} FROM documents d WHERE sha256=? ORDER BY id DESC", (sha,))]
 
 
 class JobGone(Exception):
@@ -318,26 +329,29 @@ def replace_document(doc_id, chunks, meta, analysis, model, job=None, units=None
 
 def list_documents():
     with connect() as con:
-        return [_doc(r) for r in con.execute("SELECT * FROM documents ORDER BY id DESC")]
+        return [_doc(r) for r in con.execute(f"SELECT {_doc_columns('d')} FROM documents d ORDER BY id DESC")]
 
 
 # ---- unit checks: litre/gallon misprints found in a document (units.check) ----
-# Stored as {"version", "findings"}; a check made by another version of units.py is stale.
+# Stored as {"version", "paged", "total", "findings"} (checks from before "paged" and
+# "total" have just the list); a check made by another version of units.py is stale.
 
 _STALE = "(unit_findings IS NULL OR json_extract(unit_findings, '$.version') IS NOT ?)"
 
 
 def unit_findings(doc_id, version):
-    """A document's unit check: {id, filename, title, has_file, pdf, findings}, findings
-    None while it has no check from this `version`; None if there is no such document."""
+    """A document's unit check: {id, filename, title, has_file, pdf, findings, total},
+    findings (at most units.MAX_FINDINGS of them, total counting all) None while it has no
+    check from this `version`; None if there is no such document."""
     with connect() as con:
         row = con.execute(f"SELECT id, filename, title, file_path, mime, unit_findings, {_STALE} AS stale"
                           " FROM documents WHERE id=?", (version, doc_id)).fetchone()
     if not row:
         return None
+    check = None if row["stale"] else json.loads(row["unit_findings"])
     return {"id": row["id"], "filename": row["filename"], "title": row["title"], "has_file": bool(row["file_path"]),
             "pdf": bool(row["file_path"]) and row["mime"] == "application/pdf",
-            "findings": None if row["stale"] else json.loads(row["unit_findings"])["findings"]}
+            "findings": check and check["findings"], "total": check and check.get("total", len(check["findings"]))}
 
 
 def unchecked_documents(version):
@@ -347,9 +361,14 @@ def unchecked_documents(version):
         return [r[0] for r in con.execute(f"SELECT id FROM documents WHERE {_STALE} ORDER BY id", (version,))]
 
 
-def chunk_texts(doc_id):
+def unit_source(doc_id):
+    """What a unit check of a document reads: its chunks, and whether its last check was
+    of a PDF's text (paged), which chunks without page breaks can't tell."""
     with connect() as con:
-        return [r[0] for r in con.execute("SELECT text FROM chunks WHERE doc_id=? ORDER BY idx", (doc_id,))]
+        row = con.execute("SELECT json_extract(unit_findings, '$.paged') FROM documents WHERE id=?",
+                          (doc_id,)).fetchone()
+        chunks = [r[0] for r in con.execute("SELECT text FROM chunks WHERE doc_id=? ORDER BY idx", (doc_id,))]
+    return chunks, bool(row and row[0])
 
 
 def set_unit_findings(doc_id, check):
@@ -534,7 +553,7 @@ def search_documents(text, limit=10):
         return []
     with connect() as con:
         rows = con.execute(
-            "SELECT d.* FROM docs_fts f JOIN documents d ON d.id = f.rowid"
+            f"SELECT {_doc_columns('d')} FROM docs_fts f JOIN documents d ON d.id = f.rowid"
             " WHERE docs_fts MATCH ? ORDER BY bm25(docs_fts) LIMIT ?", (q, limit))
         return [_doc(r) for r in rows]
 

@@ -214,7 +214,7 @@ def check_units(doc_id=None):
     documents it checked."""
     ids = db.unchecked_documents(units.VERSION) if doc_id is None else [doc_id]
     for i in ids:
-        db.set_unit_findings(i, units.check(db.chunk_texts(i)))
+        db.set_unit_findings(i, units.check(*db.unit_source(i)))
     return len(ids)
 
 
@@ -312,9 +312,11 @@ def _process(job):
         text, meta, analysis, who, note = _read(job, opts, data, progress, on_usage)
         progress.stage("Saving")
         chunks = extract.chunk_text(text)
-        check = units.check(chunks)  # the litre/gallon misprints that answers will be corrected for
+        # The litre/gallon misprints that answers will be corrected for. A PDF's text has pages,
+        # page 1 too when no page break follows it.
+        check = units.check(chunks, paged=job["filename"].lower().endswith(".pdf"))
         result = {**used(who, note), "title": meta.get("title") or job["filename"],
-                  "chunks": len(chunks), "analysis": analysis, "replaced": [], "unit_fixes": len(check["findings"])}
+                  "chunks": len(chunks), "analysis": analysis, "replaced": [], "unit_fixes": check["total"]}
         if job["kind"] == "reread":
             db.replace_document(job["doc_id"], chunks, meta, analysis, label(*who), units=check, job=(job_id, result))
         else:
@@ -391,10 +393,10 @@ def _read(job, opts, data, progress, on_usage):
     return with_claude(llm.MODEL, text)
 
 
-def _analysis_calls(chars):
-    """(input, output) tokens of each call that analyzes `chars` characters with Claude:
-    one, or for a long text one per section read plus one combining their notes."""
-    n, read = sections.plan(chars, llm.ANALYZE_CHARS)
+def _analysis_calls(chars, n, read):
+    """(input, output) tokens of each call that analyzes `chars` characters with Claude in
+    `n` sections, `read` of them read: one call, or one per section read plus one
+    combining their notes."""
     if n == 1:
         return [(chars // 4 + 100, ANALYSIS_OUTPUT_TOKENS)]
     return [(chars // n // 4 + 400, NOTES_OUTPUT_TOKENS)] * read + [
@@ -413,13 +415,19 @@ def estimate(name, data, model, is_pdf, mode, text=None):
         chars, is_pdf = len(extract.plain(text)), False
     elif is_pdf:
         texts = extract.pdf_texts(data)
-        reads = [t for t in texts if mode == "all" or extract.is_scan(t)]
-        pages, read = len(texts), len(reads)
-        chars = sum(map(len, texts)) - sum(map(len, reads)) + read * PAGE_OUTPUT_TOKENS * 4
+        reads = [mode == "all" or extract.is_scan(t) for t in texts]
+        pages, read = len(texts), sum(reads)
+        chars = sum(len(t) for t, r in zip(texts, reads) if not r) + read * PAGE_OUTPUT_TOKENS * 4
+        # Sections are counted on the text to come, each page Claude reads standing in as text
+        # of the length it should write: split() keeps pages whole, which can take more
+        # sections than the characters alone suggest.
+        text = extract.join_pages("word " * (PAGE_OUTPUT_TOKENS * 4 // 5) if r else t for t, r in zip(texts, reads))
     else:
-        chars = len(extract.extract_text(name, data))
+        text = extract.extract_text(name, data)
+        chars = len(text)
     price = model if model in llm.PRICES else max(llm.PRICES, key=lambda m: llm.PRICES[m][1])
-    calls = _analysis_calls(chars)
+    parts = sections.plan(text, llm.ANALYZE_CHARS)
+    calls = _analysis_calls(chars, *parts)
     cost = sum(llm.cost(price, {"input": i, "output": o}) for i, o in calls)
     for start in range(0, read, extract.PDF_PAGES_PER_CALL):
         n = min(extract.PDF_PAGES_PER_CALL, read - start)
@@ -428,7 +436,7 @@ def estimate(name, data, model, is_pdf, mode, text=None):
             "pages": pages, "claude_pages": read,
             "input_tokens": read * PAGE_INPUT_TOKENS + sum(i for i, _ in calls),
             "output_tokens": read * PAGE_OUTPUT_TOKENS + sum(o for _, o in calls), "cost_usd": round(cost, 6),
-            "sections": list(sections.plan(chars, llm.ANALYZE_CHARS)), "priced": model in llm.PRICES,
+            "sections": list(parts), "priced": model in llm.PRICES,
             "confirm_at": CONFIRM_COST_USD}
 
 

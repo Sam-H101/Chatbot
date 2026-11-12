@@ -10,8 +10,11 @@ the document printed. Only what is sent to the model changes; stored text does n
 fix() corrects a text; find() lists what fix() would correct in it, for the upload's
 unit check. Both run the same code (_run), so they can't disagree.
 """
+import bisect
 import hashlib
 import re
+
+from .extract import PAGE_BREAK  # a document's pages are joined with form feeds
 
 # Changes whenever this file does. Documents keep the version their unit check was made
 # with, and a check from another version is run again (jobs.check_units): the list on a
@@ -22,14 +25,17 @@ with open(__file__, "rb") as _f:
 US_GAL = 3.785411784
 IMP_GAL = 4.54609
 US_QT = US_GAL / 4
-PAGE_BREAK = "\f"  # as in extract.py: a document's pages are joined with form feeds
+# Findings kept with a document (all of them are counted): a table of figures that all
+# disagree would otherwise store, and send to the page, a list as long as the document.
+MAX_FINDINGS = 500
 
 _NUM = r"(\d+(?:\.\d+)?)"
 _LITRE = r"(?:ℓ|L|lit(?:re|er)s?)(?![A-Za-z])"
 _GAL = r"((?:imp(?:erial)?\.?\s*|U\.?\s?S\.?\s*)?gal(?:lon)?s?\.?)"
 # What may separate the two figures: spaces, slashes, brackets, <br>, and Markdown table
 # syntax, since PDF tables often put the two units in separate rows ("| 38.0 ℓ |\n|---|\n| 40.1 gal |").
-_GAP = r"((?:\s|/|\||-|,|\(|\)|\[|<br\s*/?>){1,40})"
+_SEP = r"(?:\s|/|\||-|,|\(|\)|\[|<br\s*/?>){1,40}"
+_GAP = rf"({_SEP})"
 
 LITRES_THEN_GALLONS = re.compile(rf"(?<![\d.]){_NUM}\s*({_LITRE}){_GAP}{_NUM}\s*{_GAL}", re.I)
 GALLONS_THEN_LITRES = re.compile(rf"(?<![\d.]){_NUM}\s*{_GAL}{_GAP}{_NUM}\s*({_LITRE})", re.I)
@@ -37,12 +43,12 @@ GALLONS_THEN_LITRES = re.compile(rf"(?<![\d.]){_NUM}\s*{_GAL}{_GAP}{_NUM}\s*({_L
 # by a "gallon" figure 1.057 times larger is the quarts misprint: litres -> U.S. quarts.
 BARE_THEN_GALLONS = re.compile(rf"(?<![\d.]){_NUM}(?!\s*{_LITRE}|\d|\.\d){_GAP}{_NUM}\s*{_GAL}", re.I)
 SCRIPT_L = re.compile(r"(?<=\d)\s*ℓ")
-# A litre or gallon figure (and the gap after it) right before a spot: tables print pairs
-# side by side ("| 8.9 ℓ, 2.4 U.S.gal | 8.3 ℓ, 2.2 U.S.gal |"), and 2.4 gal belongs to the
-# 8.9 ℓ before it, not to the 8.3 ℓ after it (see _taken).
-_SEP = r"(?:\s|/|\||-|,|\(|\)|\[|<br\s*/?>){1,40}"
+# A litre or gallon figure (and a gap after it, as a pair has) right before a spot: tables
+# print pairs side by side ("| 8.9 ℓ, 2.4 U.S.gal | 8.3 ℓ, 2.2 U.S.gal |"), and 2.4 gal
+# belongs to the 8.9 ℓ before it, not to the 8.3 ℓ after it (see _taken).
 LITRES_BEFORE = re.compile(rf"(?<![\d.])\d+(?:\.\d+)?\s*{_LITRE}{_SEP}$", re.I)
 GALLONS_BEFORE = re.compile(rf"(?<![\d.])\d+(?:\.\d+)?\s*{_GAL}{_SEP}$", re.I)
+_CLOSE = re.compile(r"[ \t]*\)")  # the bracket a gap opened closes after the pair: "3.0 US gal (2.0 L)"
 
 # What find() calls each kind of misprint.
 QUARTS, IMPERIAL, INCONSISTENT = "quarts-printed-as-gallons", "imperial-printed-as-us-gallons", "inconsistent-pair"
@@ -120,24 +126,66 @@ def _context(before):
     return text if len(text) <= 80 else "…" + text[-80:].split(" ", 1)[-1]
 
 
+class _Found(list):
+    """Findings as they are made: the first `cap` of them (all, without one), and how
+    many there were in all (total)."""
+
+    def __init__(self, cap=None):
+        super().__init__()
+        self.cap, self.total = cap, 0
+
+
+def _origin(pos, passes):
+    """A spot in the text the rules' passes so far made -> the same spot in the text they
+    were given. Each pass: (where its corrections start in its output, [(start, end in its
+    input, length, start in its output)])."""
+    for starts, edits in reversed(passes):
+        i = bisect.bisect_right(starts, pos) - 1
+        if i >= 0:
+            start, end, size, out = edits[i]
+            pos = min(end, start + pos - out) if pos < out + size else end + pos - out - size
+    return pos
+
+
+def _finding(text, start, end, new, kind, page, lead):
+    """The pair at text[start:end], corrected to `new`, as a person reads it."""
+    printed = text[start:end]
+    tail = _CLOSE.match(text, end) if printed.count("(") > printed.count(")") else None
+    if tail:
+        printed, new = printed + tail[0], new + tail[0]
+    before = text[max(0, start - 200):start]
+    return {"page": None if page is None else page + text.count(PAGE_BREAK, 0, start), "kind": kind,
+            "printed": _clean(printed), "corrected": _clean(new),
+            "context": _context(f"{lead[-200:]}\n{before}" if start < 200 else before)}
+
+
 def _run(text, page=None, found=None, lead=""):
-    """The rules applied in turn, as fix() needs them. With a `found` list, each
-    correction is also recorded there, its page counted from `page` (the page the
-    text starts on, or None when unknown) and the form feeds before it. `lead` is the
-    text before this one (say the previous chunk), only for the context."""
+    """The rules applied in turn, as fix() needs them: each pass reads the text the
+    passes before it corrected. With `found` (a _Found), each correction is also
+    recorded, as the text given has it (its page, words before it and printed figures,
+    never what an earlier pass wrote): its page counted from `page` (the page the text
+    starts on, or None when unknown) and the form feeds before it. `lead` is the text
+    before this one (say the previous chunk), only for the context."""
+    given, passes = text, []
     for pattern, rule in _RULES:
+        edits = []
+
         def sub(m):
             hit = rule(m)
             if hit is None:
                 return m[0]
             new, kind = hit
-            if found is not None:  # m.string is this pass's text: every form feed is still there
-                before = m.string[:m.start()]
-                found.append({"page": None if page is None else page + before.count(PAGE_BREAK), "kind": kind,
-                              "printed": _clean(m[0]), "corrected": _clean(new),
-                              "context": _context(f"{lead[-200:]}\n{before}" if len(before) < 200 else before)})
+            _, end, size, out = edits[-1] if edits else (0, 0, 0, 0)
+            edits.append((m.start(), m.end(), len(new), m.start() + out + size - end))  # + how much longer so far
+            if found is not None:
+                found.total += 1
+                if found.cap is None or len(found) < found.cap:
+                    found.append(_finding(given, _origin(m.start(), passes), _origin(m.end(), passes), new, kind,
+                                          page, lead))
             return new
+
         text = pattern.sub(sub, text)
+        passes.append(([e[3] for e in edits], edits))
     return text
 
 
@@ -151,25 +199,29 @@ def find(text, page=None, lead=""):
     page. `page` is the page the text starts on; without one, pages are counted from 1
     if the text has page breaks ("\\f"), and are None otherwise (text without pages, or
     read before pages were kept). `lead`: the text before this one, for the context."""
-    found = []
+    found = _Found()
     _run(text, page if page is not None else 1 if PAGE_BREAK in text else None, found, lead)
     return found
 
 
-def scan(chunks):
+def scan(chunks, paged=False, cap=None):
     """find() over a document's chunks, in order: what fix() corrects in the excerpts a
     question can retrieve, since it corrects one chunk at a time. Pages carry on from
-    chunk to chunk (a chunk keeps the form feeds of the page breaks in it)."""
-    page = 1 if any(PAGE_BREAK in c for c in chunks) else None
-    out, lead = [], ""
+    chunk to chunk (a chunk keeps the form feeds of the page breaks in it), counted from
+    1 if the text has page breaks or is `paged` (a PDF's: one with text on its first page
+    only has none). The first `cap` findings, their .total counting them all."""
+    page = 1 if paged or any(PAGE_BREAK in c for c in chunks) else None
+    found, lead = _Found(cap), ""
     for c in chunks:
-        out += find(c, page, lead)
+        _run(c, page, found, lead)
         lead = c
         if page is not None:
             page += c.count(PAGE_BREAK)
-    return out
+    return found
 
 
-def check(chunks):
-    """A document's unit check as it is stored: what scan() finds, and this VERSION."""
-    return {"version": VERSION, "findings": scan(chunks)}
+def check(chunks, paged=False):
+    """A document's unit check as it is stored: the first MAX_FINDINGS findings of scan(),
+    how many it found in all, whether the text is `paged`, and this VERSION."""
+    found = scan(chunks, paged, MAX_FINDINGS)
+    return {"version": VERSION, "paged": bool(paged), "total": found.total, "findings": list(found)}

@@ -3,6 +3,7 @@ nothing leaving the machine. Talks to Ollama's HTTP API with the standard librar
 import base64
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -17,14 +18,25 @@ VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "minicpm-v4.6")
 # Context window per request. On an 11 GB card a 9B model leaves room for ~16K;
 # raise it on bigger GPUs. Ollama silently drops the oldest tokens past this.
 NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
-# Characters of a document one analysis call sends. 40,000 is about 11-13K tokens, which
-# fits NUM_CTX with room for the reply. Longer documents are analyzed section by section
-# (sections.py). Past NUM_CTX Ollama would silently cut the text, so a smaller NUM_CTX
-# also makes the sections smaller (analyze_chars); raise both together.
+# Characters of a document one analysis call sends, at most. Longer documents are analyzed
+# section by section (sections.py), and sections are also kept within the tokens NUM_CTX
+# holds (analyze_tokens): 40,000 characters of prose fit, while tables of figures, at a
+# token a digit, make sections smaller. Raise this together with NUM_CTX.
 ANALYZE_CHARS = int(os.environ.get("OLLAMA_ANALYZE_CHARS", "40000"))
 REPLY_TOKENS = 2000  # context kept free for an analysis reply, and the most it may write
 KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "600"))
+# What an analysis prompt adds to the text it carries (its instructions, the file name and
+# labels), in tokens, and the factor a token estimate (tokens) is raised by for what it misses.
+PROMPT_TOKENS, MARGIN = 500, 1.1
+# Bits of text that are about a token each for qwen3.5, whose tokenizer, like many, gives
+# every digit a token of its own: a digit, a non-ASCII character, a word (with its leading
+# space) or six letters of a long one, up to four punctuation marks, a line break with the
+# spaces around it, spaces before a number. On the library's manuals, tables of figures
+# and part lists this came within 7% under to about 20% over qwen3.5's own count (dot
+# leaders and CJK text, more over); the plain 3 characters a token used before was up to
+# 3 times under for tables, and Ollama then cut the start off the text it was given.
+_TOKEN = re.compile(r"\d|[^\x00-\x7f]|[A-Za-z]{1,6}|[!-/:-@\[-`{-~]{1,4}|\s*\n\s*|[ \t]+(?=\d)")
 
 PAGE_PROMPT = (
     "This is page {page} of a {total}-page document. Transcribe all of its text in "
@@ -40,6 +52,12 @@ class OllamaError(Exception):
 
 class OllamaUnavailable(OllamaError):
     """Ollama could not be reached at all."""
+
+
+class ContextExceeded(OllamaError, sections.TooLong):
+    """A prompt and its reply that NUM_CTX can't hold. Analysis calls ask Ollama to refuse
+    such a prompt rather than cut it (truncate) and to stop such a reply rather than drop
+    the start of the context (shift); sections.py then reads the text in smaller pieces."""
 
 
 def _chat(model, messages, think=None, temperature=None, num_predict=None, **extra):
@@ -63,7 +81,9 @@ def _chat(model, messages, think=None, temperature=None, num_predict=None, **ext
             detail = json.loads(detail).get("error", detail)
         except ValueError:
             pass
-        raise OllamaError(f"{model}: {detail}") from e
+        # "request (17012 tokens) exceeds the available context size (16384 tokens)": truncate=False
+        error = ContextExceeded if re.search(r"exceeds .*context", str(detail), re.I) else OllamaError
+        raise error(f"{model}: {detail}") from e
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         raise OllamaUnavailable(f"Could not reach Ollama at {URL}") from e
 
@@ -78,11 +98,17 @@ def models():
         raise OllamaUnavailable(f"Could not reach Ollama at {URL}") from e
 
 
+def tokens(text):
+    """About how many tokens `text` is for a local model (see _TOKEN). Counted a megabyte
+    at a time, so a huge text never becomes a list of millions of bits at once."""
+    step = 1_000_000
+    return sum(len(_TOKEN.findall(text, i, i + step)) for i in range(0, len(text), step))
+
+
 def fits(messages, reply_tokens=2000):
-    """Rough check that a prompt fits the local context window (about 3 characters
-    per token, erring on the side of switching to Claude)."""
-    chars = sum(len(m.get("content") or "") for m in messages)
-    return chars / 3 + reply_tokens <= NUM_CTX
+    """Whether a prompt fits the local context window with room for the reply: its token
+    estimate (tokens) with MARGIN to spare, erring on the side of switching to Claude."""
+    return sum(tokens(m.get("content") or "") for m in messages) * MARGIN + reply_tokens <= NUM_CTX
 
 
 def _usage(r):
@@ -92,25 +118,40 @@ def _usage(r):
             "cache_read": 0, "cache_write": 0}
 
 
-def analyze_chars():
-    """Characters of document text (or notes) one analysis call carries: ANALYZE_CHARS,
-    or fewer when NUM_CTX can't hold that many next to the prompt and the reply."""
-    return max(1000, min(ANALYZE_CHARS, (NUM_CTX - REPLY_TOKENS) * 3 - sections.PROMPT_CHARS))
+def analyze_tokens():
+    """Tokens of document text (or notes) one analysis call may carry: what NUM_CTX holds
+    beside the prompt's own words and the reply, with MARGIN to spare."""
+    return max(100, (NUM_CTX - REPLY_TOKENS) / MARGIN - PROMPT_TOKENS)
+
+
+def _analysis_size(text):
+    """How much of one analysis call `text` takes, in the tokens of analyze_tokens(): its
+    token estimate, or more for text so long in characters that ANALYZE_CHARS caps it."""
+    return max(tokens(text), len(text) * analyze_tokens() / ANALYZE_CHARS)
 
 
 def analyze(_client, filename, text, model=MODEL, on_usage=None, **hooks):
-    """Same contract as llm.analyze. Every call fits the context window: sections.py
-    keeps the text in each within analyze_chars(), and the reply within REPLY_TOKENS."""
+    """Same contract as llm.analyze. Every call fits the context window: sections.py keeps
+    the text in each within analyze_tokens() (as _analysis_size reckons it), and the reply
+    within REPLY_TOKENS. Text denser than reckoned can't be cut silently: Ollama refuses a
+    prompt too long for NUM_CTX, and stops a reply that reaches its end (ContextExceeded),
+    and sections.py then reads that text in smaller pieces."""
     def ask(prompt, schema, kind):
         messages = [{"role": "user", "content": prompt}]
-        if not fits(messages, REPLY_TOKENS):  # only with a NUM_CTX too small for any analysis
-            raise OllamaError(f"{model}: OLLAMA_NUM_CTX={NUM_CTX} is too small for an analysis prompt")
-        r = _chat(model, messages, think=False, temperature=0, num_predict=REPLY_TOKENS, format=schema)
+        if not fits(messages, REPLY_TOKENS):
+            raise ContextExceeded(f"{model}: a prompt of about {tokens(prompt):,} tokens and a {REPLY_TOKENS:,}-token "
+                                  f"reply don't fit OLLAMA_NUM_CTX={NUM_CTX}")
+        r = _chat(model, messages, think=False, temperature=0, num_predict=REPLY_TOKENS, format=schema,
+                  truncate=False, shift=False)
         if on_usage:
             on_usage(kind, "ollama", model, _usage(r))
+        if r.get("done_reason") == "length":
+            if (r.get("eval_count") or 0) < REPLY_TOKENS:  # stopped by the end of the context, not num_predict
+                raise ContextExceeded(f"{model}: the prompt and its reply ran past OLLAMA_NUM_CTX={NUM_CTX}")
+            raise ValueError(f"the reply was cut off at {REPLY_TOKENS:,} tokens")
         return json.loads(r["message"]["content"])
 
-    return sections.analyze(ask, filename, text, analyze_chars(), **hooks)
+    return sections.analyze(ask, filename, text, analyze_tokens(), size=_analysis_size, **hooks)
 
 
 def transcribe_pdf(data, on_usage=None, done=None, on_page=None):
