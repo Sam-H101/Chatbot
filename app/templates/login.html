@@ -43,12 +43,16 @@
   button:hover { filter: brightness(1.08); }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .err { margin: 0; color: var(--bad); font-size: 14px; }
+  .note { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-left: 4px solid var(--accent);
+          border-radius: 4px 10px 10px 4px; background: var(--card); font-size: 14px; }
   .muted { margin: 14px 0 0; color: var(--soft); font-size: 13px; text-align: center; }
 </style>
 </head>
 <body>
 <main>
   <h1>Doc<i>.</i>chat</h1>
+  {% if ended and not error %}<p class="note" role="status">Your session has ended. Log in again: a question or
+    instruction you were sending will be back in its box, but an upload has to be chosen again.</p>{% endif %}
   <form method="post" action="/login">
     <label for="password">Password</label>
     <input id="password" name="password" type="password" autocomplete="current-password" required autofocus
@@ -59,5 +63,13 @@
   </form>
   <p class="muted">One shared password, set by whoever runs this library.</p>
 </main>
+<script>
+  // A link to a page of an original (…/file#page=5) keeps its page through the login: the browser
+  // keeps the #fragment on this page's address but never sends it, so it goes along with next.
+  document.forms[0].addEventListener('submit', e => {
+    const next = e.target.elements.next;
+    if (location.hash && !next.value.includes('#')) next.value += location.hash;
+  });
+</script>
 </body>
 </html>

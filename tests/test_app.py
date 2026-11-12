@@ -3359,10 +3359,48 @@ def test_logging_in_and_out(guarded, monkeypatch):
 
 def test_a_login_goes_back_only_to_pages_of_this_site(guarded):
     for given, to in [("/api/documents/1/file", "/api/documents/1/file"), ("/?x=1", "/?x=1"), ("", "/"),
+                      ("/api/documents/1/file#page=5", "/api/documents/1/file#page=5"),  # a page link keeps its page
+                      ("/#//evil.example", "/#//evil.example"),                          # a fragment is no host
                       ("//evil.example/x", "/"), ("https://evil.example/", "/"), ("/\\evil.example", "/"),
                       ("/\t/evil.example", "/"), ("/\n/evil.example", "/"), ("javascript:alert(1)", "/")]:
         r = log_in(guarded, next=given)
         assert r.status_code == 303 and r.headers["Location"] == to, given
+    # The server never sees a #fragment: the login page adds the one on its address to next.
+    guarded.post("/logout")
+    page = guarded.get("/login?next=/api/documents/1/file").data
+    assert b'value="/api/documents/1/file"' in page and b"next.value += location.hash" in page
+
+
+def test_the_login_page_says_when_a_session_ended(guarded):
+    """The app's page goes to /login?ended=1 when a call gets 401: the session ended under it."""
+    assert b"Your session has ended" in guarded.get("/login?ended=1").data
+    assert b"Your session has ended" not in guarded.get("/login").data
+    r = guarded.post("/login", data={"password": "wrong"}, query_string={"ended": "1"})
+    assert b"Wrong password." in r.data and b"Your session has ended" not in r.data
+    log_in(guarded)
+    assert guarded.get("/login?ended=1").headers["Location"] == "/"                      # logged in again
+
+
+def test_any_password_works_when_sent_encoded(guarded, monkeypatch):
+    """$, #, +, & and spaces are the owner's to use: the form (and curl --data-urlencode) encodes them."""
+    from app import auth
+    monkeypatch.setattr(auth, "PASSWORD", "pa$s #w+r&d=%41 ü")
+    assert log_in(guarded, "pa$s #w+r&d=%41 ü").status_code == 303
+    assert guarded.get("/api/documents").status_code == 200
+    raw = guarded.post("/login", data="password=pa$s #w+r&d=%41 ü".encode(), content_type="application/x-www-form-urlencoded")
+    assert raw.status_code == 401                                                         # curl -d sends it as typed
+
+
+def test_the_log_says_at_start_whether_there_is_a_login(monkeypatch, caplog):
+    """A password compose emptied (a $ in .env) shows in the log, as a warning so it gets there."""
+    from flask import Flask
+    from app import auth
+    for password, said in (("", "No login: APP_PASSWORD is unset or empty"), ("s3cret pw", "Login on")):
+        monkeypatch.setattr(auth, "PASSWORD", password)
+        caplog.clear()
+        auth.setup(Flask(__name__))
+        assert [r.levelname for r in caplog.records] == ["WARNING"] and said in caplog.text
+        assert "s3cret" not in caplog.text                                                # never the password
 
 
 def test_state_changing_api_calls_need_the_pages_own_header(guarded):

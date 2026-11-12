@@ -207,6 +207,21 @@ Everything below is uncommitted in the working tree.
   193 tests pass. Staging (qwen3.5, nothing spent on Claude): 28/28 API checks (an upload read and embedded and a
   streamed answer while logged in, a job finished after a restart with no request at all, the session kept across
   the restart, the throttle) and 52/52 browser checks (light, dark, 1400-320 px, with and without a password).
+- 2026-11-12: Review fixes for item 12. The header overflowed with a login at 421-446, 481-492 and 821-893 px (large
+  iPhones at 428-440, an 11" iPad at 834; Log out cut off) and, without one, at 341-364 px with a two-digit
+  instruction count (from before item 12): short labels now apply with a login from 500 px down and at 821-910 px
+  (Key there without one too), and the 380/350 px tightening applies to both; measured at every width from 320 to
+  1000 px plus 1099-1400, with 0, 1 and 12 instructions, light and dark, with and without a password: 0 overflows.
+  A call answered 401 sends the page to `/login?ended=1`, which says the session ended; a question being sent (until
+  the server kept it) or typed, and a new instruction, come back in their boxes after logging in (sessionStorage).
+  **Log out** reports a streamed answer's stop before leaving (it got 401 on pagehide, so more was kept than shown),
+  sends it once, and forgets the Claude key typed into that browser. The login page adds its `#page=5` to `next`,
+  so a page link keeps its page. The log says at start whether a login is on. README: `.env` value in single quotes
+  (`$` and ` #` were mangled; `$ecret1` became no password at all), `curl --data-urlencode`, the key file is made at
+  the first request, a wrong try a minute keeps the lock going for everyone and a restart clears it. 196 tests pass.
+  Staging (qwen3.5, nothing spent on Claude): drafts 11/11, page link 4/4, stream stopped by Log out, reload and
+  Stop kept exactly as shown (one 204 each), login page 6/6, curl flow with `pa$s #w+r&d`, `.env` quoting checked
+  with `docker compose config`.
 
 ## To do
 

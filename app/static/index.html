@@ -321,16 +321,20 @@
     header button.icon { flex: none; width: 32px; height: 32px; }
     header button:not(.icon) { padding: 5px 8px; font-size: 12.5px; }
   }
-  /* Short labels, so the row still fits with the instruction count on the Instructions button,
-     and with Log out (an icon here) when there is a login. */
-  @media (max-width: 420px) {
+  /* Short labels wherever the full row doesn't fit with a two-digit instruction count (measured at
+     every width from 320 px): Key on phones and beside the library on narrow screens (821-910 px);
+     with a login, whose Log out is then an icon, also Rules for Instructions, from 500 px down. */
+  @media (max-width: 420px), (min-width: 821px) and (max-width: 910px) {
     header .wide { display: none; } header .narrow { display: inline; }
-    body.login header .long { display: none; } body.login header .short { display: inline; }
   }
-  @media (max-width: 380px) { body.login header { gap: 2px; padding-inline: 8px; } }
-  @media (max-width: 350px) { body.login header button:not(.icon) { padding-inline: 6px; } }
+  @media (max-width: 500px), (min-width: 821px) and (max-width: 910px) {
+    body.login header .wide, body.login header .long { display: none; }
+    body.login header .narrow, body.login header .short { display: inline; }
+  }
+  @media (max-width: 380px) { header { gap: 2px; padding-inline: 8px; } }
+  @media (max-width: 350px) { header button:not(.icon) { padding-inline: 6px; } }
   @media (max-width: 340px) {
-    header { padding: 10px 8px; gap: 2px; }
+    header { padding: 10px 6px; gap: 2px; }
     header button:not(.icon) { padding: 5px 6px; }
     header button.icon { width: 30px; }
     #rulecount:not(:empty) { margin-left: 3px; padding: 2px 4px; }
@@ -491,11 +495,23 @@ let busy = false;
 // With a password set (APP_PASSWORD), the server asks every call that changes something for
 // this header, which a page on another site can't add (app/auth.py).
 const OWN = { 'X-Requested-With': 'fetch' };
-// A call made once the session has ended (Log out in another tab, a new password) gets 401
-// {login: true}: the page goes to the login page, and the call never settles, so nothing
-// shows an error on the way out. A 401 without `login` is about the Claude key.
+// A call made once the session has ended (Log out in another tab, a new password, SESSION_DAYS
+// passed) gets 401 {login: true}: the page goes to the login page, which says so, and the call
+// never settles, so nothing shows an error on the way out. A question being sent (until the
+// server has kept it) or typed, and a new instruction, go along in this tab's sessionStorage
+// and are back in their boxes after logging in. A 401 without `login` is about the Claude key.
 const loginGone = (status, data) => status === 401 && data?.login === true;
-const toLogin = () => { location.assign('/login'); return new Promise(() => {}); };
+let asking = '';      // the question being sent, until its start event says the server kept it
+let leaving = false;  // on the way to the login page already (Log out, or a call before this one)
+const toLogin = () => {
+  if (!leaving) {
+    leaving = true;
+    const question = [asking, $('question').value.trim()].filter(Boolean).join('\n\n');
+    try { sessionStorage.setItem('draft', JSON.stringify({ question, rule: $('newrule').value.trim() })); } catch {}
+    location.assign('/login?ended=1');
+  }
+  return new Promise(() => {});
+};
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { 'X-API-Key': key.value, ...OWN, ...(opts.headers || {}) } });
@@ -1760,7 +1776,8 @@ $('stop').onclick = () => { stopAnswer(); $('question').focus(); };
 // how many characters of it are shown (code points, as the server counts).
 let live = null;
 function reportStop(l) {
-  if (!l) return;
+  if (!l || l.reported) return;  // once: Log out reports it before pagehide, and so does Stop
+  l.reported = true;
   fetch('/api/chat/stop', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json', ...OWN },
     body: JSON.stringify({ conversation_id: l.conversation_id, answer_id: l.answer_id, shown: l.shown }) }).catch(() => {});
 }
@@ -1851,8 +1868,9 @@ async function ask(question) {
     if (scopeGone) throw new Error(GONE);  // never every document unasked
     const req = { question, model: $('chatModel').value, ...(scope.length ? { doc_ids: scope } : {}),
                   ...(chat ? { conversation_id: chat.id } : {}) };
+    asking = question;
     const r = await fetchAnswer(req, ctl.signal, {
-      start: s => { live = mine = { conversation_id: s.conversation_id, answer_id: s.answer_id, shown: 0 }; follow(s); },
+      start: s => { asking = ''; live = mine = { conversation_id: s.conversation_id, answer_id: s.answer_id, shown: 0 }; follow(s); },
       meta: m => { meta = m; follow(m); },
       delta: piece => {
         const pinned = nearBottom();
@@ -1892,6 +1910,7 @@ async function ask(question) {
   }
   if (answering === ctl) answering = null;
   if (live === mine) live = null;
+  asking = '';
   busy = false;
   $('send').hidden = false; $('stop').hidden = true;
   if (shown === chatShown) loadChats();
@@ -1915,8 +1934,24 @@ $('ask').onsubmit = e => {
   ask(question);
 };
 
-// Log out, when there is a login (body.login: on a phone, Instructions is shortened to make room for it).
+// Log out, when there is a login (body.login: where the row is short of room, Instructions reads Rules).
 api('/api/session').then(s => { $('logout').hidden = !s.login; document.body.classList.toggle('login', !!s.login); }).catch(() => {});
+// An answer being written is stopped first, while the session still lets the stop report through
+// (pagehide's would get 401, and the server would keep more than the page showed). The Claude key
+// typed here is forgotten, so whoever logs in next in this browser isn't using it.
+$('logoutform').addEventListener('submit', () => {
+  leaving = true;
+  reportStop(live);
+  stopAnswer();
+  key.value = ''; store.set('claudeKey', '');
+});
+// What was being written when the session ended (toLogin), back in its box.
+try {
+  const draft = JSON.parse(sessionStorage.getItem('draft') || 'null');
+  sessionStorage.removeItem('draft');
+  if (draft?.question && !qbox.value) { qbox.value = draft.question; qbox.oninput(); }
+  if (draft?.rule) { $('newrule').value = draft.rule; $('rulesbtn').click(); }
+} catch {}
 const lastChat = +store.get('chatConversation');
 if (lastChat) openChat(lastChat); else emptyState();  // the conversation open before a reload
 loadChats();

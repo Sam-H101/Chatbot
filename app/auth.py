@@ -45,6 +45,12 @@ def setup(app):
                       SESSION_REFRESH_EACH_REQUEST=False)
     app.register_blueprint(bp)
     app.before_request(gate)
+    # Said at start, so a password compose has emptied (a $ in .env read as a variable) shows in
+    # the log. A warning, as that is what reaches the container's log.
+    if PASSWORD:
+        log.warning("Login on: APP_PASSWORD is set, every page and API call asks for it")
+    else:
+        log.warning("No login: APP_PASSWORD is unset or empty, so anyone who can reach the app can use it")
 
 
 def secret_key():
@@ -119,7 +125,8 @@ def _fail(ip, now):
 
 
 def _next(raw):
-    """Where to go after logging in: a path on this site, nothing else (no //host, no scheme).
+    """Where to go after logging in: a path on this site, nothing else (no //host, no scheme),
+    with the #fragment the login page adds (an original's #page=5), which the server never sees.
     Browsers drop tabs and line breaks from a URL, so "/\\t/host" would become "//host": a next
     with any whitespace or control character is refused too (one made by gate() has none)."""
     if (not raw or not raw.startswith("/") or raw.startswith("//") or "\\" in raw
@@ -152,8 +159,9 @@ def gate():
     return None
 
 
-def _page(next_url, error=None, status=200, wait=0):
-    resp = current_app.make_response((render_template("login.html", next_url=next_url, error=error), status))
+def _page(next_url, error=None, status=200, wait=0, ended=False):
+    page = render_template("login.html", next_url=next_url, error=error, ended=ended)
+    resp = current_app.make_response((page, status))
     resp.headers["Cache-Control"] = "no-store"
     if wait:
         resp.headers["Retry-After"] = str(wait)
@@ -165,7 +173,8 @@ def login_page():
     if not PASSWORD:
         return redirect("/")
     next_url = _next(request.args.get("next"))
-    return redirect(next_url) if logged_in() else _page(next_url)
+    # ?ended=1: the app's page was sent here by a 401, so the session ended under it.
+    return redirect(next_url) if logged_in() else _page(next_url, ended=request.args.get("ended") == "1")
 
 
 @bp.post("/login")
