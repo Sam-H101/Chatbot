@@ -2,11 +2,12 @@
 import base64
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 
-from . import units
+from . import extract, units
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
@@ -18,12 +19,14 @@ EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
 ANALYZE_CHARS = int(os.environ.get("CLAUDE_ANALYZE_CHARS", "500000"))
 PDF_CONCURRENCY = int(os.environ.get("PDF_CONCURRENCY", "4"))
 TRANSCRIBE_PROMPT = (
-    "This is pages {first}-{last} of a {total}-page PDF. Transcribe all of its text in "
-    "reading order. Render tables as Markdown tables and headings as Markdown headings. "
-    "For charts, diagrams and photos, write a one-line description in [square brackets], "
-    "including any numbers they show. Leave a blank line between paragraphs. Output only "
-    "the transcription, with no preamble or commentary."
+    "This PDF holds {which} of a {total}-page document, in that order. Transcribe all of its "
+    "text in reading order. Begin each page with a line containing only <<<PAGE n>>>, where n "
+    "is that page's number in the whole document. Render tables as Markdown tables and headings "
+    "as Markdown headings. For charts, diagrams and photos, write a one-line description in "
+    "[square brackets], including any numbers they show. Leave a blank line between paragraphs. "
+    "Output only the transcription, with no preamble or commentary."
 )
+_PAGE_MARK = re.compile(r"^[ \t]*<<<\s*PAGE\s+(\d+)\s*>>>[ \t]*$", re.M | re.I)
 # Models offered in the UI's model pickers.
 MODELS = [
     ("claude-opus-5-5", "Claude Opus 5.5"),
@@ -120,6 +123,10 @@ class Refused(RuntimeError):
     """Claude's safety filter declined (after any server-side fallbacks)."""
 
 
+class MissingKey(Exception):
+    """No Claude API key: none from the browser and no ANTHROPIC_API_KEY."""
+
+
 def _text(response):
     if response.stop_reason == "refusal":
         raise Refused("Claude declined this request")
@@ -144,15 +151,72 @@ def analyze(client, filename, text, model=MODEL, on_usage=None):
     return json.loads(_text(response)), "full" if len(text) <= ANALYZE_CHARS else "partial"
 
 
-def transcribe_pdf(client, batches, model=MODEL, on_usage=None):
-    """Have Claude read the PDF pages (as text and image) and return their text.
-    `batches` comes from extract.pdf_batches; pieces are read in parallel, so
-    on_usage is called from worker threads."""
+def transcribe_pdf(client, batches, model=MODEL, on_usage=None, on_batch=None):
+    """Have Claude read PDF pages (as text and image). `batches` comes from
+    extract.pdf_batches. Returns {page number: text} for every page in them.
+
+    Pieces are read in parallel, so on_usage is called from worker threads. on_batch
+    ({page: text}) is called in this thread as each piece finishes, so the caller can
+    save it and skip it after a failure; it may raise to stop. The first failure stops
+    pieces not yet started, waits for those under way (they are billed), and is raised."""
+    pages, error, stopped = {}, None, False
     with ThreadPoolExecutor(max_workers=PDF_CONCURRENCY) as pool:
-        return "\n\n".join(pool.map(lambda b: _transcribe(client, model, *b, on_usage=on_usage), batches))
+        futures = [pool.submit(_transcribe, client, model, *b, on_usage=on_usage) for b in batches]
+
+        def fail(e):
+            for other in futures:
+                other.cancel()
+            return error or e
+
+        for f in as_completed(futures):
+            if f.cancelled():
+                continue
+            try:
+                got = f.result()
+            except Exception as e:
+                error = fail(e)
+                continue
+            pages.update(got)
+            if on_batch and not stopped:  # also pieces that finish after another failed
+                try:
+                    on_batch(got)
+                except Exception as e:  # the caller wants to stop (say the job was cancelled)
+                    error, stopped = fail(e), True
+    if error:
+        raise error
+    return pages
 
 
-def _transcribe(client, model, first, last, total, pdf_bytes, on_usage=None):
+def page_names(pages):
+    """[21, ..., 40] -> 'pages 21-40'; [3, 7, 8] -> 'pages 3, 7 and 8'; [5] -> 'page 5'."""
+    if len(pages) == 1:
+        return f"page {pages[0]}"
+    if pages == list(range(pages[0], pages[-1] + 1)):
+        return f"pages {pages[0]}-{pages[-1]}"
+    return "pages " + ", ".join(map(str, pages[:-1])) + f" and {pages[-1]}"
+
+
+def split_pages(text, pages):
+    """A transcription of `pages` -> {page: text}, split at its <<<PAGE n>>> lines. With
+    one mark per page they are taken in order (whatever numbers they carry); otherwise
+    by number, a mark that names none of the pages staying with the page before. Text
+    before the first mark belongs to the first page, so nothing is ever dropped."""
+    parts = _PAGE_MARK.split(text)
+    head, marks = parts[0].strip(), list(zip(parts[1::2], parts[2::2]))
+    out = dict.fromkeys(pages, "")
+    if len(marks) == len(pages):
+        for p, (_, body) in zip(pages, marks):
+            out[p] = body.strip()
+    else:
+        current = pages[0]
+        for number, body in marks:
+            current = int(number) if int(number) in out else current
+            out[current] = f"{out[current]}\n\n{body.strip()}".strip()
+    out[pages[0]] = f"{head}\n\n{out[pages[0]]}".strip()
+    return out
+
+
+def _transcribe(client, model, pages, total, pdf_bytes, on_usage=None):
     with client.beta.messages.stream(
         model=model,
         max_tokens=64000,
@@ -161,23 +225,23 @@ def _transcribe(client, model, first, last, total, pdf_bytes, on_usage=None):
             {"type": "document", "source": {
                 "type": "base64", "media_type": "application/pdf",
                 "data": base64.standard_b64encode(pdf_bytes).decode("ascii")}},
-            {"type": "text", "text": TRANSCRIBE_PROMPT.format(first=first, last=last, total=total)},
+            {"type": "text", "text": TRANSCRIBE_PROMPT.format(which=page_names(pages), total=total)},
         ]}],
         **_fallback(model),
     ) as stream:
         response = stream.get_final_message()
     _report(on_usage, "transcribe", model, response)  # billed even when the reply is unusable
     if response.stop_reason == "max_tokens":
-        raise RuntimeError(f"pages {first}-{last} hold more text than one call can return; "
+        raise RuntimeError(f"{page_names(pages)} hold more text than one call can return; "
                            "lower PDF_PAGES_PER_CALL")
-    return _text(response)
+    return split_pages(_text(response), pages)
 
 
 def build_user_message(question, hits):
     if not hits:
         return question
     # units.fix corrects litre/gallon misprints so the model doesn't repeat them.
-    parts = [f'<excerpt file="{h["filename"]}" part="{h["idx"]}">\n{units.fix(h["text"])}\n</excerpt>'
+    parts = [f'<excerpt file="{h["filename"]}" part="{h["idx"]}">\n{units.fix(extract.plain(h["text"]))}\n</excerpt>'
              for h in hits]
     return "<excerpts>\n" + "\n".join(parts) + "\n</excerpts>\n\n" + question
 

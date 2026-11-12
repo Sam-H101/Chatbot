@@ -52,6 +52,21 @@ Everything below is uncommitted in the working tree.
   (ids get reused). Also: a failed insert no longer leaves its file behind, CR/LF in an uploaded file name
   no longer breaks its Open link, ids past 64 bits give 404 instead of 500, and Open is a bigger tap target
   on phones. 60 tests pass.
+- 2026-11-12: Plan items 5 and 8, and re-reading (item 7). Uploads are now jobs (`jobs` table, `app/jobs.py`):
+  `POST /api/upload` stores the file, checks duplicates and answers 202; one worker thread reads jobs in order
+  and saves stage, page counts and every page a model read, so Retry or a restart carries on where it stopped
+  (jobs left running are re-queued on the first request after a start). The upload list polls `GET /api/jobs`:
+  stage text and a progress bar, Added/Replaced, the Auto switch note, errors with Retry, Cancel, and it all
+  comes back after a reload. Re-read: the table view's **Re-read with** sends `POST /api/documents/<id>/reread`,
+  which replaces text, chunks, metadata and model in place. PDF readers return one text per page, joined with
+  `\f`; chunks keep the page breaks (counting them gives a chunk's page later), and search, excerpts and analysis
+  read them as paragraph breaks. Claude now reads only scanned pages by default (`CLAUDE_PDF_PAGES`), as a new
+  PDF of those pages with their page numbers; a "Claude reads every page" box overrides it. Claude jobs are
+  estimated first and wait for Start at `CONFIRM_COST_USD` ($1.00) or more. Usage is logged per call as it
+  happens (new `usage.job_id`), linked to the document when the job ends. Also fixed: an unsupported file no
+  longer logs a traceback; "Read with" no longer wraps on phones. 81 tests pass. Staging: qwen3.5 + minicpm
+  (progress, cancel mid-read, restart mid-read resumed without re-reading pages), Claude Haiku on 2 small PDFs
+  ($0.0007; only the scanned page sent), a 60-page Opus job held at $1.35 and cancelled; UI in light, dark, 390px.
 
 ## To do
 
@@ -91,13 +106,13 @@ Ordered by priority. Suggested start: 1 and 2, then 5. Item 12 is small and wort
 
 ### Phase 2: Uploads
 
-- [ ] 5. Background uploads with progress. An upload is one request with a 600 s gunicorn timeout;
+- [x] 5. Background uploads with progress. An upload is one request with a 600 s gunicorn timeout;
       a 200 MB scan on the local model can exceed it. Job queue, "page 40 of 312", resume on failure.
 - [x] 6. Duplicate detection. Hash the file and offer replace or skip
       ("Chapter 6 Hydraulic System-1.pdf" is in the library twice).
 - [x] 7. Keep the original file. Only extracted text is stored. Keeping the PDF allows re-reading
       with a different model without re-uploading, and viewing the cited page.
-- [ ] 8. Cheaper Claude reading. Send only scanned pages to Claude and use the text layer for the
+- [x] 8. Cheaper Claude reading. Send only scanned pages to Claude and use the text layer for the
       rest (the Ollama path already does). Show an estimated cost before a large upload.
 
 ### Phase 3: Chat experience

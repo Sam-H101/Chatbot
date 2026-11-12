@@ -18,6 +18,8 @@ services:
       - CLAUDE_MODEL
       - CLAUDE_EFFORT
       - CLAUDE_ANALYZE_CHARS
+      - CLAUDE_PDF_PAGES
+      - CONFIRM_COST_USD
       - SYSTEM_PROMPT
       - PDF_EXTRACTOR
       - MAX_UPLOAD_MB

@@ -6,5 +6,6 @@ COPY app ./app
 ENV DB_PATH=/data/metabase.db
 VOLUME /data
 EXPOSE 8000
-# One worker: SQLite is a single file. Threads handle concurrent requests; long timeout for Claude calls.
+# One worker: SQLite is a single file, and uploads are read by one background thread in that
+# process (app/jobs.py). Threads handle concurrent requests; long timeout for Claude chat calls.
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "8", "--timeout", "600", "app.main:app"]

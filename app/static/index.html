@@ -49,14 +49,26 @@
   #drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--card)); }
   #drop p { margin: 0 0 10px; font-family: var(--serif); font-size: 16px; }
   #drop small { display: block; margin-top: 8px; }
-  #queue { margin: 8px 20px 0; display: grid; gap: 4px; }
+  #drop .pick.check { display: flex; justify-content: center; margin-top: 6px; }
+  .pick.check input { margin: 0; width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+  .pick.check { cursor: pointer; }
+  #queue { margin: 8px 20px 0; display: grid; gap: 4px; max-height: 45dvh; overflow-y: auto; }
   .job { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; font-size: 13px; padding: 5px 10px; border-radius: 8px; background: var(--card); border: 1px solid var(--line); }
   .job b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-  .job.ok > span { color: var(--ok); } .job.bad > span { color: var(--bad); }
+  .job .state { white-space: nowrap; color: var(--soft); }
+  .job.ok .state { color: var(--ok); } .job.bad .state { color: var(--bad); }
   .job.dup { border-color: var(--accent); }
-  .dupask { flex-basis: 100%; display: grid; gap: 6px; padding: 2px 0 3px; color: var(--soft); font-size: 12px; overflow-wrap: anywhere; }
-  .dupask div { display: flex; flex-wrap: wrap; gap: 6px; }
-  .dupask button { font-size: 12px; padding: 3px 10px; }
+  .job .x { border: 0; background: none; padding: 2px 5px; margin: -2px -5px -2px 0; color: var(--soft); line-height: 1; }
+  .job .x.sure { color: var(--bad); font-size: 12px; font-weight: 600; }
+  .bar { flex-basis: 100%; height: 4px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: inherit; transition: width .4s; }
+  .bar.wait i { width: 30%; animation: slide 1.3s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  .job .detail { flex-basis: 100%; display: grid; gap: 2px; font-size: 12px; color: var(--soft); overflow-wrap: anywhere; }
+  .job.bad .detail .err { color: var(--bad); }
+  .job .acts { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 3px; }
+  .job .detail:empty, .job .acts:empty { display: none; }
+  .job .acts button { font-size: 12px; padding: 3px 10px; }
   a.open { color: var(--accent); font-weight: 600; text-decoration: none; }
   a.open:hover { text-decoration: underline; }
   @media (pointer: coarse), (max-width: 820px) {  /* a finger-sized target; the negative margin keeps the layout */
@@ -112,7 +124,7 @@
   .composer:focus-within { border-color: var(--accent); }
   .composer textarea { flex: 1; border: 0; background: none; resize: none; outline: 0; padding: 6px 0; max-height: 180px; }
   .hint { max-width: 740px; margin: 6px auto 0; font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; justify-content: space-between; }
-  .pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--soft); max-width: 100%; }
+  .pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--soft); max-width: 100%; white-space: nowrap; }
   #drop .pick { margin-top: 10px; }
   .pick select { font: 12px/1.2 var(--mono); color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; min-width: 0; max-width: 230px; text-overflow: ellipsis; }
   .pick select:hover { border-color: var(--accent); }
@@ -126,6 +138,7 @@
   .tvhead h2 { font: 600 20px/1.2 var(--serif); margin: 0; }
   .tvhead .grow { flex: 1; }
   #delsel.sure { background: var(--bad); border-color: var(--bad); color: #fff; }
+  .rereadbar { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
   .tvbody { flex: 1; overflow: auto; padding: 12px 18px 18px; }
   #doctable { font-size: 13px; }
   #doctable td { vertical-align: top; overflow-wrap: break-word; min-width: 110px; }
@@ -210,6 +223,7 @@
     <button class="primary" id="browse" type="button">Choose files</button>
     <small class="muted">PDF (text or scanned), DOCX, text</small>
     <label class="pick">Read with <select id="docModel" aria-label="Model that reads uploaded documents"></select></label>
+    <label class="pick check" id="allPagesBox" hidden><input type="checkbox" id="allPages"> Claude reads every page</label>
     <input id="file" type="file" multiple hidden accept=".pdf,.docx,.txt,.md,.csv,.json,.html,.xml,.log,.py,.js,text/*">
   </div>
   <div id="queue"></div>
@@ -236,9 +250,14 @@
   <dialog id="tableview" aria-labelledby="tvtitle">
     <div class="tvhead">
       <h2 id="tvtitle">All documents</h2>
-      <span class="muted" id="selcount"></span>
+      <span class="muted" id="selcount" role="status"></span>
       <span class="grow"></span>
       <button id="selnone" type="button" hidden>Clear selection</button>
+      <span class="rereadbar">
+        <label class="pick">Re-read with <select id="rereadModel" aria-label="Model that re-reads the selected documents"></select></label>
+        <label class="pick check" id="rereadAllBox" hidden><input type="checkbox" id="rereadAll"> every page</label>
+        <button id="rereadsel" type="button" disabled>Re-read</button>
+      </span>
       <button id="delsel" type="button" disabled>Delete selected</button>
       <button class="icon" id="tvclose" type="button" aria-label="Close table">✕</button>
     </div>
@@ -345,8 +364,24 @@ showKey();
 // ---- model pickers ----
 // Values: 'auto', 'ollama:<model>' or 'claude:<model>'. Each picker remembers its choice.
 let MODELS = { local: [], claude: [], auto: {}, default: 'auto' };
-const PICKERS = { docModel: 'docModel', chatModel: 'chatModel' };
+const PICKERS = { docModel: 'docModel', chatModel: 'chatModel', rereadModel: 'rereadModel' };
 const claudeReady = () => MODELS.server_key || !!key.value.trim();
+// "Claude reads every page", beside the pickers that read documents. Shown only for a
+// Claude model; off, Claude reads only scanned pages and the text layer does the rest.
+const PAGE_BOXES = { docModel: ['allPagesBox', 'allPages'], rereadModel: ['rereadAllBox', 'rereadAll'] };
+const PAGES_TIP = 'Off: pages that have a text layer are used as they are, and only scanned pages go to Claude (cheaper). '
+  + 'On: Claude reads every page as text and image, which helps with complex tables and layouts but costs more.';
+function syncPageBoxes() {
+  for (const [sel, [box]] of Object.entries(PAGE_BOXES)) $(box).hidden = !$(sel).value.startsWith('claude:');
+}
+const claudePages = sel => $(PAGE_BOXES[sel][1]).checked ? 'all' : 'scanned';
+for (const [box, input] of Object.values(PAGE_BOXES)) {
+  $(box).title = PAGES_TIP;
+  $(input).onchange = e => {
+    store.set('claudeAllPages', e.target.checked ? '1' : '0');
+    for (const [, other] of Object.values(PAGE_BOXES)) $(other).checked = e.target.checked;
+  };
+}
 
 function fillPicker(sel) {
   const want = sel.value || store.get(PICKERS[sel.id]) || MODELS.default || 'auto';
@@ -365,15 +400,18 @@ function fillPicker(sel) {
   sel.append(g1, g2);
   sel.value = [...sel.options].some(o => o.value === want) ? want : 'auto';
 }
-const fillPickers = () => Object.keys(PICKERS).forEach(id => fillPicker($(id)));
+const fillPickers = () => { Object.keys(PICKERS).forEach(id => fillPicker($(id))); syncPageBoxes(); };
 
 async function loadModels() {
   try { MODELS = await api('/api/models'); } catch {}
+  const all = store.get('claudeAllPages');
+  for (const [, input] of Object.values(PAGE_BOXES)) $(input).checked = all ? all === '1' : MODELS.claude_pages === 'all';
   fillPickers();
 }
 for (const id of Object.keys(PICKERS)) {
   $(id).onchange = e => {
     store.set(PICKERS[id], e.target.value);
+    syncPageBoxes();
     if (e.target.value.startsWith('claude:') && !claudeReady()) { $('settings').hidden = false; key.focus(); }
   };
 }
@@ -444,6 +482,9 @@ $('q').oninput = () => { clearTimeout(timer); timer = setTimeout(loadDocs, 200);
 // ---- table view (DataTables) with bulk delete ----
 let table = null;
 const picked = new Set();  // ids of selected documents, kept across pages, sorting and searching
+let docsById = new Map();
+// Selected documents that can be re-read: those with a kept original.
+const rereadable = () => [...picked].filter(id => docsById.get(id)?.has_file);
 
 function syncPicked() {
   const n = picked.size;
@@ -453,6 +494,12 @@ function syncPicked() {
   del.disabled = !n;
   del.classList.remove('sure');
   del.textContent = n ? `Delete ${n}` : 'Delete selected';
+  const can = rereadable().length, re = $('rereadsel');
+  re.disabled = !can;
+  re.textContent = can ? `Re-read ${can}` : 'Re-read';
+  re.title = n && can < n
+    ? `${n - can} of the selected documents ${n - can > 1 ? 'were' : 'was'} uploaded before originals were kept, so ${n - can > 1 ? 'they' : 'it'} can't be re-read`
+    : 'Read the kept originals of the selected documents again with the chosen model. Each keeps its place in the library.';
   if (!table) return;
   for (const box of $('doctable').querySelectorAll('tbody input.rowsel')) {
     box.checked = picked.has(+box.value);
@@ -467,7 +514,8 @@ function syncPicked() {
 async function openTable() {
   let docs;
   try { docs = await api('/api/documents'); } catch (err) { alert(err.message); return; }
-  for (const id of [...picked]) if (!docs.some(d => d.id === id)) picked.delete(id);
+  docsById = new Map(docs.map(d => [d.id, d]));
+  for (const id of [...picked]) if (!docsById.has(id)) picked.delete(id);
   if (!table) {
     const text = DataTable.render.text();
     table = new DataTable('#doctable', {
@@ -536,6 +584,27 @@ $('delsel').onclick = async () => {
   } catch (err) { alert(err.message); }
   await openTable();
   loadDocs();
+};
+$('rereadsel').onclick = async () => {
+  const ids = rereadable(), model = $('rereadModel').value, btn = $('rereadsel');
+  if (model.startsWith('claude:') && !claudeReady()) { $('settings').hidden = false; key.focus(); return; }
+  btn.disabled = true;
+  const body = { model, ...(model.startsWith('claude:') ? { claude_pages: claudePages('rereadModel') } : {}) };
+  let queued = 0;
+  const errors = [];
+  for (const id of ids) {
+    try {
+      const r = await api(`/api/documents/${id}/reread`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      showJob(jobRow(r.job.id), r.job);
+      queued++;
+    } catch (err) { errors.push(`${docsById.get(id)?.filename}: ${err.message}`); }
+  }
+  picked.clear();
+  syncPicked();
+  if (queued) startPolling();
+  $('selcount').textContent = (queued ? `${queued} re-read${queued > 1 ? 's' : ''} queued; progress shows under the upload box. ` : '')
+    + errors.join(' · ');
 };
 
 // ---- instructions (added to every question's system prompt) ----
@@ -671,74 +740,227 @@ $('usagedays').onchange = loadUsage;
 $('uvclose').onclick = () => $('usageview').close();
 $('usageview').addEventListener('click', e => { if (e.target === $('usageview')) $('usageview').close(); });
 
-// ---- upload ----
+// ---- upload queue: each file is sent, then read on the server as a background job ----
+// A row per upload or re-read: name, state, ✕, a progress bar, details, buttons. Rows are
+// updated in place from GET /api/jobs, so buttons keep their focus between polls.
+const ACTIVE = new Set(['queued', 'awaiting_confirmation', 'running']);
+const jobRows = new Map();  // job id -> row
+const gone = new Set();     // jobs whose row was closed: a poll already under way mustn't bring it back
+
+function newRow() {
+  const row = el('div', 'job');
+  row.nameEl = el('b');
+  row.spin = el('span', 'spin');
+  row.state = el('span', 'state');
+  row.x = Object.assign(el('button', 'x', '✕'), { type: 'button' });
+  row.bar = el('div', 'bar');
+  row.fill = el('i');
+  row.bar.append(row.fill);
+  row.detail = el('div', 'detail');
+  row.acts = el('div', 'acts');
+  row.append(row.nameEl, row.spin, row.state, row.x, row.bar, row.detail, row.acts);
+  $('queue').append(row);
+  return row;
+}
+
+function jobRow(id) {
+  if (!jobRows.has(id)) jobRows.set(id, newRow());
+  return jobRows.get(id);
+}
+
+function dropRow(row) {
+  row.remove();
+  for (const [id, r] of jobRows) if (r === row) { jobRows.delete(id); gone.add(id); }
+}
+
+// What a row shows. bar: null (none), 'wait' (moving) or 0..1; buttons: [[label, tip, onclick]];
+// x: the ✕ as [tip, onclick], or null for none.
+function paint(row, { name, state, cls = '', spin = false, bar = null, lines = [], buttons = [], x = null }) {
+  row.className = 'job' + (cls ? ' ' + cls : '');
+  row.nameEl.textContent = name;
+  row.title = name;
+  row.spin.hidden = !spin;
+  row.state.textContent = state;
+  row.bar.hidden = bar === null;
+  row.bar.classList.toggle('wait', bar === 'wait');
+  row.fill.style.width = typeof bar === 'number' ? `${Math.round(bar * 100)}%` : '';
+  if (row.note) lines = [...lines, [row.note, 'err']];  // a button's error, until the next click
+  row.detail.replaceChildren(...lines.filter(l => l[0]).map(([text, c]) => el('div', c || '', text)));
+  const sig = JSON.stringify([buttons.map(b => b[0]), x && x[0]]);
+  if (row.sig !== sig) {  // rebuilt only when they change, so focus and hover survive a poll
+    row.sig = sig;
+    row.acts.replaceChildren(...buttons.map(([label, tip]) => Object.assign(el('button', '', label), { type: 'button', title: tip })));
+    row.x.classList.remove('sure');
+    row.x.textContent = '✕';
+  }
+  [...row.acts.children].forEach((b, i) => b.onclick = buttons[i][2]);
+  row.x.hidden = !x;
+  if (x) { row.x.title = x[0]; row.x.setAttribute('aria-label', x[0]); row.x.onclick = x[1]; }
+}
+
+function estimateText(e) {
+  if (!e) return '';
+  const cost = `about ${fmtTok(e.input_tokens)} input and ${fmtTok(e.output_tokens)} output tokens, est. ${fmtUsd(e.cost_usd)}`;
+  if (e.mode == null) return `${e.model_label} analyzes the text: ${cost}`;
+  if (!e.claude_pages) return `No scanned pages, so ${e.model_label} only analyzes the text layer: ${cost}`;
+  const which = e.claude_pages === e.pages ? `all ${e.pages} page${e.pages > 1 ? 's' : ''}`
+    : `${e.claude_pages} of ${e.pages} pages (the scanned ones)`;
+  return `${e.model_label} reads ${which}: ${cost}`;
+}
+
+const sure = (btn, then) => () => {  // a second click within 3 s confirms
+  if (btn.classList.contains('sure')) { then(); return; }
+  btn.classList.add('sure'); btn.textContent = 'Cancel?';
+  setTimeout(() => { btn.classList.remove('sure'); btn.textContent = '✕'; }, 3000);
+};
+
+async function jobAction(row, id, what) {
+  row.note = '';
+  try {
+    const r = await api(`/api/jobs/${id}/${what}`, { method: 'POST' });
+    if (r?.job) showJob(row, r.job);
+  } catch (err) {
+    if (err.status === 401) { $('settings').hidden = false; key.focus(); }
+    row.note = err.message;
+    if (row.job) showJob(row, row.job);
+  }
+  startPolling(0);
+}
+
+function showJob(row, j) {
+  const before = row.job?.status;
+  row.job = j;
+  const name = (j.kind === 'reread' ? 'Re-read · ' : '') + j.filename;
+  const est = estimateText(j.estimate), act = what => () => jobAction(row, j.id, what);
+  const switched = j.options?.switched ? `Switched to Claude: ${j.options.switched}` : '';
+  if (j.status === 'cancelled') { dropRow(row); return; }
+  if (j.status === 'queued' || j.status === 'running') {
+    const reading = j.status === 'running' && j.total > 0 && j.progress < j.total;
+    paint(row, { name, state: j.status === 'queued' ? 'Queued' : 'Working', spin: true,
+      bar: reading ? j.progress / j.total : 'wait', lines: [[j.stage], [switched], [est]],
+      x: ['Cancel this job', null] });
+    row.x.onclick = sure(row.x, act('cancel'));
+  } else if (j.status === 'awaiting_confirmation') {
+    paint(row, { name, state: 'Confirm cost', cls: 'dup',
+      lines: [[switched], [est], [`Jobs estimated at ${fmtUsd(j.estimate?.confirm_at)} or more wait for a go-ahead.`]],
+      buttons: [['Start', 'Read it with Claude at about this cost', act('confirm')],
+                ['Cancel', 'Leave the library as it is', act('cancel')]] });
+  } else if (j.status === 'failed') {
+    const kept = j.pages_kept ? ` (keeps the ${j.pages_kept} page${j.pages_kept > 1 ? 's' : ''} already read)` : '';
+    paint(row, { name, state: 'Failed', cls: 'bad', lines: [[j.error, 'err'], [est]],
+      buttons: [['Retry', 'Try this job again' + kept, act('retry')]],
+      x: ['Dismiss this failed job', act('cancel')] });
+  } else if (j.status === 'done') {
+    const r = j.result || {};
+    const verb = j.kind === 'reread' ? 'Re-read' : r.replaced?.length ? 'Replaced' : 'Added';
+    paint(row, { name, state: `${verb} · ${r.model_label || ''}`, cls: 'ok',
+      lines: [[r.switched ? `Switched to ${r.model_label}: ${r.switched}` : ''], [est]],
+      x: ['Hide', () => dropRow(row)] });
+    if (before !== 'done' && !r.switched) setTimeout(() => dropRow(row), 4000);
+  }
+}
+
+// Poll while any job is unfinished, or an action asked for news.
+let pollTimer = null, polling = false, pollAgain = false;
+function startPolling(delay = 300) {
+  pollAgain = true;
+  if (!polling && !pollTimer) pollTimer = setTimeout(pollJobs, delay);
+}
+
+async function pollJobs() {
+  pollTimer = null; polling = true; pollAgain = false;
+  let list = null, active = false, finished = false;
+  try { list = await api('/api/jobs'); } catch {}
+  if (list) {
+    const ids = new Set(list.map(j => j.id));
+    for (const j of list) {
+      const row = jobRows.get(j.id);
+      // Unknown here and already finished: done before this page saw it (the library shows it).
+      if (!row && ((!ACTIVE.has(j.status) && j.status !== 'failed') || gone.has(j.id))) continue;
+      if (row?.job && row.job.status !== 'done' && j.status === 'done') finished = true;
+      showJob(row || jobRow(j.id), j);
+      active ||= ACTIVE.has(j.status);
+    }
+    for (const [id, row] of jobRows) if (!ids.has(id)) dropRow(row);  // dismissed elsewhere
+    if (finished) { loadDocs(); if ($('tableview').open) openTable(); }
+  }
+  polling = false;
+  if (active || pollAgain || !list) pollTimer = setTimeout(pollJobs, !list ? 5000 : document.hidden ? 4000 : 1500);
+}
+
+// The upload itself, with progress (fetch can't report upload progress).
+function send(path, body, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('POST', path);
+    x.setRequestHeader('X-API-Key', key.value);
+    x.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    x.onload = () => {
+      let data = null;
+      try { data = JSON.parse(x.responseText); } catch {}
+      if (x.status >= 200 && x.status < 300) return resolve(data);
+      const msg = data?.error || (x.status === 413 ? 'File is too large to upload' : `${x.status} ${x.statusText}`);
+      reject(Object.assign(new Error(msg), { status: x.status, data }));
+    };
+    x.onerror = () => reject(new Error('The upload broke off: is the server reachable?'));
+    x.send(body);
+  });
+}
+
 async function uploadAll(files) {
   for (const f of files) await uploadOne(f);
 }
 
 // onDuplicate: '' (the server answers 409 if the file is already in the library),
-// 'replace' or 'keep'. A job row is reused when the user answers the duplicate prompt.
-async function uploadOne(f, onDuplicate = '', job = null) {
-  if (!job) $('queue').append(job = el('div'));
-  job.className = 'job';
-  const state = el('span', 'spin');
-  job.replaceChildren(el('b', '', f.name), state);
-  job.title = f.name;
+// 'replace' or 'keep'. The row is reused when the user answers the duplicate prompt.
+async function uploadOne(f, onDuplicate = '', row = null) {
+  row ||= newRow();
+  const model = $('docModel').value;
   const body = new FormData();
   body.append('file', f);
-  body.append('model', $('docModel').value);
+  body.append('model', model);
+  if (model.startsWith('claude:')) body.append('claude_pages', claudePages('docModel'));
   if (onDuplicate) body.append('on_duplicate', onDuplicate);
+  const uploading = p => paint(row, { name: f.name, state: p < 1 ? `Uploading ${Math.floor(p * 100)}%` : 'Uploaded',
+    spin: true, bar: p < 1 ? p : 'wait' });
+  uploading(0);
   try {
     const limit = MODELS.max_upload_mb;  // check before sending megabytes the server will refuse
     if (limit && f.size > limit * 1024 * 1024)
       throw new Error(`${(f.size / 1048576).toFixed(0)} MB is over the ${limit} MB upload limit`);
-    const r = await api('/api/upload', { method: 'POST', body });
-    job.classList.add('ok'); state.className = '';
-    state.textContent = (r.replaced?.length ? 'Replaced · ' : 'Added · ') + r.model_label;
-    if (r.switched) {
-      job.title = `Read by ${r.model_label}: ${r.switched}`;
-      job.after(Object.assign(el('div', 'muted', `Switched to ${r.model_label}: ${r.switched}`), { style: 'padding:0 10px' }));
-    } else setTimeout(() => job.remove(), 4000);
+    const r = await send('/api/upload', body, uploading);
+    jobRows.set(r.job.id, row);
+    showJob(row, r.job);
+    startPolling();
   } catch (err) {
-    state.className = '';
-    if (err.status === 409 && err.data?.duplicate) askDuplicate(f, job, state, err.data.duplicate);
+    if (err.status === 409 && err.data?.duplicate) askDuplicate(f, row, err.data.duplicate);
     else {
-      job.classList.add('bad'); state.textContent = 'Failed';
-      job.title = err.message;
-      job.append(Object.assign(el('button', 'x', '✕'), { type: 'button', onclick: () => job.remove() }));
-      job.after(Object.assign(el('div', 'muted', err.message), { style: 'padding:0 10px' }));
+      if (err.status === 401) { $('settings').hidden = false; key.focus(); }
+      paint(row, { name: f.name, state: 'Failed', cls: 'bad', lines: [[err.message, 'err']], x: ['Hide', () => dropRow(row)] });
     }
   }
-  loadDocs();
 }
 
-function askDuplicate(f, job, state, dup) {
-  job.classList.add('dup');
-  const ask = el('div', 'dupask');
+function askDuplicate(f, row, dup) {
   const choices = [
     ['Replace', 'replace', 'Read this file and delete the copy already in the library'],
     ['Keep both', 'keep', 'Add this file as another copy'],
     ['Skip', '', 'Leave the library as it is'],
   ];
-  if (dup.in_progress) {  // e.g. the page was reloaded during an upload: the server is still reading it
-    state.textContent = 'Being read';
-    ask.append(el('span', '', `The same file is being read right now as “${dup.filename}” (started ${dup.started_at} UTC). `
-      + 'It appears in the library when done, even after a reload.'));
+  let state, text;
+  if (dup.in_progress) {  // say the page was reloaded during an upload: the server is still on it
+    state = 'Being read';
+    text = `The same file is queued or being read right now as “${dup.filename}” (since ${dup.started_at} UTC). `
+      + 'It appears in the library when done, even after a reload.';
     choices.shift();  // nothing to replace yet
   } else {
-    state.textContent = 'Already added';
+    state = 'Already added';
     const by = dup.model ? `, read by ${dup.model}` : '';
     const copies = dup.copies > 1 ? ` (${dup.copies} copies)` : '';
-    ask.append(el('span', '', `The same file is in the library as “${dup.filename}”${copies}, added ${dup.created_at} UTC${by}.`));
+    text = `The same file is in the library as “${dup.filename}”${copies}, added ${dup.created_at} UTC${by}.`;
   }
-  const buttons = el('div');
-  for (const [label, how, tip] of choices) {
-    const b = Object.assign(el('button', '', label), { type: 'button', title: tip });
-    b.onclick = () => how ? uploadOne(f, how, job) : job.remove();
-    buttons.append(b);
-  }
-  ask.append(buttons);
-  job.append(ask);
+  paint(row, { name: f.name, state, cls: 'dup', lines: [[text]],
+    buttons: choices.map(([label, how, tip]) => [label, tip, () => how ? uploadOne(f, how, row) : dropRow(row)]) });
 }
 $('browse').onclick = () => $('file').click();
 $('file').onchange = e => { uploadAll([...e.target.files]); e.target.value = ''; };
@@ -818,6 +1040,7 @@ emptyState();
 loadModels();
 loadDocs();
 loadRules();
+pollJobs();  // uploads still queued or being read, and failed ones, also after a reload
 </script>
 </body>
 </html>

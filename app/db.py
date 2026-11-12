@@ -1,6 +1,7 @@
 """Embedded metadata database: SQLite + FTS5. One file, no server.
 Original uploads are kept as plain files next to it (see files_dir)."""
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -13,7 +14,11 @@ DB_PATH = os.environ.get("DB_PATH", "data/metabase.db")
 FILES_DIR = os.environ.get("FILES_DIR", "")
 # Serialises writing and removing stored files with the rows that point at them, so a
 # delete never removes a file that an upload is about to reference (one gunicorn worker).
-_files_lock = threading.Lock()
+# Reentrant: the upload route holds it across its duplicate check and add_job.
+files_lock = threading.RLock()
+# Jobs that still need their file: waiting, running, or failed (and so retryable).
+ACTIVE_JOBS = ("queued", "awaiting_confirmation", "running")
+HOLDING_JOBS = ACTIVE_JOBS + ("failed",)
 # The schema is brought up to date once per database per process, under this lock: the
 # page's first requests arrive together, and two threads that both saw a column missing
 # would both run ALTER TABLE, failing the slower request.
@@ -48,10 +53,35 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd           REAL NOT NULL DEFAULT 0,
-    doc_id             INTEGER              -- no foreign key: the cost stays logged after a delete,
+    doc_id             INTEGER,             -- no foreign key: the cost stays logged after a delete,
                                             -- with doc_id set to NULL (ids get reused)
+    job_id             INTEGER              -- the upload or re-read job that made the call
 );
 CREATE INDEX IF NOT EXISTS usage_created ON usage(created_at);
+CREATE TABLE IF NOT EXISTS jobs (           -- uploads and re-reads, worked through by jobs.py
+    id         INTEGER PRIMARY KEY,
+    kind       TEXT NOT NULL,               -- 'upload' or 'reread'
+    status     TEXT NOT NULL DEFAULT 'queued',  -- queued, awaiting_confirmation, running, done, failed, cancelled
+    filename   TEXT NOT NULL,
+    sha256     TEXT NOT NULL,               -- the original, kept as files_dir()/<file_path>
+    file_path  TEXT NOT NULL,
+    file_size  INTEGER,
+    mime       TEXT,
+    model      TEXT NOT NULL,               -- the choice: 'auto', 'ollama:<model>' or 'claude:<model>'
+    options    TEXT NOT NULL DEFAULT '{}',  -- JSON: on_duplicate, claude_pages, confirmed, ...
+    progress   INTEGER NOT NULL DEFAULT 0,  -- pages read so far
+    total      INTEGER NOT NULL DEFAULT 0,  -- pages to read; 0 while unknown or not a PDF
+    stage      TEXT NOT NULL DEFAULT '',    -- e.g. 'Reading page 40 of 312'
+    error      TEXT,
+    estimate   TEXT,                        -- JSON: what reading with Claude should cost
+    result     TEXT,                        -- JSON, once done: model, title, chunks, ...
+    partial    TEXT,                        -- JSON: pages a model already read, kept for a retry
+    doc_id     INTEGER,                     -- the document added (upload) or re-read (reread)
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS jobs_sha256 ON jobs(sha256);
 CREATE TABLE IF NOT EXISTS chunks (
     id     INTEGER PRIMARY KEY,
     doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -82,6 +112,7 @@ COLUMNS = {
     "file_size": "INTEGER",
     "mime": "TEXT",
 }
+USAGE_COLUMNS = {"job_id": "INTEGER"}  # usage rows from before jobs have none
 
 
 def connect():
@@ -99,15 +130,17 @@ def connect():
 
 def _migrate(con):
     con.executescript(SCHEMA)
-    have = {r[1] for r in con.execute("PRAGMA table_info(documents)")}
-    for name, decl in COLUMNS.items():
-        if name not in have:
-            try:
-                con.execute(f"ALTER TABLE documents ADD COLUMN {name} {decl}")
-            except sqlite3.OperationalError as e:  # another process added it first
-                if "duplicate column name" not in str(e):
-                    raise
+    for table, columns in (("documents", COLUMNS), ("usage", USAGE_COLUMNS)):
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in have:
+                try:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                except sqlite3.OperationalError as e:  # another process added it first
+                    if "duplicate column name" not in str(e):
+                        raise
     con.execute("CREATE INDEX IF NOT EXISTS documents_sha256 ON documents(sha256)")
+    con.execute("CREATE INDEX IF NOT EXISTS usage_job ON usage(job_id)")
 
 
 def _doc(row):
@@ -155,11 +188,11 @@ def _remove(file_path):
 
 
 def stored_file(doc_id):
-    """The kept original of a document: {path, filename, mime, size}, or None for
-    documents uploaded before originals were kept (or whose file has gone missing).
+    """The kept original of a document: {path, filename, mime, size, sha256}, or None
+    for documents uploaded before originals were kept (or whose file has gone missing).
     Re-reading a document with another model starts from here."""
     with connect() as con:
-        row = con.execute("SELECT filename, file_path, file_size, mime FROM documents WHERE id=?",
+        row = con.execute("SELECT filename, sha256, file_path, file_size, mime FROM documents WHERE id=?",
                           (doc_id,)).fetchone()
     if not row or not row["file_path"]:
         return None
@@ -167,7 +200,12 @@ def stored_file(doc_id):
     if not os.path.isfile(path):
         return None
     return {"path": path, "filename": row["filename"], "mime": row["mime"] or "application/octet-stream",
-            "size": row["file_size"]}
+            "size": row["file_size"], "sha256": row["sha256"]}
+
+
+def document_exists(doc_id):
+    with connect() as con:
+        return con.execute("SELECT 1 FROM documents WHERE id=?", (doc_id,)).fetchone() is not None
 
 
 def find_duplicates(sha):
@@ -177,46 +215,91 @@ def find_duplicates(sha):
         return [_doc(r) for r in con.execute("SELECT * FROM documents WHERE sha256=? ORDER BY id DESC", (sha,))]
 
 
-def add_document(filename, chunks, meta, analysis, model="", data=None, mime=None, sha=None, replace=False):
-    """Index a document. `data` is the uploaded file, kept under files_dir(); `sha` is
-    its hash if the caller already has it. replace=True first deletes the documents
-    that hold the same file, in the same transaction. Returns the new id."""
+class JobGone(Exception):
+    """A job's result can't be saved: it was cancelled, or its document deleted, meanwhile."""
+
+
+def _meta(meta):
+    return (meta.get("title", ""), meta.get("doc_type", ""), meta.get("summary", ""),
+            ", ".join(meta.get("keywords", [])))
+
+
+def _insert_chunks(con, doc_id, chunks):
+    for i, text in enumerate(chunks):
+        cid = con.execute("INSERT INTO chunks (doc_id, idx, text) VALUES (?,?,?)", (doc_id, i, text)).lastrowid
+        con.execute("INSERT INTO chunks_fts (rowid, text) VALUES (?,?)", (cid, text))
+
+
+def _finish_job(con, job, doc_id):
+    """Mark job = (id, result dict) done in the caller's transaction, if it is still
+    running, and link its model calls (earlier failed attempts too) to the document."""
+    job_id, result = job
+    result["doc_id"] = doc_id
+    if not con.execute(
+            "UPDATE jobs SET status='done', stage='Done', error=NULL, partial=NULL, doc_id=?, result=?,"
+            " updated_at=datetime('now') WHERE id=? AND status='running'",
+            (doc_id, json.dumps(result), job_id)).rowcount:
+        raise JobGone("The job was cancelled")
+    con.execute("UPDATE usage SET doc_id=? WHERE job_id=?", (doc_id, job_id))
+
+
+def add_document(filename, chunks, meta, analysis, model="", data=None, mime=None, sha=None, replace=False,
+                 size=None, job=None):
+    """Index a document and return its id. Its original is `data`, stored here under
+    files_dir(), or one already stored under its hash `sha` (by an upload job) with
+    `size` bytes; with neither, the document has no kept file. replace=True first
+    deletes the documents that hold the same file, in the same transaction. `job` =
+    (job id, result dict) marks that job done in the same transaction too, the result
+    gaining doc_id and replaced; if the job was cancelled meanwhile, nothing is added."""
     if data is not None:
-        sha = sha or file_hash(data)
-    kept = data is not None
-    with _files_lock:
+        sha, size = sha or file_hash(data), len(data)
+    kept = sha is not None and size is not None
+    with files_lock:
         wrote = False
         try:
             with connect() as con:
                 if replace and sha:
                     old = [r[0] for r in con.execute("SELECT id FROM documents WHERE sha256=?", (sha,))]
                     _delete_rows(con, old)  # the file stays: the new row points at it
-                cur = con.execute(
+                    if job:
+                        job[1]["replaced"] = old
+                doc_id = con.execute(
                     "INSERT INTO documents (filename, char_count, title, doc_type, summary, keywords, analysis,"
                     " model, sha256, file_path, file_size, mime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (filename, sum(len(c) for c in chunks), meta.get("title", ""), meta.get("doc_type", ""),
-                     meta.get("summary", ""), ", ".join(meta.get("keywords", [])), analysis, model,
-                     sha if kept else None, sha if kept else None, len(data) if kept else None,
-                     mime if kept else None),
-                )
-                doc_id = cur.lastrowid
-                con.execute(
-                    "INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords) VALUES (?,?,?,?,?,?)",
-                    (doc_id, filename, meta.get("title", ""), meta.get("doc_type", ""),
-                     meta.get("summary", ""), ", ".join(meta.get("keywords", []))),
-                )
-                for i, text in enumerate(chunks):
-                    cid = con.execute(
-                        "INSERT INTO chunks (doc_id, idx, text) VALUES (?,?,?)", (doc_id, i, text)
-                    ).lastrowid
-                    con.execute("INSERT INTO chunks_fts (rowid, text) VALUES (?,?)", (cid, text))
-                if kept:  # last, so a failed insert leaves no file behind
+                    (filename, sum(len(c) for c in chunks), *_meta(meta), analysis, model,
+                     sha if kept else None, sha if kept else None, size if kept else None, mime if kept else None),
+                ).lastrowid
+                con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords)"
+                            " VALUES (?,?,?,?,?,?)", (doc_id, filename, *_meta(meta)))
+                _insert_chunks(con, doc_id, chunks)
+                if job:
+                    _finish_job(con, job, doc_id)
+                if data is not None:  # last, so a failed insert leaves no file behind
                     wrote = _store(sha, data)
         except BaseException:
             if wrote:  # written for rows that never committed
                 _remove(sha)
             raise
     return doc_id
+
+
+def replace_document(doc_id, chunks, meta, analysis, model, job=None):
+    """A re-read: new text, chunks, metadata and model for a document, keeping its id,
+    file and upload date. `job` as in add_document."""
+    with connect() as con:
+        row = con.execute("SELECT filename FROM documents WHERE id=?", (doc_id,)).fetchone()
+        if not row:
+            raise JobGone("The document was deleted while it was being read")
+        con.execute("DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE doc_id=?)", (doc_id,))
+        con.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+        con.execute("UPDATE documents SET char_count=?, title=?, doc_type=?, summary=?, keywords=?, analysis=?,"
+                    " model=? WHERE id=?", (sum(len(c) for c in chunks), *_meta(meta), analysis, model, doc_id))
+        con.execute("DELETE FROM docs_fts WHERE rowid=?", (doc_id,))
+        con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords) VALUES (?,?,?,?,?,?)",
+                    (doc_id, row["filename"], *_meta(meta)))
+        _insert_chunks(con, doc_id, chunks)
+        if job:
+            _finish_job(con, job, doc_id)
 
 
 def list_documents():
@@ -241,22 +324,146 @@ def _delete_rows(con, ids):
         con.execute(f"DELETE FROM docs_fts WHERE rowid IN ({marks})", part)
         # SQLite hands a deleted id to the next document: keep the cost, drop the link.
         con.execute(f"UPDATE usage SET doc_id = NULL WHERE doc_id IN ({marks})", part)
+        # A re-read of a deleted document has nothing left to update.
+        con.execute(f"UPDATE jobs SET status='cancelled', stage='The document was deleted',"
+                    f" updated_at=datetime('now') WHERE kind='reread' AND doc_id IN ({marks})"
+                    f" AND status IN ({','.join('?' * len(HOLDING_JOBS))})", [*part, *HOLDING_JOBS])
+        con.execute(f"UPDATE jobs SET doc_id = NULL WHERE doc_id IN ({marks})", part)
         deleted += con.execute(f"DELETE FROM documents WHERE id IN ({marks})", part).rowcount
     return deleted, files
 
 
+def _unused(con, file_path):
+    """No document and no job that may still read it uses this stored file."""
+    return not con.execute(
+        f"SELECT 1 FROM documents WHERE file_path=? UNION ALL SELECT 1 FROM jobs WHERE file_path=?"
+        f" AND status IN ({','.join('?' * len(HOLDING_JOBS))}) LIMIT 1",
+        (file_path, file_path, *HOLDING_JOBS)).fetchone()
+
+
 def delete_documents(ids):
-    """Delete several documents in one transaction, and the stored files no other
-    document still uses. Returns how many existed."""
+    """Delete several documents in one transaction, and the stored files nothing else
+    still uses. Returns how many existed."""
     ids = [i for i in dict.fromkeys(int(i) for i in ids) if -2**63 <= i < 2**63]  # others can't exist
-    with _files_lock:
+    with files_lock:
         with connect() as con:
             deleted, files = _delete_rows(con, ids)
-            unused = [p for p in files
-                      if not con.execute("SELECT 1 FROM documents WHERE file_path=?", (p,)).fetchone()]
+            unused = [p for p in files if _unused(con, p)]
         for p in unused:  # only after the commit: a rollback must not lose a file
             _remove(p)
     return deleted
+
+
+# ---- jobs: uploads and re-reads waiting for, or in, the background worker ----
+
+_JSON = ("options", "estimate", "result", "partial")
+
+
+def _job(row):
+    j = dict(row)
+    for k in _JSON:
+        if k in j:
+            j[k] = json.loads(j[k]) if j[k] else None
+    return j
+
+
+def add_job(kind, filename, sha, model, options, data=None, size=None, mime=None, doc_id=None, on_insert=None):
+    """Queue a job and return its id. An upload passes its `data`, stored here as the
+    original (once per content); a re-read uses its document's stored file, `sha`.
+    on_insert(id) runs before the job is committed, so before the worker can see it."""
+    if data is not None:
+        size = len(data)
+    with files_lock:
+        wrote = False
+        try:
+            with connect() as con:
+                job_id = con.execute(
+                    "INSERT INTO jobs (kind, filename, sha256, file_path, file_size, mime, model, options, doc_id,"
+                    " stage) VALUES (?,?,?,?,?,?,?,?,?, 'Waiting to start')",
+                    (kind, filename, sha, sha, size, mime, model, json.dumps(options), doc_id)).lastrowid
+                if on_insert:
+                    on_insert(job_id)
+                if data is not None:  # last, as in add_document
+                    wrote = _store(sha, data)
+        except BaseException:
+            if wrote:
+                _remove(sha)
+            raise
+    return job_id
+
+
+def get_job(job_id):
+    with connect() as con:
+        row = con.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return _job(row) if row else None
+
+
+def list_jobs(hours=1):
+    """Jobs still to finish, failed ones (until dismissed), and any others that changed
+    in the last `hours`; newest first. Partial pages only for failed jobs (a count for a retry)."""
+    cols = "id, kind, status, filename, sha256, file_size, mime, model, options, progress, total, stage, " \
+           "error, estimate, result, doc_id, created_at, updated_at, CASE WHEN status='failed' THEN partial END AS partial"
+    marks = ",".join("?" * len(HOLDING_JOBS))
+    with connect() as con:
+        return [_job(r) for r in con.execute(
+            f"SELECT {cols} FROM jobs WHERE status IN ({marks}) OR updated_at >= datetime('now', ?)"
+            " ORDER BY id DESC LIMIT 200", (*HOLDING_JOBS, f"-{hours} hours"))]
+
+
+def active_jobs(sha=None, doc_id=None):
+    """Unfinished upload jobs for this file, or re-read jobs for this document."""
+    marks = ",".join("?" * len(ACTIVE_JOBS))
+    where, arg = ("kind='upload' AND sha256=?", sha) if sha else ("kind='reread' AND doc_id=?", doc_id)
+    with connect() as con:
+        return [_job(r) for r in con.execute(
+            f"SELECT * FROM jobs WHERE {where} AND status IN ({marks}) ORDER BY id", (arg, *ACTIVE_JOBS))]
+
+
+def claim_next_job():
+    """The oldest queued job, now marked running; None if nothing is queued."""
+    with connect() as con:
+        rows = con.execute(
+            "UPDATE jobs SET status='running', stage='Starting', updated_at=datetime('now') WHERE id ="
+            " (SELECT id FROM jobs WHERE status='queued' ORDER BY id LIMIT 1) RETURNING *").fetchall()
+    return _job(rows[0]) if rows else None
+
+
+def update_job(job_id, when=("running",), **fields):
+    """Set fields of a job whose status is one of `when`. False if it isn't (say it
+    was cancelled meanwhile). Dicts are stored as JSON."""
+    fields = {k: json.dumps(v) if k in _JSON and v is not None else v for k, v in fields.items()}
+    sets = "".join(f"{k}=?, " for k in fields)
+    marks = ",".join("?" * len(when))
+    with connect() as con:
+        return con.execute(f"UPDATE jobs SET {sets}updated_at=datetime('now') WHERE id=? AND status IN ({marks})",
+                           (*fields.values(), job_id, *when)).rowcount > 0
+
+
+def job_status(job_id):
+    with connect() as con:
+        row = con.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return row[0] if row else None
+
+
+def requeue_running():
+    """Jobs left running by a restart go back in the queue; their saved pages are kept."""
+    with connect() as con:
+        return con.execute("UPDATE jobs SET status='queued', stage='Interrupted by a restart, waiting to resume',"
+                           " updated_at=datetime('now') WHERE status='running'").rowcount
+
+
+def cancel_job(job_id):
+    """Cancel a job that hasn't finished, or dismiss a failed one; its stored file goes
+    once nothing uses it. Returns the job (unchanged if it had already finished)."""
+    with files_lock:
+        with connect() as con:
+            con.execute(f"UPDATE jobs SET status='cancelled', stage='Cancelled', partial=NULL, updated_at=datetime('now')"
+                        f" WHERE id=? AND status IN ({','.join('?' * len(HOLDING_JOBS))})", (job_id, *HOLDING_JOBS))
+            row = con.execute("SELECT status, file_path FROM jobs WHERE id=?", (job_id,)).fetchone()
+            drop = row and row["status"] == "cancelled" and _unused(con, row["file_path"])
+        if drop:
+            _remove(row["file_path"])
+    return get_job(job_id)
 
 
 def fts_query(text):
@@ -291,7 +498,7 @@ def search_chunks(text, limit=5):
 
 # ---- usage log: one row per model call ----
 
-def add_usage(calls, doc_id=None):
+def add_usage(calls, doc_id=None, job_id=None):
     """calls: [(kind, backend, model, usage dict, cost_usd)], where usage has the keys
     input, output, cache_read and cache_write (as llm.chat returns it)."""
     if not calls:
@@ -299,9 +506,15 @@ def add_usage(calls, doc_id=None):
     with connect() as con:
         con.executemany(
             "INSERT INTO usage (kind, backend, model, input_tokens, output_tokens, cache_read_tokens,"
-            " cache_write_tokens, cost_usd, doc_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            " cache_write_tokens, cost_usd, doc_id, job_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
             [(kind, backend, model, u.get("input") or 0, u.get("output") or 0, u.get("cache_read") or 0,
-              u.get("cache_write") or 0, cost, doc_id) for kind, backend, model, u, cost in calls])
+              u.get("cache_write") or 0, cost, doc_id, job_id) for kind, backend, model, u, cost in calls])
+
+
+def link_usage(job_id, doc_id):
+    """A job's model calls belong to this document (a re-read's, even when it failed)."""
+    with connect() as con:
+        con.execute("UPDATE usage SET doc_id=? WHERE job_id=?", (doc_id, job_id))
 
 
 _SUMS = ("COUNT(*) AS calls, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,"

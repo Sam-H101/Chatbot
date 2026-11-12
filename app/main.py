@@ -1,15 +1,13 @@
-"""HTTP API + single-page UI."""
+"""HTTP API + single-page UI. Uploads and re-reads are queued as jobs (see jobs.py)."""
 import mimetypes
 import os
 import re
-import threading
-import time
 
 import anthropic
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from werkzeug.routing import IntegerConverter
 
-from . import db, extract, llm, ollama
+from . import db, extract, jobs, llm, ollama
 
 
 class RowId(IntegerConverter):
@@ -30,44 +28,38 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 #             Claude only when needed and a Claude key is available.
 #   "claude": the Claude API (CLAUDE_MODEL), with the key from the browser or ANTHROPIC_API_KEY.
 BACKEND = os.environ.get("LLM_BACKEND", "ollama")
-# "model" (default): the chosen model reads PDFs. With Ollama only scanned pages go
-# to the vision model; with Claude every page is read as text and image.
-# "local": the PDF's embedded text layer only; scanned pages come out empty.
-PDF_EXTRACTOR = os.environ.get("PDF_EXTRACTOR", "model")
 # Kept originals shown in the browser: PDFs open in its viewer, plain text as text.
 # Everything else downloads, so an uploaded HTML or SVG file never runs script here.
 INLINE_TYPES = {"application/pdf", "text/plain"}
 # The slim image has no /etc/mime.types, and Python's own table lacks these two.
 mimetypes.add_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx")
 mimetypes.add_type("text/plain", ".log")
-# Uploads being read right now, by hash: [(file name, start time UTC), ...]. A copy that
-# arrives meanwhile (the page was reloaded and the file picked again) is not in the
-# library yet, but must still count as a duplicate. One gunicorn worker, so a dict will do.
-_reading = {}
-_reading_lock = threading.Lock()
-
-
-class MissingKey(Exception):
-    pass
+MissingKey = llm.MissingKey
 
 
 class BadChoice(ValueError):
     pass
 
 
-class NoText(ValueError):
-    pass
+def _key():
+    # The key comes from the browser per request (or ANTHROPIC_API_KEY); never stored server-side.
+    return request.headers.get("X-API-Key", "").strip()
 
 
 def _has_key():
-    return bool(request.headers.get("X-API-Key", "").strip() or os.environ.get("ANTHROPIC_API_KEY"))
+    return bool(_key() or os.environ.get("ANTHROPIC_API_KEY"))
 
 
 def _client():
-    # The key comes from the browser per request (or ANTHROPIC_API_KEY); never stored server-side.
     if not _has_key():
         raise MissingKey()
-    return llm.client_for(request.headers.get("X-API-Key", "").strip())
+    return llm.client_for(_key())
+
+
+def _keep_key(job_id):
+    """The browser's key goes with a job (in memory only), kept before the worker can
+    pick the job up."""
+    jobs.remember_key(job_id, _key())
 
 
 def _choice(raw):
@@ -83,45 +75,50 @@ def _choice(raw):
     raise BadChoice(f"Unknown model choice: {raw}")
 
 
+def _job_choice(raw):
+    """A model choice for a job, checked now: a Claude model needs a key up front."""
+    backend, model = _choice(raw)
+    if backend == "claude" and not _has_key():
+        raise MissingKey()
+    return "auto" if backend == "auto" else f"{backend}:{model}"
+
+
+def _claude_pages(raw):
+    raw = raw or jobs.CLAUDE_PDF_PAGES
+    if raw not in ("scanned", "all"):
+        raise BadChoice("claude_pages must be 'scanned' or 'all'")
+    return raw
+
+
 def _label(backend, model):
-    return model if backend == "ollama" else llm.label(model)
+    return jobs.label(backend, model)
 
 
-def _run(choice, job, fits_local=True):
-    """Run job(backend, model) for the chosen model. Auto runs locally and switches to
-    Claude when the prompt is too long for the local model or Ollama fails, provided
-    a Claude key is available. Returns (result, model used, why it switched or None)."""
+def _run(choice, fn, fits_local=True):
+    """Run fn(backend, model) for the chosen chat model. Auto runs locally and switches
+    to Claude when the prompt is too long for the local model or Ollama fails, provided
+    a Claude key is available. Returns (result, model used, why it switched or None).
+    Uploads do the same in the background (jobs._read)."""
     backend, model = choice
     if backend != "auto":
-        return job(backend, model), (backend, model), None
+        return fn(backend, model), (backend, model), None
     if not fits_local and _has_key():
-        return job("claude", llm.MODEL), ("claude", llm.MODEL), "too long for the local model"
+        return fn("claude", llm.MODEL), ("claude", llm.MODEL), "too long for the local model"
     try:
-        return job("ollama", ollama.MODEL), ("ollama", ollama.MODEL), None
+        return fn("ollama", ollama.MODEL), ("ollama", ollama.MODEL), None
     except ollama.OllamaError as e:
         if not _has_key():
             raise
-        return job("claude", llm.MODEL), ("claude", llm.MODEL), f"local model failed ({e})"
+        return fn("claude", llm.MODEL), ("claude", llm.MODEL), f"local model failed ({e})"
 
 
-def _used(used, note):
-    backend, model = used
-    return {"model": f"{backend}:{model}", "model_label": _label(backend, model), "switched": note}
-
-
-def _call(kind, backend, model, usage):
-    """One usage-log entry. Local models cost nothing."""
-    return kind, backend, model, usage, llm.cost(model, usage) if backend == "claude" else 0.0
-
-
-def _log_usage(calls, doc_id=None):
-    """Best effort: if the log can't be written (say the database stays locked), the
-    answer or upload that already succeeded is still returned, and the reason a request
-    failed is not replaced by a logging error."""
-    try:
-        db.add_usage(calls, doc_id)
-    except Exception:
-        app.logger.exception("Could not log %d model call(s)", len(calls))
+def _job_out(j):
+    """A job for the API: no stored path, no page texts (a count of kept pages instead)."""
+    partial = j.pop("partial", None) or {}
+    j.pop("file_path", None)
+    j["model_label"] = jobs.choice_label(j["model"])
+    j["pages_kept"] = sum(len(p) for p in partial.values())
+    return j
 
 
 def _clean_name(name):
@@ -179,6 +176,11 @@ def _ollama_error(e):
     return jsonify(error=f"Ollama error: {e}"), 502
 
 
+@app.before_request
+def _start_worker():
+    jobs.start()  # once per process; queued jobs carry on after a restart
+
+
 @app.get("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
@@ -199,6 +201,7 @@ def models():
         claude=[{"id": m, "label": name} for m, name in llm.MODELS],
         server_key=bool(os.environ.get("ANTHROPIC_API_KEY")),
         max_upload_mb=MAX_UPLOAD_MB,
+        claude_pages=jobs.CLAUDE_PDF_PAGES, confirm_cost_usd=jobs.CONFIRM_COST_USD,
     )
 
 
@@ -210,86 +213,125 @@ def documents():
 
 @app.get("/api/search")
 def search():
-    return jsonify([{k: h[k] for k in ("doc_id", "filename", "title", "idx", "snippet")}
+    return jsonify([{**{k: h[k] for k in ("doc_id", "filename", "title", "idx")}, "snippet": extract.plain(h["snippet"])}
                     for h in db.search_chunks(request.args.get("q", ""), limit=10)])
 
 
 @app.post("/api/upload")
 def upload():
+    """Keep the file and queue it for reading: 202 {job}. The page follows the job
+    through GET /api/jobs. Duplicates are caught here, before any model spends time."""
     f = request.files.get("file")
     name = _clean_name(f.filename) if f else ""
     if not name:
         return jsonify(error="No file"), 400
-    choice = _choice(request.form.get("model"))
+    model = _job_choice(request.form.get("model"))
     # A file already in the library is refused (409) unless the browser says what to do:
     # "replace" deletes the earlier copies once the new one is read, "keep" adds it anyway.
     on_duplicate = request.form.get("on_duplicate", "")
     if on_duplicate not in ("", "replace", "keep"):
         raise BadChoice("on_duplicate must be 'replace' or 'keep'")
+    options = {"on_duplicate": on_duplicate, "claude_pages": _claude_pages(request.form.get("claude_pages"))}
     data = f.read()
     sha = db.file_hash(data)
-    with _reading_lock:  # check and claim together: two uploads of one file can't both pass
-        dups, reading = db.find_duplicates(sha), _reading.get(sha)
-        if reading and on_duplicate != "keep":  # a copy is still being read: nothing to replace yet
-            first, started = reading[0]
+    with db.files_lock:  # check and queue together: two uploads of one file can't both pass
+        dups, reading = db.find_duplicates(sha), db.active_jobs(sha=sha)
+        if reading and on_duplicate != "keep":  # a copy is still queued or being read: nothing to replace yet
             return jsonify(error=f"{name} is being read right now", duplicate={
-                "in_progress": True, "filename": first, "started_at": started, "copies": len(dups)}), 409
-        if dups and not on_duplicate:  # checked before any model spends time on it
+                "in_progress": True, "filename": reading[0]["filename"], "started_at": reading[0]["created_at"],
+                "job_id": reading[0]["id"], "copies": len(dups)}), 409
+        if dups and not on_duplicate:
             d = dups[0]
             return jsonify(error=f"{name} is already in the library", duplicate={
                 "id": d["id"], "filename": d["filename"], "title": d["title"], "created_at": d["uploaded_at"],
                 "model": d["model"], "copies": len(dups)}), 409
-        claim = (name, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
-        _reading.setdefault(sha, []).append(claim)
-    is_pdf = name.lower().endswith(".pdf") and PDF_EXTRACTOR != "local"
-    calls = []  # every model call, logged even if the upload then fails
+        job_id = db.add_job("upload", name, sha, model, options, data=data, on_insert=_keep_key,
+                            mime=mimetypes.guess_type(name)[0] or f.mimetype or "application/octet-stream")
+    jobs.wake()
+    return jsonify(job=_job_out(db.get_job(job_id))), 202
 
-    def on_usage(*call):
-        calls.append(_call(*call))
 
-    def read(backend, model):
-        if not is_pdf:
-            text = extract.extract_text(name, data)
-        elif backend == "ollama":
-            text = ollama.transcribe_pdf(data, on_usage=on_usage)  # scanned pages go to the vision model
-        else:
-            text = llm.transcribe_pdf(_client(), extract.pdf_batches(data), model, on_usage=on_usage)
-        if not extract.chunk_text(text):
-            raise NoText()
-        try:
-            if backend == "ollama":
-                meta, analysis = ollama.analyze(None, name, text, model, on_usage=on_usage)
-            else:
-                meta, analysis = llm.analyze(_client(), name, text, model, on_usage=on_usage)
-        except (anthropic.AuthenticationError, MissingKey, ollama.OllamaError):
-            raise  # Ollama errors let Auto switch to Claude
-        except Exception as e:  # still index the text so it is searchable
-            meta, analysis = {"title": name}, f"none: {e}"
-        return text, meta, analysis
+@app.post("/api/documents/<id:doc_id>/reread")
+def reread(doc_id):
+    """Queue a new reading of a document's kept original, with any model: when done it
+    replaces the document's text, metadata and model in place (same id)."""
+    body = request.get_json(silent=True) or {}
+    model = _job_choice(body.get("model"))
+    options = {"claude_pages": _claude_pages(body.get("claude_pages"))}
+    with db.files_lock:  # a delete can't slip in between the checks and the job
+        f = db.stored_file(doc_id)
+        if not f:
+            if not db.document_exists(doc_id):
+                return jsonify(error="Not found"), 404
+            return jsonify(error="No original file is kept for this document, so it can't be re-read"), 409
+        if db.active_jobs(doc_id=doc_id):
+            return jsonify(error=f"{f['filename']} is already being re-read"), 409
+        job_id = db.add_job("reread", f["filename"], f["sha256"], model, options, size=f["size"],
+                            mime=f["mime"], doc_id=doc_id, on_insert=_keep_key)
+    jobs.wake()
+    return jsonify(job=_job_out(db.get_job(job_id))), 202
 
-    doc_id = None
-    try:
-        try:
-            (text, meta, analysis), used, note = _run(choice, read)
-        except (MissingKey, anthropic.APIError, ollama.OllamaError):
-            raise  # handled by the error handlers above
-        except NoText:
-            return jsonify(error="No text found in file"), 400
-        except Exception as e:
-            return jsonify(error=f"Could not read {name}: {e}"), 400
-        chunks = extract.chunk_text(text)
-        replace = on_duplicate == "replace"
-        doc_id = db.add_document(name, chunks, meta, analysis, _label(*used), data=data, sha=sha,
-                                 mime=mimetypes.guess_type(name)[0] or f.mimetype or "application/octet-stream",
-                                 replace=replace)
-    finally:
-        with _reading_lock:  # added (so find_duplicates sees it) or failed
-            _reading[sha].remove(claim)
-            if not _reading[sha]:
-                del _reading[sha]
-        _log_usage(calls, doc_id)
-    return jsonify(id=doc_id, chunks=len(chunks), analysis=analysis, has_file=True,
-                   replaced=[d["id"] for d in dups] if replace else [], **_used(used, note), **meta)
+
+@app.get("/api/jobs")
+def job_list():
+    """Unfinished and failed jobs, and others that changed in the last hour."""
+    return jsonify([_job_out(j) for j in db.list_jobs()])
+
+
+@app.get("/api/jobs/<id:job_id>")
+def job_get(job_id):
+    j = db.get_job(job_id)
+    return jsonify(_job_out(j)) if j else (jsonify(error="Not found"), 404)
+
+
+@app.post("/api/jobs/<id:job_id>/cancel")
+def job_cancel(job_id):
+    """Cancel a job that hasn't finished (a running one stops after its current page),
+    or dismiss a failed one."""
+    j = db.cancel_job(job_id)
+    if not j:
+        return jsonify(error="Not found"), 404
+    if j["status"] == "done":
+        return jsonify(error="This job has already finished", job=_job_out(j)), 409
+    return jsonify(job=_job_out(j))
+
+
+@app.post("/api/jobs/<id:job_id>/confirm")
+def job_confirm(job_id):
+    """Start a job that waits for its estimated Claude cost to be confirmed."""
+    j = db.get_job(job_id)
+    if not j:
+        return jsonify(error="Not found"), 404
+    if j["status"] == "awaiting_confirmation" and not _has_key():  # it waits only to spend on Claude
+        raise MissingKey()
+    _keep_key(job_id)  # before it is queued
+    if not db.update_job(job_id, when=("awaiting_confirmation",), status="queued", stage="Waiting to start",
+                         options={**j["options"], "confirmed": True}):
+        return jsonify(error="This job is not waiting for a confirmation"), 409
+    jobs.wake()
+    return jsonify(job=_job_out(db.get_job(job_id)))
+
+
+@app.post("/api/jobs/<id:job_id>/retry")
+def job_retry(job_id):
+    """Queue a failed job again. Pages a model already read are kept and not paid for
+    twice; Auto tries the local model first again."""
+    j = db.get_job(job_id)
+    if not j:
+        return jsonify(error="Not found"), 404
+    if j["status"] != "failed":
+        return jsonify(error="Only a failed job can be retried"), 409
+    if not os.path.isfile(os.path.join(db.files_dir(), os.path.basename(j["file_path"]))):
+        return jsonify(error="The original file is no longer stored; upload it again"), 409
+    if j["model"].startswith("claude:") and not _has_key():
+        raise MissingKey()
+    options = {k: v for k, v in j["options"].items() if k not in ("fallback", "switched")}
+    _keep_key(job_id)  # before it is queued
+    if not db.update_job(job_id, when=("failed",), status="queued", stage="Waiting to start", error=None,
+                         options=options):
+        return jsonify(error="Only a failed job can be retried"), 409
+    jobs.wake()
+    return jsonify(job=_job_out(db.get_job(job_id)))
 
 
 @app.get("/api/documents/<id:doc_id>/file")
@@ -388,7 +430,7 @@ def chat():
     calls = []
 
     def on_usage(*call):
-        calls.append(_call(*call))
+        calls.append(jobs.priced(*call))
 
     def answer(backend, model):
         if backend == "ollama":
@@ -399,12 +441,12 @@ def chat():
     try:
         (text, usage), used, note = _run(choice, answer, fits_local=fits)
     finally:
-        _log_usage(calls)  # a refused Claude answer is billed too
+        jobs.log_usage(calls)  # a refused Claude answer is billed too
     return jsonify(
         answer=text,
         usage=usage,
         sources=sorted({h["filename"] for h in hits}),
-        **_used(used, note),
+        **jobs.used(used, note),
         # The client stores these and sends them back as `history` next turn.
         turns=[{"role": "user", "content": user_message}, {"role": "assistant", "content": text}],
     )

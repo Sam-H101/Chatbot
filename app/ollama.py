@@ -102,23 +102,35 @@ def analyze(_client, filename, text, model=MODEL, on_usage=None):
     return meta, "full" if len(text) <= ANALYZE_CHARS else "partial"
 
 
-def transcribe_pdf(data, on_usage=None):
-    """Embedded text where the PDF has it; the vision model reads only scanned pages."""
-    pages = extract.pdf_pages(data)
+def transcribe_pdf(data, on_usage=None, done=None, on_page=None):
+    """One string per page: the embedded text where the page has it, while the vision
+    model reads only scanned pages. `done` maps page numbers (from 1) read in an earlier
+    attempt to their text; those are not read again. on_page(number, total, text, read)
+    follows every page, read=True when the vision model read it, and on_page(number,
+    total, None, True) comes just before the vision model starts on one. It may raise
+    to stop."""
+    done = done or {}
+    total = extract.page_count(data)
     out = []
-    for n, (text, png) in enumerate(pages, 1):
-        if png is None:
-            out.append(text)
-            continue
-        r = _chat(VISION_MODEL, [{
-            "role": "user",
-            "content": PAGE_PROMPT.format(page=n, total=len(pages)),
-            "images": [base64.standard_b64encode(png).decode("ascii")],
-        }], temperature=0)
-        if on_usage:
-            on_usage("transcribe", "ollama", VISION_MODEL, _usage(r))
-        out.append(r["message"]["content"])
-    return "\n\n".join(out)
+    for n, (text, png) in enumerate(extract.pdf_pages(data, skip=done), 1):
+        read = n not in done and png is not None
+        if n in done:
+            text = done[n]
+        elif read:
+            if on_page:
+                on_page(n, total, None, True)
+            r = _chat(VISION_MODEL, [{
+                "role": "user",
+                "content": PAGE_PROMPT.format(page=n, total=total),
+                "images": [base64.standard_b64encode(png).decode("ascii")],
+            }], temperature=0)
+            if on_usage:
+                on_usage("transcribe", "ollama", VISION_MODEL, _usage(r))
+            text = r["message"]["content"]
+        out.append(text)
+        if on_page:
+            on_page(n, total, text, read)
+    return out
 
 
 def chat(_client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):
