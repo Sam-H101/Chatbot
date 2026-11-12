@@ -12,7 +12,7 @@ import anthropic
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory, stream_with_context
 from werkzeug.routing import IntegerConverter
 
-from . import db, extract, jobs, llm, ollama, vectors
+from . import auth, db, extract, jobs, llm, ollama, vectors
 
 log = logging.getLogger(__name__)
 
@@ -242,6 +242,11 @@ def _same_origin():
 @app.before_request
 def _start_worker():
     jobs.start()  # once per process (gunicorn starts it at boot); queued jobs carry on after a restart
+
+
+# The optional login (APP_PASSWORD): checked after the two hooks above, so a request from
+# another site still gets its 403 and any request, the login page's too, starts the worker.
+auth.setup(app)
 
 
 @app.get("/")

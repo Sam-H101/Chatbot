@@ -34,6 +34,11 @@ services:
       - PDF_CONCURRENCY
       - PDF_MAX_BATCH_MB
       - MAX_UPLOAD_MB
+      # Login: set APP_PASSWORD (in .env, say) to ask everyone for it. Unset, there is no login.
+      # SECRET_KEY signs the session cookie; unset, a random one is kept in /data/secret_key.
+      - APP_PASSWORD
+      - SECRET_KEY
+      - SESSION_DAYS
     depends_on:
       - ollama
     restart: unless-stopped

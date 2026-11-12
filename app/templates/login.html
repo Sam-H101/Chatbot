@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Log in · Doc.chat</title>
+<link rel="icon" href="data:,">
+<script>try { const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch {}</script>
+<style>
+  /* Standalone: everything inline, since nothing else is served before logging in. Colours as in index.html. */
+  :root {
+    --paper: #f4efe6; --card: #fbf8f2; --ink: #1f1b16; --soft: #6b6257; --line: #d9d0c1;
+    --accent: #b4441c; --accent-ink: #fff; --bad: #b3261e;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --sans: system-ui, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --paper: #171512; --card: #201d19; --ink: #ece5d8; --soft: #9c9285; --line: #3a352e;
+    --accent: #e8703f; --accent-ink: #1a1410; --bad: #f08a80; color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #171512; --card: #201d19; --ink: #ece5d8; --soft: #9c9285; --line: #3a352e;
+      --accent: #e8703f; --accent-ink: #1a1410; --bad: #f08a80; color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100dvh; display: grid; place-items: center; padding: 24px 16px;
+         font: 15px/1.55 var(--sans); background: var(--paper); color: var(--ink); }
+  main { width: min(360px, 100%); }
+  h1 { font: 600 30px/1 var(--serif); margin: 0 0 18px; text-align: center; letter-spacing: -.01em; }
+  h1 i { color: var(--accent); }
+  form { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 22px; display: grid; gap: 12px; }
+  label { font: 600 11px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--soft); }
+  input { font: inherit; color: inherit; width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+  input:focus { outline: 0; border-color: var(--accent); }
+  input[aria-invalid="true"] { border-color: var(--bad); }
+  button { font: inherit; font-weight: 600; cursor: pointer; border: 1px solid var(--accent); background: var(--accent);
+           color: var(--accent-ink); border-radius: 999px; padding: 9px 16px; margin-top: 4px; }
+  button:hover { filter: brightness(1.08); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .err { margin: 0; color: var(--bad); font-size: 14px; }
+  .muted { margin: 14px 0 0; color: var(--soft); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Doc<i>.</i>chat</h1>
+  <form method="post" action="/login">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus
+      {%- if error %} aria-invalid="true" aria-describedby="err"{% endif %}>
+    {% if error %}<p class="err" id="err" role="alert">{{ error }}</p>{% endif %}
+    <input type="hidden" name="next" value="{{ next_url }}">
+    <button type="submit">Log in</button>
+  </form>
+  <p class="muted">One shared password, set by whoever runs this library.</p>
+</main>
+</body>
+</html>

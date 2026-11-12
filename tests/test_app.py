@@ -8,8 +8,9 @@ import pytest
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    from app import db, jobs, llm, main, ollama, vectors
+    from app import auth, db, jobs, llm, main, ollama, vectors
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setattr(auth, "PASSWORD", "")  # no login, unless a test sets a password (guarded)
     # No embedding model unless a test brings one (fake_embedder): search is by keywords, and
     # vectors.py starts each test with no pause and nothing cached.
     monkeypatch.setattr(ollama, "embed", no_embedder)
@@ -3259,3 +3260,188 @@ def test_libraries_from_before_saved_conversations_gain_them(client, tmp_path, m
     assert answer["sources"][0]["filename"] == "manual.pdf" and answer["sources"][0]["pages"] == []
     assert client.delete("/api/documents/1").status_code == 204                          # conversations forget it
     assert client.get(f"/api/conversations/{conv_id}").json["doc_ids"] == []
+
+
+# ---- the optional login (APP_PASSWORD) ----
+
+PASSWORD = "correct horse"
+OWN = {"X-Requested-With": "fetch"}  # what the page sends with every call
+
+
+@pytest.fixture
+def guarded(client, monkeypatch):
+    """The client with a password set, not logged in yet. Its session key is made beside the
+    test database, as it is beside /data/metabase.db."""
+    from app import auth, main
+    monkeypatch.setattr(auth, "PASSWORD", PASSWORD)
+    monkeypatch.setattr(auth, "_fails", {})
+    monkeypatch.setattr(main.app, "secret_key", None)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    return client
+
+
+def log_in(client, password=PASSWORD, **form):
+    return client.post("/login", data={"password": password, **form})
+
+
+def next_of(r):
+    """Where a redirect to the login page comes back to afterwards."""
+    from urllib.parse import parse_qs, urlsplit
+    loc = urlsplit(r.headers["Location"])
+    assert loc.path == "/login"
+    return parse_qs(loc.query).get("next", ["/"])[0]
+
+
+def test_without_a_password_there_is_no_login(client, tmp_path):
+    r = client.get("/")
+    assert r.status_code == 200 and "Set-Cookie" not in r.headers
+    assert client.get("/api/documents").status_code == 200
+    assert client.get("/api/session").json == {"login": False}
+    assert client.get("/login").headers["Location"] == "/"
+    assert client.post("/login", data={"password": "x"}).headers["Location"] == "/"
+    assert client.post("/logout").status_code == 303
+    assert client.post("/api/instructions", json={"text": "Be brief."}).status_code == 201   # no header needed
+    assert post(client).status_code == 202
+    assert not (tmp_path / "secret_key").exists()                                           # no key made either
+
+
+def test_a_password_guards_every_page_and_api_call(guarded):
+    r = guarded.get("/api/documents")
+    assert r.status_code == 401 and r.json == {"error": "Login required", "login": True}
+    for r in (guarded.post("/api/upload", data={"file": (io.BytesIO(LEASE), "lease.txt")}, headers={**H, **OWN}),
+              guarded.post("/api/chat/stream", json={"question": "hi"}, headers={**H, **OWN}),
+              guarded.delete("/api/documents/1", headers=OWN), guarded.get("/api/session"),
+              guarded.get("/api/no-such-route")):                                            # routes aren't given away
+        assert r.status_code == 401 and r.json["error"] == "Login required"
+    r = guarded.get("/")
+    assert r.status_code == 302 and r.headers["Location"] == "/login"
+    for path in ("/static/index.html", "/static/vendor/jquery.min.js", "/favicon.ico", "/?q=1"):
+        assert next_of(guarded.get(path)) == path
+    # A browser opening an API link (an original file, from a bookmark) goes to the login page and back.
+    assert next_of(guarded.get("/api/documents/1/file", headers={"Sec-Fetch-Mode": "navigate"})) == "/api/documents/1/file"
+    page = guarded.get("/login")
+    assert page.status_code == 200 and b'type="password"' in page.data and page.headers["Cache-Control"] == "no-store"
+    assert b"<script src" not in page.data and b"stylesheet" not in page.data            # nothing else to fetch first
+    assert b'"><b>' not in guarded.get('/login?next=/"><b>x').data                       # next is escaped
+    assert guarded.get("/api/conversations").status_code == 401 and guarded.get("/api/jobs").status_code == 401
+
+
+def test_logging_in_and_out(guarded, monkeypatch):
+    import datetime
+    from email.utils import parsedate_to_datetime
+    from app import main
+    r = log_in(guarded, "wrong")
+    assert r.status_code == 401 and b"Wrong password." in r.data and "Set-Cookie" not in r.headers
+    assert guarded.get("/api/documents").status_code == 401
+    r = log_in(guarded)
+    assert r.status_code == 303 and r.headers["Location"] == "/"
+    cookie = r.headers["Set-Cookie"]
+    assert cookie.startswith("docchat_session=") and "HttpOnly" in cookie and "SameSite=Lax" in cookie
+    expires = parsedate_to_datetime(re.search(r"Expires=([^;]+)", cookie).group(1))
+    days = (expires - datetime.datetime.now(datetime.timezone.utc)).total_seconds() / 86400
+    assert 29.99 < days <= 30                                                             # SESSION_DAYS
+    assert guarded.get("/").status_code == 200 and guarded.get("/api/documents").status_code == 200
+    assert guarded.get("/api/session").json == {"login": True}
+    assert "Set-Cookie" not in guarded.get("/api/jobs").headers                          # not renewed by every poll
+    assert guarded.get("/login?next=/api/usage").headers["Location"] == "/api/usage"      # logged in already
+    r = guarded.post("/logout")
+    assert r.status_code == 303 and r.headers["Location"] == "/login" and "Max-Age=0" in r.headers["Set-Cookie"]
+    assert guarded.get("/api/documents").status_code == 401
+    log_in(guarded)
+    guarded.set_cookie("docchat_session", "made-up")                                      # not signed with the key
+    assert guarded.get("/api/documents").status_code == 401
+    log_in(guarded)
+    monkeypatch.setitem(main.app.config, "PERMANENT_SESSION_LIFETIME", datetime.timedelta(seconds=-1))
+    assert guarded.get("/api/documents").status_code == 401                               # past SESSION_DAYS
+    # A page on another site can't post the password form (or anything else) here.
+    assert guarded.post("/login", data={"password": PASSWORD}, headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_a_login_goes_back_only_to_pages_of_this_site(guarded):
+    for given, to in [("/api/documents/1/file", "/api/documents/1/file"), ("/?x=1", "/?x=1"), ("", "/"),
+                      ("//evil.example/x", "/"), ("https://evil.example/", "/"), ("/\\evil.example", "/"),
+                      ("/\t/evil.example", "/"), ("/\n/evil.example", "/"), ("javascript:alert(1)", "/")]:
+        r = log_in(guarded, next=given)
+        assert r.status_code == 303 and r.headers["Location"] == to, given
+
+
+def test_state_changing_api_calls_need_the_pages_own_header(guarded):
+    """A page on another site can make a browser send a form or a plain POST, but not with a
+    header of its own; logged in, the page's calls that change something all carry one."""
+    log_in(guarded)
+    r = guarded.post("/api/instructions", json={"text": "Be brief."})
+    assert r.status_code == 403 and "X-Requested-With" in r.json["error"]
+    assert guarded.post("/api/instructions", json={"text": "Be brief."}, headers=OWN).status_code == 201
+    assert guarded.delete("/api/instructions/1").status_code == 403
+    assert guarded.patch("/api/instructions/1", json={"enabled": False}).status_code == 403
+    assert guarded.post("/api/documents/delete", data='{"ids": [1]}', content_type="text/plain").status_code == 403
+    assert guarded.get("/api/instructions").json[0]["enabled"] is True                    # reading needs none
+    r = guarded.post("/api/upload", data={"file": (io.BytesIO(LEASE), "lease.txt")}, headers=H)
+    assert r.status_code == 403
+    r = guarded.post("/api/upload", data={"file": (io.BytesIO(LEASE), "lease.txt")}, headers={**H, **OWN})
+    assert r.status_code == 202                                                           # the page's multipart upload
+    from app import jobs
+    jobs.drain()                                                                          # the worker needs no login
+    assert job_of(guarded, r)["status"] == "done"
+    events = sse(guarded.post("/api/chat/stream", json={"question": "How much is the rent?"}, headers={**H, **OWN}))
+    assert events[-1][0] == "done" and events[-1][1]["answer"] == "42"
+    assert guarded.post("/api/instructions", json={"text": "x"},
+                        headers={**OWN, "Origin": "http://evil.example"}).status_code == 403  # another site, logged in
+
+
+def test_wrong_passwords_are_held_up_per_address(guarded, monkeypatch):
+    from app import auth, main
+    now = [1000.0]
+    monkeypatch.setattr(auth, "_now", lambda: now[0])
+    for _ in range(4):
+        assert log_in(guarded, "wrong").status_code == 401
+    r = log_in(guarded, "wrong")                                                          # the fifth in 10 minutes
+    assert r.status_code == 429 and r.headers["Retry-After"] == "60"
+    now[0] += 30
+    r = log_in(guarded)                                                                   # the right one waits too
+    assert r.status_code == 429 and r.headers["Retry-After"] == "30" and b"Try again in 30 seconds" in r.data
+    other = main.app.test_client().post("/login", data={"password": PASSWORD}, environ_base={"REMOTE_ADDR": "10.0.0.9"})
+    assert other.status_code == 303                                                       # others aren't held up
+    now[0] += 31
+    assert log_in(guarded, "wrong").status_code == 429                                    # one try a minute now
+    now[0] += 60
+    assert log_in(guarded).status_code == 303 and guarded.get("/api/documents").status_code == 200
+    assert "127.0.0.1" not in auth._fails                                                 # a login starts afresh
+    for _ in range(4):
+        assert log_in(guarded, "wrong").status_code == 401
+    now[0] += 601                                                                         # failures older than 10 minutes
+    for _ in range(4):
+        assert log_in(guarded, "wrong").status_code == 401                                # don't count
+
+
+def test_the_session_key_is_kept_across_restarts(guarded, tmp_path, monkeypatch):
+    import os
+    import stat
+    from app import main
+    log_in(guarded)
+    key = tmp_path / "secret_key"
+    assert stat.S_IMODE(os.stat(key).st_mode) == 0o600 and len(key.read_text()) == 64
+    main.app.secret_key = None                                                            # a restart: read again
+    assert guarded.get("/api/documents").status_code == 200 and main.app.secret_key == key.read_text()
+    monkeypatch.setenv("SECRET_KEY", "the owner's own key")                               # SECRET_KEY wins
+    main.app.secret_key = None
+    assert guarded.get("/api/documents").status_code == 401                               # signed with the other key
+    assert log_in(guarded).status_code == 303 and guarded.get("/api/documents").status_code == 200
+
+
+def test_a_new_password_logs_everyone_out(guarded, monkeypatch):
+    from app import auth
+    log_in(guarded)
+    assert guarded.get("/api/documents").status_code == 200
+    monkeypatch.setattr(auth, "PASSWORD", "a new one")
+    assert guarded.get("/api/documents").status_code == 401
+
+
+def test_the_login_leaves_the_job_worker_alone(guarded, monkeypatch):
+    """Any request starts the worker (gunicorn starts it at boot anyway): the login page's
+    too, and one turned away for want of a login."""
+    from app import jobs
+    started = []
+    monkeypatch.setattr(jobs, "start", lambda: started.append(True))
+    assert guarded.get("/api/jobs").status_code == 401 and guarded.get("/login").status_code == 200
+    assert len(started) == 2

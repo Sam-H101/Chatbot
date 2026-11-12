@@ -289,7 +289,8 @@
   .svfoot .grow { flex: 1; }
   .turn.user .scoped { font-size: 12px; color: var(--soft); max-width: 85%; overflow-wrap: anywhere; text-align: right; }
   header button { white-space: nowrap; flex: none; }  /* only the conversation's title gives way */
-  header .narrow { display: none; }
+  header .narrow, header .short { display: none; }
+  #logout svg { vertical-align: -3px; }
   @media (max-width: 820px) {
     #rulesview, #usageview, #unitsview, #sourceview, #scopeview { width: 100vw; max-width: 100vw; max-height: 100dvh; height: 100dvh; border-radius: 0; }
     .ubody { padding: 12px 16px 16px; }
@@ -320,8 +321,14 @@
     header button.icon { flex: none; width: 32px; height: 32px; }
     header button:not(.icon) { padding: 5px 8px; font-size: 12.5px; }
   }
-  /* Short labels, so the row still fits with the instruction count on the Instructions button. */
-  @media (max-width: 420px) { header .wide { display: none; } header .narrow { display: inline; } }
+  /* Short labels, so the row still fits with the instruction count on the Instructions button,
+     and with Log out (an icon here) when there is a login. */
+  @media (max-width: 420px) {
+    header .wide { display: none; } header .narrow { display: inline; }
+    body.login header .long { display: none; } body.login header .short { display: inline; }
+  }
+  @media (max-width: 380px) { body.login header { gap: 2px; padding-inline: 8px; } }
+  @media (max-width: 350px) { body.login header button:not(.icon) { padding-inline: 6px; } }
   @media (max-width: 340px) {
     header { padding: 10px 8px; gap: 2px; }
     header button:not(.icon) { padding: 5px 6px; }
@@ -361,11 +368,16 @@
     <span id="convtitle">New conversation</span>
     <span class="grow"></span>
     <button id="newchat" type="button" title="Start a new conversation">New chat</button>
-    <button id="rulesbtn" type="button" title="Instructions added to every question">Instructions<span id="rulecount"></span></button>
+    <button id="rulesbtn" type="button" title="Instructions added to every question"><span class="long">Instructions</span><span
+      class="short">Rules</span><span id="rulecount"></span></button>
     <button id="usagebtn" type="button" title="Model calls, tokens and cost">Usage</button>
     <button id="keybtn" type="button" title="Claude API key"><span id="keydot"></span><span class="wide">API key</span><span class="narrow">Key</span></button>
     <button class="icon" id="theme" type="button" aria-label="Switch light or dark theme">◐</button>
+    <button id="logout" type="submit" form="logoutform" hidden aria-label="Log out" title="Log out of this library"><span
+      class="wide">Log out</span><svg class="narrow" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path
+      d="M10 4H5v16h5M14 8l4 4-4 4M18 12H9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
   </header>
+  <form id="logoutform" method="post" action="/logout" hidden></form>
   <div id="settings" hidden>
     <span class="label">Claude API key</span>
     <input id="key" type="password" placeholder="sk-ant-…" autocomplete="off">
@@ -476,10 +488,20 @@ const key = $('key');
 key.value = store.get('claudeKey') || '';
 let busy = false;
 
+// With a password set (APP_PASSWORD), the server asks every call that changes something for
+// this header, which a page on another site can't add (app/auth.py).
+const OWN = { 'X-Requested-With': 'fetch' };
+// A call made once the session has ended (Log out in another tab, a new password) gets 401
+// {login: true}: the page goes to the login page, and the call never settles, so nothing
+// shows an error on the way out. A 401 without `login` is about the Claude key.
+const loginGone = (status, data) => status === 401 && data?.login === true;
+const toLogin = () => { location.assign('/login'); return new Promise(() => {}); };
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: { 'X-API-Key': key.value, ...(opts.headers || {}) } });
+  const res = await fetch(path, { ...opts, headers: { 'X-API-Key': key.value, ...OWN, ...(opts.headers || {}) } });
   const data = res.status === 204 ? null : await res.json().catch(() => ({
     error: res.status === 413 ? 'File is too large to upload' : `${res.status} ${res.statusText}` }));
+  if (loginGone(res.status, data)) return toLogin();
   if (!res.ok) throw Object.assign(new Error(data?.error || res.statusText), { status: res.status, data });
   return data;
 }
@@ -1192,10 +1214,12 @@ function send(path, body, onProgress) {
     const x = new XMLHttpRequest();
     x.open('POST', path);
     x.setRequestHeader('X-API-Key', key.value);
+    for (const [k, v] of Object.entries(OWN)) x.setRequestHeader(k, v);
     x.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
     x.onload = () => {
       let data = null;
       try { data = JSON.parse(x.responseText); } catch {}
+      if (loginGone(x.status, data)) return toLogin();
       if (x.status >= 200 && x.status < 300) return resolve(data);
       const msg = data?.error || (x.status === 413 ? 'File is too large to upload' : `${x.status} ${x.statusText}`);
       reject(Object.assign(new Error(msg), { status: x.status, data }));
@@ -1737,7 +1761,7 @@ $('stop').onclick = () => { stopAnswer(); $('question').focus(); };
 let live = null;
 function reportStop(l) {
   if (!l) return;
-  fetch('/api/chat/stop', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' },
+  fetch('/api/chat/stop', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json', ...OWN },
     body: JSON.stringify({ conversation_id: l.conversation_id, answer_id: l.answer_id, shown: l.shown }) }).catch(() => {});
 }
 addEventListener('pagehide', () => reportStop(live));  // a reload or a closed tab stops it too
@@ -1745,11 +1769,12 @@ addEventListener('pagehide', () => reportStop(live));  // a reload or a closed t
 async function fetchAnswer(req, signal, on) {
   const opts = { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req) };
   if (canStream) {
-    const res = await fetch('/api/chat/stream', { ...opts, headers: { ...opts.headers, 'X-API-Key': key.value } });
+    const res = await fetch('/api/chat/stream', { ...opts, headers: { ...opts.headers, ...OWN, 'X-API-Key': key.value } });
     const type = res.headers.get('content-type') || '';
     if (type.startsWith('text/event-stream')) return readEvents(res, on);
     if (!((res.status === 404 || res.status === 405) && !type.includes('json'))) {  // not "no such route": the server's answer
       const data = await res.json().catch(() => ({ error: `${res.status} ${res.statusText}` }));
+      if (loginGone(res.status, data)) return toLogin();
       if (!res.ok) throw Object.assign(new Error(data.error || res.statusText), { status: res.status, data });
       on.meta(data);
       return data;
@@ -1890,6 +1915,8 @@ $('ask').onsubmit = e => {
   ask(question);
 };
 
+// Log out, when there is a login (body.login: on a phone, Instructions is shortened to make room for it).
+api('/api/session').then(s => { $('logout').hidden = !s.login; document.body.classList.toggle('login', !!s.login); }).catch(() => {});
 const lastChat = +store.get('chatConversation');
 if (lastChat) openChat(lastChat); else emptyState();  // the conversation open before a reload
 loadChats();

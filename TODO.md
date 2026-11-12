@@ -190,6 +190,23 @@ Everything below is uncommitted in the working tree.
   the page. 184 tests pass. Staging (qwen3.5, nothing spent on Claude): 19/19 API checks, a server killed mid-answer
   (3/3), a 7-question conversation at `OLLAMA_NUM_CTX=4096` kept local (5/5), and 18/18 browser checks (reload and Stop
   mid-answer, another tab, rename, a deleted id, light, dark, 390 px).
+- 2026-11-12: Plan item 12. An optional shared password (`app/auth.py`). With `APP_PASSWORD` set, every page and API
+  call needs a signed session cookie (`docchat_session`: HttpOnly, SameSite=Lax, `SESSION_DAYS` = 30 days from
+  logging in, not renewed by every poll) from `/login`, a standalone page (inline styles, light and dark, phone
+  width). Pages redirect there and back after it (a bookmarked link to an original file too); `/api/*` gets 401
+  `{"error": "Login required", "login": true}` and the page then goes to the login page without an error box.
+  Passwords are compared with `hmac.compare_digest` over SHA-256 digests; the session holds an HMAC of the password,
+  so a new password logs everyone out. The cookie key is `SECRET_KEY`, or else a random one made once in
+  `/data/secret_key` (mode 600), loaded by a session interface when first needed (Flask opens the session before any
+  `before_request` hook). Five wrong passwords from one address within 10 minutes make it wait a minute after each
+  further failure (429 with `Retry-After`, the right password included). CSRF: logged in, POST/PATCH/DELETE under
+  `/api/` need an `X-Requested-With` header, which the page's calls, the XHR upload, the stream and the stop request
+  send; the Origin check stays. **Log out** in the header (an icon at 420 px and below, where Instructions reads
+  **Rules** to make room; it fits from 320 px). Without a password nothing changes: no cookie, no header needed, no
+  key file, the header as before. Compose passes `APP_PASSWORD`, `SECRET_KEY` and `SESSION_DAYS` (no defaults).
+  193 tests pass. Staging (qwen3.5, nothing spent on Claude): 28/28 API checks (an upload read and embedded and a
+  streamed answer while logged in, a job finished after a restart with no request at all, the session kept across
+  the restart, the throttle) and 52/52 browser checks (light, dark, 1400-320 px, with and without a password).
 
 ## To do
 
@@ -246,7 +263,7 @@ Ordered by priority. Suggested start: 1 and 2, then 5. Item 12 is small and wort
 
 ### Phase 4: Safety and operations
 
-- [ ] 12. A login. The app is open to the LAN on port 8000 with no password; anyone can delete
+- [x] 12. A login. The app is open to the LAN on port 8000 with no password; anyone can delete
       documents or change the instructions. A single shared password would close that.
 - [ ] 13. Stable network address. The Windows portproxy points at the WSL IP, which can change on
       restart. Use WSL mirrored networking or a start-up script that re-points it.
