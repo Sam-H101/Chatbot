@@ -11,6 +11,7 @@ services:
       - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
       - OLLAMA_MODEL
       - OLLAMA_VISION_MODEL
+      - OLLAMA_EMBED_MODEL
       - OLLAMA_NUM_CTX
       - OLLAMA_ANALYZE_CHARS
       - ANALYZE_MAX_SECTIONS
@@ -23,6 +24,7 @@ services:
       - CONFIRM_COST_USD
       - SYSTEM_PROMPT
       - TOP_K
+      - SEARCH_MIN_SIMILARITY
       - PDF_EXTRACTOR
       # Which PDF pages count as scanned (read by a model, and paid for with Claude), and
       # how Claude's reading is split up.

@@ -89,11 +89,18 @@ def _report(on_usage, kind, model, response):
 # Kept byte-stable (no timestamps, no per-request data) so it stays cacheable.
 SYSTEM = os.environ.get("SYSTEM_PROMPT") or (
     "You answer questions for the user of a document chatbot. Each user message may "
-    "start with <excerpts> retrieved from the user's uploaded documents by full-text "
-    "search. Use them when relevant and cite the file name in parentheses. If the "
-    "excerpts do not contain the answer, say so and answer from general knowledge. "
-    "Be concise."
+    "start with <excerpts> retrieved from the user's uploaded documents by search, and a "
+    "<scope> naming the only documents the user wants searched. Use the excerpts when "
+    "relevant, and cite each one you use in parentheses with its file name, like "
+    "(Chapter 7 Brake.pdf). If the excerpts do not contain the answer, say so and answer "
+    "from general knowledge. Be concise."
 )
+# Follows the excerpts only when some of them have pages. In the system prompt, it had a
+# local model (qwen3.5:9b) give excerpts without pages (documents read before pages were
+# kept) a made-up page in 7 of 15 answers; here, in none of 15, and pages were cited right.
+PAGE_NOTE = ("Excerpts with a page or pages attribute: cite the page too, like (Chapter 7 Brake.pdf, p. 12); "
+             "a [Page n] line inside an excerpt marks where page n starts. Cite an excerpt without one by its "
+             "file name alone.")
 
 def system_prompt(rules=()):
     """SYSTEM plus the operator's instructions. Changes only when the rules change,
@@ -224,14 +231,39 @@ def _transcribe(client, model, pages, total, pdf_bytes, on_usage=None):
     return split_pages(_text(response), pages)
 
 
-def build_user_message(question, hits):
+def excerpt_text(hit):
+    """A retrieved chunk as the model reads it (and the page shows it as a source): litre/
+    gallon misprints corrected so the model doesn't repeat them, and where a chunk of a PDF
+    runs onto another page, a "[Page n]" line where that page starts, so a fact is cited
+    with its own page rather than the range's. units.fix reads the stored chunk, as the
+    unit check at upload did (units.scan), so both find the same misprints."""
+    text, first = units.fix(hit["text"]), hit.get("page_start")
+    parts = text.lstrip(extract.PAGE_BREAK).split(extract.PAGE_BREAK)  # breaks before its text: in page_start
+    if first and len(parts) > 1:
+        text = parts[0].rstrip() + "".join(f"\n\n[Page {first + i}]\n{p.strip()}" for i, p in enumerate(parts)
+                                           if i and p.strip())
+    return extract.plain(text)
+
+
+def build_user_message(question, hits, scope=None):
+    """The question, after the excerpts retrieved for it. Each names its file and, for a
+    PDF read since pages were kept, its page or pages, which PAGE_NOTE asks the answer to
+    cite. `scope`: the file names of the documents the user limited the question to."""
+    head = ""
+    if scope:
+        names = ", ".join(scope[:10]) + (f" and {len(scope) - 10} more" if len(scope) > 10 else "")
+        head = f"<scope>Only these documents were searched: {names}</scope>\n"
     if not hits:
-        return question
-    # units.fix corrects litre/gallon misprints so the model doesn't repeat them. It reads the
-    # stored chunk, as the unit check at upload did (units.scan), so both find the same ones.
-    parts = [f'<excerpt file="{h["filename"]}" part="{h["idx"]}">\n{extract.plain(units.fix(h["text"]))}\n</excerpt>'
-             for h in hits]
-    return "<excerpts>\n" + "\n".join(parts) + "\n</excerpts>\n\n" + question
+        return head + question
+    parts = []
+    for h in hits:
+        attrs = 'file="{}"'.format(h["filename"].replace('"', "'"))
+        if h.get("page_start"):
+            first, last = h["page_start"], h["page_end"]
+            attrs += f' page="{first}"' if first == last else f' pages="{first}-{last}"'
+        parts.append(f"<excerpt {attrs}>\n{excerpt_text(h)}\n</excerpt>")
+    note = f"\n\n{PAGE_NOTE}" if any(h.get("page_start") for h in hits) else ""
+    return head + "<excerpts>\n" + "\n".join(parts) + "\n</excerpts>" + note + "\n\n" + question
 
 
 def chat(client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):

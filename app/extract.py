@@ -2,7 +2,7 @@
 
 PDF text is kept per page: the readers return one string per page, and a document's
 text joins its pages with a form feed ("\\f", see join_pages). Chunks keep those page
-breaks (see chunk_text), so a chunk's page numbers can be worked out later."""
+breaks (see chunk_text), which give each chunk's pages (page_ranges) for citations."""
 import io
 import os
 import re
@@ -161,7 +161,7 @@ def chunk_text(text, size=CHUNK_CHARS):
     A page break ("\\f") also ends a paragraph, and it is kept rather than dropped as
     whitespace: a chunk that starts a new page begins with "\\f", and one that runs onto
     the next page has "\\f" where it does. Counting the form feeds before a spot in a
-    document's chunks therefore gives its page. Empty pages still count."""
+    document's chunks therefore gives its page (page_ranges). Empty pages still count."""
     chunks, current, breaks = [], "", 0
     for n, page in enumerate(text.split(PAGE_BREAK)):
         breaks += n > 0
@@ -184,6 +184,19 @@ def chunk_text(text, size=CHUNK_CHARS):
     if current:
         chunks.append(current)
     return chunks
+
+
+def page_ranges(chunks):
+    """(first page, last page) of each chunk of a paged text (a PDF's), from 1. chunk_text
+    keeps every page break, and a chunk that opens a page starts with its breaks, so the
+    breaks before a chunk and at its start give the page its text starts on, and those in
+    it the page it ends on: a chunk running onto the next pages gets a range."""
+    ranges, page = [], 1
+    for c in chunks:
+        first = page + len(c) - len(c.lstrip(PAGE_BREAK))
+        page += c.count(PAGE_BREAK)
+        ranges.append((first, page))
+    return ranges
 
 
 def plain(text):

@@ -24,6 +24,10 @@ HOLDING_JOBS = ACTIVE_JOBS + ("failed",)
 # would both run ALTER TABLE, failing the slower request.
 _schema_lock = threading.Lock()
 _schema_ready = set()
+# Moves after every committed change to chunks or their vectors: vectors.py keeps the
+# vectors in memory and reloads them when it moves (one process, see the Dockerfile).
+_index_version = 0
+_version_lock = threading.Lock()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -71,8 +75,9 @@ CREATE TABLE IF NOT EXISTS jobs (           -- uploads and re-reads, worked thro
     mime       TEXT,
     model      TEXT NOT NULL,               -- the choice: 'auto', 'ollama:<model>' or 'claude:<model>'
     options    TEXT NOT NULL DEFAULT '{}',  -- JSON: on_duplicate, claude_pages, confirmed, ...
-    progress   INTEGER NOT NULL DEFAULT 0,  -- pages read so far, then sections analyzed (long documents)
-    total      INTEGER NOT NULL DEFAULT 0,  -- pages to read, then sections; 0 while unknown or not a PDF
+    progress   INTEGER NOT NULL DEFAULT 0,  -- pages read so far, then sections analyzed (long documents),
+                                            -- then passages indexed for search by meaning
+    total      INTEGER NOT NULL DEFAULT 0,  -- pages to read, then sections, then passages; 0 while unknown
     stage      TEXT NOT NULL DEFAULT '',    -- e.g. 'Reading page 40 of 312', 'Analyzing section 3 of 12 with …'
     error      TEXT,
     estimate   TEXT,                        -- JSON: what reading with Claude should cost
@@ -86,10 +91,17 @@ CREATE TABLE IF NOT EXISTS jobs (           -- uploads and re-reads, worked thro
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_sha256 ON jobs(sha256);
 CREATE TABLE IF NOT EXISTS chunks (
-    id     INTEGER PRIMARY KEY,
-    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    idx    INTEGER NOT NULL,
-    text   TEXT NOT NULL
+    id         INTEGER PRIMARY KEY,
+    doc_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    idx        INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    page_start INTEGER,                     -- pages of a PDF's chunk (extract.page_ranges); NULL for
+    page_end   INTEGER                      -- other files and chunks indexed before pages were kept
+);
+CREATE TABLE IF NOT EXISTS chunk_vectors (  -- search by meaning (vectors.py): one embedding per chunk
+    chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    model    TEXT NOT NULL,                 -- the embedding model that made it (OLLAMA_EMBED_MODEL)
+    vector   BLOB NOT NULL                  -- float32, little-endian
 );
 CREATE TABLE IF NOT EXISTS instructions (
     id         INTEGER PRIMARY KEY,
@@ -117,6 +129,7 @@ COLUMNS = {
     "unit_findings": "TEXT",  # litre/gallon misprints; checked at upload, older documents by jobs.check_units
 }
 USAGE_COLUMNS = {"job_id": "INTEGER"}  # usage rows from before jobs have none
+CHUNK_COLUMNS = {"page_start": "INTEGER", "page_end": "INTEGER"}  # older chunks have no pages: cited by file name
 # A document's columns as the API lists it. Its unit check's findings stay here (they have
 # their own route, unit_findings()): listings read only how many there are (_doc_columns).
 _DOC_FIELDS = ("id", "filename", "uploaded_at", "char_count", "title", "doc_type", "summary", "keywords", "analysis",
@@ -138,7 +151,7 @@ def connect():
 
 def _migrate(con):
     con.executescript(SCHEMA)
-    for table, columns in (("documents", COLUMNS), ("usage", USAGE_COLUMNS)):
+    for table, columns in (("documents", COLUMNS), ("usage", USAGE_COLUMNS), ("chunks", CHUNK_COLUMNS)):
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         for name, decl in columns.items():
             if name not in have:
@@ -242,10 +255,30 @@ def _meta(meta):
             ", ".join(meta.get("keywords", [])))
 
 
-def _insert_chunks(con, doc_id, chunks):
+def index_version():
+    return _index_version
+
+
+def _index_changed():
+    """After a commit that changed chunks or vectors (before it, a search could reload the
+    old rows and keep them as current)."""
+    global _index_version
+    with _version_lock:
+        _index_version += 1
+
+
+def _insert_chunks(con, doc_id, chunks, pages=None, vectors=None):
+    """A document's chunks and their FTS rows. `pages`: (first, last) page of each chunk of
+    a paged text (extract.page_ranges), None for text without pages. `vectors`: (embedding
+    model, one vector per chunk) for search by meaning; None leaves them to vectors.backfill."""
     for i, text in enumerate(chunks):
-        cid = con.execute("INSERT INTO chunks (doc_id, idx, text) VALUES (?,?,?)", (doc_id, i, text)).lastrowid
+        first, last = pages[i] if pages else (None, None)
+        cid = con.execute("INSERT INTO chunks (doc_id, idx, text, page_start, page_end) VALUES (?,?,?,?,?)",
+                          (doc_id, i, text, first, last)).lastrowid
         con.execute("INSERT INTO chunks_fts (rowid, text) VALUES (?,?)", (cid, text))
+        if vectors:
+            con.execute("INSERT OR REPLACE INTO chunk_vectors (chunk_id, model, vector) VALUES (?,?,?)",
+                        (cid, vectors[0], vectors[1][i]))
 
 
 def _finish_job(con, job, doc_id):
@@ -266,14 +299,15 @@ def _units(check):
 
 
 def add_document(filename, chunks, meta, analysis, model="", data=None, mime=None, sha=None, replace=False,
-                 size=None, job=None, units=None):
+                 size=None, job=None, units=None, pages=None, vectors=None):
     """Index a document and return its id. Its original is `data`, stored here under
     files_dir(), or one already stored under its hash `sha` (by an upload job) with
     `size` bytes; with neither, the document has no kept file. replace=True first
     deletes the documents that hold the same file, in the same transaction. `job` =
     (job id, result dict) marks that job done in the same transaction too, the result
     gaining doc_id and replaced; if the job was cancelled meanwhile, nothing is added.
-    `units`: its unit check (units.check); None leaves it to jobs.check_units."""
+    `units`: its unit check (units.check); None leaves it to jobs.check_units. `pages`
+    and `vectors`: its chunks', as _insert_chunks takes them."""
     if data is not None:
         sha, size = sha or file_hash(data), len(data)
     kept = sha is not None and size is not None
@@ -295,7 +329,7 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
                 ).lastrowid
                 con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords)"
                             " VALUES (?,?,?,?,?,?)", (doc_id, filename, *_meta(meta)))
-                _insert_chunks(con, doc_id, chunks)
+                _insert_chunks(con, doc_id, chunks, pages, vectors)
                 if job:
                     _finish_job(con, job, doc_id)
                 if data is not None:  # last, so a failed insert leaves no file behind
@@ -304,12 +338,14 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
             if wrote:  # written for rows that never committed
                 _remove(sha)
             raise
+    _index_changed()
     return doc_id
 
 
-def replace_document(doc_id, chunks, meta, analysis, model, job=None, units=None):
+def replace_document(doc_id, chunks, meta, analysis, model, job=None, units=None, pages=None, vectors=None):
     """A re-read: new text, chunks, metadata, model and unit check for a document,
-    keeping its id, file and upload date. `job` and `units` as in add_document."""
+    keeping its id, file and upload date. `job`, `units`, `pages` and `vectors` as in
+    add_document; the old chunks' vectors go with them (ON DELETE CASCADE)."""
     with connect() as con:
         row = con.execute("SELECT filename FROM documents WHERE id=?", (doc_id,)).fetchone()
         if not row:
@@ -322,9 +358,10 @@ def replace_document(doc_id, chunks, meta, analysis, model, job=None, units=None
         con.execute("DELETE FROM docs_fts WHERE rowid=?", (doc_id,))
         con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords) VALUES (?,?,?,?,?,?)",
                     (doc_id, row["filename"], *_meta(meta)))
-        _insert_chunks(con, doc_id, chunks)
+        _insert_chunks(con, doc_id, chunks, pages, vectors)
         if job:
             _finish_job(con, job, doc_id)
+    _index_changed()
 
 
 def list_documents():
@@ -421,6 +458,7 @@ def delete_documents(ids):
         with connect() as con:
             deleted, files = _delete_rows(con, ids)
             unused = [p for p in files if _unused(con, p)]
+        _index_changed()  # their chunks' vectors went with them
         for p in unused:  # only after the commit: a rollback must not lose a file
             _remove(p)
     return deleted
@@ -541,9 +579,19 @@ def cancel_job(job_id):
     return get_job(job_id)
 
 
+# Words too common to tell passages apart. A question's "what is the" matched nearly every
+# chunk, which ranked them by how often they say "the", and in the blend with search by
+# meaning (vectors.search) counted as being found by keywords too.
+STOPWORDS = frozenset(
+    "about an and are as at be by can could do does did for from had has have how i if in into is it its many me "
+    "much my of on or our should so than that the their them then there these they this those to was we were what "
+    "when where which who whom why will with would you your".split())
+
+
 def fts_query(text):
-    """Turn free text into a safe FTS5 query: quoted terms OR-ed together."""
-    terms = [t for t in re.findall(r"\w+", text.lower()) if len(t) > 1]
+    """Turn free text into a safe FTS5 query: quoted terms OR-ed together, without the
+    STOPWORDS. Empty when that leaves nothing ("What is 2 + 2?"): nothing to search for."""
+    terms = [t for t in re.findall(r"\w+", text.lower()) if len(t) > 1 and t not in STOPWORDS]
     return " OR ".join(f'"{t}"' for t in dict.fromkeys(terms))
 
 
@@ -558,17 +606,96 @@ def search_documents(text, limit=10):
         return [_doc(r) for r in rows]
 
 
-def search_chunks(text, limit=5):
+# A chunk as search returns it: where it is (document, place, pages) and whether its
+# document's original can be opened (at a page, for a PDF).
+_HIT = ("c.id AS chunk_id, c.doc_id, c.idx, c.text, c.page_start, c.page_end, d.filename, d.title,"
+        " d.file_path IS NOT NULL AS has_file, d.mime")
+
+
+def _hit(row):
+    h = dict(row)
+    mime = h.pop("mime")
+    h["has_file"] = bool(h["has_file"])
+    h["pdf"] = h["has_file"] and mime == "application/pdf"
+    return h
+
+
+def _among(doc_ids):
+    """A filter on c.doc_id for a search limited to these documents (None: all of them).
+    One JSON parameter, however many there are."""
+    if doc_ids is None:
+        return "", ()
+    return " AND c.doc_id IN (SELECT value FROM json_each(?))", (json.dumps(list(doc_ids)),)
+
+
+def search_chunks(text, limit=5, doc_ids=None):
+    """Chunks with the words of `text`, best first (bm25), each with a snippet that marks
+    them [like this]; only in the documents `doc_ids`, if given."""
     q = fts_query(text)
     if not q:
         return []
+    scope, args = _among(doc_ids)
     with connect() as con:
         rows = con.execute(
-            "SELECT c.doc_id, c.idx, c.text, d.filename, d.title,"
-            " snippet(chunks_fts, 0, '[', ']', ' … ', 24) AS snippet"
+            f"SELECT {_HIT}, snippet(chunks_fts, 0, '[', ']', ' … ', 24) AS snippet"
             " FROM chunks_fts f JOIN chunks c ON c.id = f.rowid JOIN documents d ON d.id = c.doc_id"
-            " WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?", (q, limit))
-        return [dict(r) for r in rows]
+            f" WHERE chunks_fts MATCH ?{scope} ORDER BY bm25(chunks_fts) LIMIT ?", (q, *args, limit))
+        return [_hit(r) for r in rows]
+
+
+def chunks_by_id(ids):
+    """{chunk id: chunk as search_chunks has it, without a snippet} for those that exist."""
+    with connect() as con:
+        return {r["chunk_id"]: _hit(r) for r in con.execute(
+            f"SELECT {_HIT} FROM chunks c JOIN documents d ON d.id = c.doc_id"
+            " WHERE c.id IN (SELECT value FROM json_each(?))", (json.dumps(list(ids)),))}
+
+
+def document_names(ids):
+    """{id: filename} of the documents among `ids` that exist, in the order given."""
+    with connect() as con:
+        names = dict(con.execute("SELECT id, filename FROM documents WHERE id IN (SELECT value FROM json_each(?))",
+                                 (json.dumps(list(ids)),)).fetchall())
+    return {i: names[i] for i in ids if i in names}
+
+
+# ---- vectors for search by meaning (vectors.py) ----
+
+def all_vectors(model):
+    """[(chunk id, document id, vector bytes)] of every chunk this embedding model embedded."""
+    with connect() as con:
+        return con.execute("SELECT v.chunk_id, c.doc_id, v.vector FROM chunk_vectors v JOIN chunks c ON c.id = v.chunk_id"
+                           " WHERE v.model=?", (model,)).fetchall()
+
+
+def missing_vectors(model, limit):
+    """Up to `limit` chunks, all of one document, that have no vector from this embedding
+    model (indexed before search by meaning, while the model was unavailable, or by
+    another model): [(chunk id, document id, text)], in order."""
+    with connect() as con:
+        rows = con.execute("SELECT c.id, c.doc_id, c.text FROM chunks c LEFT JOIN chunk_vectors v"
+                           " ON v.chunk_id = c.id AND v.model = ? WHERE v.chunk_id IS NULL"
+                           " ORDER BY c.doc_id, c.idx LIMIT ?", (model, limit)).fetchall()
+    return [tuple(r) for r in rows if r[1] == rows[0][1]]
+
+
+def store_vectors(model, rows):
+    """Keep chunks' vectors: rows [(chunk id, the text embedded, vector bytes)]. A chunk
+    whose text is no longer that (its document was re-read, or deleted and the id given to
+    a new chunk, while the text was being embedded) is skipped. Returns how many were kept."""
+    with connect() as con:
+        kept = sum(con.execute("INSERT OR REPLACE INTO chunk_vectors (chunk_id, model, vector)"
+                               " SELECT id, ?, ? FROM chunks WHERE id=? AND text=?",
+                               (model, blob, cid, text)).rowcount for cid, text, blob in rows)
+    _index_changed()
+    return kept
+
+
+def vector_counts(model):
+    """(chunks in the library, chunks with a vector from this embedding model)."""
+    with connect() as con:
+        return tuple(con.execute("SELECT (SELECT count(*) FROM chunks),"
+                                 " (SELECT count(*) FROM chunk_vectors WHERE model=?)", (model,)).fetchone())
 
 
 # ---- usage log: one row per model call ----

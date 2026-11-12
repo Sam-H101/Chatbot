@@ -26,6 +26,11 @@ ANALYZE_CHARS = int(os.environ.get("OLLAMA_ANALYZE_CHARS", "40000"))
 REPLY_TOKENS = 2000  # context kept free for an analysis reply, and the most it may write
 KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "600"))
+# Embeds chunks and questions for search by meaning (vectors.py). A small model (0.6B,
+# about 640 MB) that sits on the GPU beside the chat model.
+EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:0.6b")
+# Seconds an embedding call may take: a question waits for it, so far less than TIMEOUT.
+EMBED_TIMEOUT = 60
 # What an analysis prompt adds to the text it carries (its instructions, the file name and
 # labels), in tokens, and the factor a token estimate (tokens) is raised by for what it misses.
 PROMPT_TOKENS, MARGIN = 500, 1.1
@@ -70,10 +75,15 @@ def _chat(model, messages, think=None, temperature=None, num_predict=None, **ext
             "keep_alive": KEEP_ALIVE, "options": options, **extra}
     if think is not None:  # only sent to models that support thinking
         body["think"] = think
-    req = urllib.request.Request(f"{URL}/api/chat", data=json.dumps(body).encode(),
+    return _post("/api/chat", body)
+
+
+def _post(path, body, timeout=TIMEOUT):
+    model = body["model"]
+    req = urllib.request.Request(f"{URL}{path}", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:  # before URLError: it is a subclass
         detail = e.read().decode(errors="replace")
@@ -116,6 +126,23 @@ def _usage(r):
     the whole prompt came from its cache."""
     return {"input": r.get("prompt_eval_count") or 0, "output": r.get("eval_count") or 0,
             "cache_read": 0, "cache_write": 0}
+
+
+def embed(texts, model=None, kind="embed", on_usage=None):
+    """One embedding per text (a list of floats; Ollama returns them unit length), in one
+    call to /api/embed. Text past the model's context (a very long question) is cut rather
+    than refused (truncate). on_usage hears of the call as `kind` ("embed" for document
+    text, "embed-query" for a question)."""
+    model = model or EMBED_MODEL
+    r = _post("/api/embed", {"model": model, "input": list(texts), "truncate": True, "keep_alive": KEEP_ALIVE},
+              timeout=EMBED_TIMEOUT)
+    if on_usage:
+        on_usage(kind, "ollama", model, {"input": r.get("prompt_eval_count") or 0, "output": 0,
+                                         "cache_read": 0, "cache_write": 0})
+    vectors = r.get("embeddings") or []
+    if len(vectors) != len(texts):
+        raise OllamaError(f"{model}: {len(vectors)} embeddings for {len(texts)} texts")
+    return vectors
 
 
 def analyze_tokens():

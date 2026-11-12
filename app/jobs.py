@@ -1,7 +1,8 @@
 """Background reading. Uploads and re-reads wait in the jobs table, and one worker thread
 per process works through them in order, saving progress as it goes. Pages a model has
 read are kept with the job, so a job that failed, or was cut off by a restart, carries on
-where it stopped instead of paying for those pages again. Flask-free, like llm.py and
+where it stopped instead of paying for those pages again. With no job to do, the worker
+embeds chunks that have no vectors yet (vectors.backfill). Flask-free, like llm.py and
 ollama.py: the routes that create jobs and report on them are in main.py."""
 import logging
 import os
@@ -11,7 +12,7 @@ import time
 import anthropic
 import pypdfium2
 
-from . import db, extract, llm, ollama, sections, units
+from . import db, extract, llm, ollama, sections, units, vectors
 
 log = logging.getLogger(__name__)
 
@@ -239,6 +240,10 @@ def _loop():
         try:
             if run_next():
                 continue
+            # No job: chunks without vectors (older documents, or uploads made while the embedding
+            # model was unavailable) are embedded a few calls at a time, between jobs.
+            if vectors.backfill():
+                continue
         except Exception:  # say the database stayed locked: try again shortly
             log.exception("Job worker error")
         _wake.wait(30)
@@ -310,19 +315,24 @@ def _process(job):
         with open(os.path.join(db.files_dir(), os.path.basename(job["file_path"])), "rb") as f:
             data = f.read()
         text, meta, analysis, who, note = _read(job, opts, data, progress, on_usage)
-        progress.stage("Saving")
         chunks = extract.chunk_text(text)
-        # The litre/gallon misprints that answers will be corrected for. A PDF's text has pages,
-        # page 1 too when no page break follows it.
-        check = units.check(chunks, paged=job["filename"].lower().endswith(".pdf"))
-        result = {**used(who, note), "title": meta.get("title") or job["filename"],
-                  "chunks": len(chunks), "analysis": analysis, "replaced": [], "unit_fixes": check["total"]}
+        # A PDF's text has pages (page 1 too when no page break follows it): each chunk's are
+        # kept for citations, and the unit check lists the litre/gallon misprints, that answers
+        # will be corrected for, by page.
+        paged = job["filename"].lower().endswith(".pdf")
+        pages = extract.page_ranges(chunks) if paged else None
+        check = units.check(chunks, paged=paged)
+        vecs = _index(chunks, progress, on_usage)
+        progress.stage("Saving")
+        result = {**used(who, note), "title": meta.get("title") or job["filename"], "chunks": len(chunks),
+                  "analysis": analysis, "replaced": [], "unit_fixes": check["total"], "embedded": vecs is not None}
         if job["kind"] == "reread":
-            db.replace_document(job["doc_id"], chunks, meta, analysis, label(*who), units=check, job=(job_id, result))
+            db.replace_document(job["doc_id"], chunks, meta, analysis, label(*who), units=check, job=(job_id, result),
+                                pages=pages, vectors=vecs)
         else:
             db.add_document(job["filename"], chunks, meta, analysis, label(*who), sha=job["sha256"],
                             size=job["file_size"], mime=job["mime"], replace=opts.get("on_duplicate") == "replace",
-                            units=check, job=(job_id, result))
+                            units=check, job=(job_id, result), pages=pages, vectors=vecs)
         status = "done"
     except AwaitConfirmation:
         status = "awaiting_confirmation"
@@ -345,6 +355,20 @@ def _process(job):
                 db.link_usage(job_id, doc_id)
             except Exception:
                 log.exception("Could not link the usage of job %d", job_id)
+
+
+def _index(chunks, progress, on_usage):
+    """The chunks' vectors for search by meaning (vectors.for_chunks), or None when the
+    embedding model is unavailable: the document is still added, searchable by keywords,
+    and the worker embeds it later (vectors.backfill)."""
+    if not vectors.ready():
+        return None
+
+    def say(done, total=len(chunks)):
+        progress.stage(f"Indexing for search by meaning: {done} of {total} passages", done, total)
+
+    say(0)
+    return vectors.for_chunks(chunks, on_usage=on_usage, on_progress=say)
 
 
 def _read(job, opts, data, progress, on_usage):

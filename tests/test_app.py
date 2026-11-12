@@ -8,8 +8,14 @@ import pytest
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    from app import db, jobs, llm, main
+    from app import db, jobs, llm, main, ollama, vectors
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    # No embedding model unless a test brings one (fake_embedder): search is by keywords, and
+    # vectors.py starts each test with no pause and nothing cached.
+    monkeypatch.setattr(ollama, "embed", no_embedder)
+    monkeypatch.setattr(vectors, "_retry_at", 0.0)
+    monkeypatch.setattr(vectors, "_last_error", None)
+    monkeypatch.setattr(vectors, "_cache", None)
     monkeypatch.setattr(db, "FILES_DIR", "")  # originals go to tmp_path / "files"
     monkeypatch.setattr(main, "BACKEND", "claude")
     # No worker thread: tests run the queue themselves (jobs.drain), see upload() below.
@@ -36,6 +42,34 @@ def client(tmp_path, monkeypatch):
 
 H = {"X-API-Key": "k"}
 LEASE = b"The monthly rent is 900 euros.\n\nPets are allowed."
+
+
+def no_embedder(texts, model=None, kind="embed", on_usage=None):
+    from app import ollama
+    raise ollama.OllamaUnavailable("Could not reach Ollama (no embedding model in tests)")
+
+
+# What the fake embedding model "understands": each word counts towards one meaning.
+MEANINGS = [{"hydraulic", "oil", "fluid", "transmission", "lubricant"}, {"capacity", "litres", "fill", "quantity"},
+            {"rent", "euros", "deposit"}, {"pets", "dog"}, {"brake", "brakes", "pedal"}]
+
+
+def fake_embedder(monkeypatch, calls=None):
+    """ollama.embed, faked: a vector of how many words of each meaning a text has (plus a
+    little of none, so no vector is all zeros). Records (kind, texts) in `calls`."""
+    from app import ollama
+
+    def embed(texts, model=None, kind="embed", on_usage=None):
+        if calls is not None:
+            calls.append((kind, list(texts)))
+        words = [re.findall(r"[a-z]+", t.lower()) for t in texts]
+        if on_usage:
+            on_usage(kind, "ollama", model or ollama.EMBED_MODEL, {"input": sum(map(len, words)), "output": 0,
+                                                                  "cache_read": 0, "cache_write": 0})
+        return [[float(sum(w in m for w in ws)) for m in MEANINGS] + [0.1] for ws in words]
+
+    monkeypatch.setattr(ollama, "embed", embed)
+    return calls
 
 
 def post(client, name="lease.txt", body=LEASE, **form):
@@ -114,11 +148,17 @@ def test_the_worker_thread_reads_queued_uploads(client, monkeypatch):
 
 
 def test_chat_grounds_on_excerpts(client):
-    upload(client)
+    doc_id = add(client)["doc_id"]
     r = client.post("/api/chat", json={"question": "How much is the rent?", "history": []}, headers=H)
-    assert r.json["answer"] == "42" and r.json["sources"] == ["lease.txt"]
-    assert "900 euros" in client.seen["msg"]
+    assert r.json["answer"] == "42" and r.json["scope"] is None
+    assert r.json["sources"] == [{"doc_id": doc_id, "filename": "lease.txt", "title": "Lease", "has_file": True,
+                                  "pdf": False, "pages": [], "excerpts": [0]}]               # a text file has no pages
+    (e,) = r.json["excerpts"]
+    assert e["text"] == LEASE.decode() and (e["match"], e["page_start"], e["idx"]) == ("keywords", None, 0)
+    assert '<excerpt file="lease.txt">\nThe monthly rent is 900 euros.' in client.seen["msg"]
     assert r.json["turns"][0]["content"] == client.seen["msg"]
+    assert client.post("/api/chat", json={"question": "hi", "history": "none"}, headers=H).status_code == 400
+    assert client.post("/api/chat", json={"question": "hi", "history": ["x"]}, headers=H).status_code == 400
 
 
 def test_requires_key(client, monkeypatch):
@@ -153,6 +193,20 @@ def test_page_breaks_survive_chunking():
     assert plain(chunks[0]) == "First page.\n\nThird page, part one.\n\nThird page, part two."
     assert plain(chunks[1]).startswith("Fourth") and plain("one\ftwo") == "one\n\ntwo"
     assert join_pages(["a\fb", "c"]) == "a\nb\fc"                                         # a stray form feed isn't a page
+
+
+def test_chunks_know_the_pages_they_span():
+    """A chunk's pages come from the page breaks before it and in it: one that opens a page
+    starts on it, one that runs onto the next pages gets a range, and empty pages count."""
+    from app.extract import chunk_text, join_pages, page_ranges
+    text = join_pages(["First page.", "", "Third page, part one.\n\nThird page, part two.", "Fourth " + "x" * 3000,
+                       "", "Sixth page."])
+    chunks = chunk_text(text, size=1500)
+    assert chunks[3] == "x" * 8 + "\n\n\f\fSixth page."                                   # page 4's end, then page 6
+    assert page_ranges(chunks) == [(1, 3), (4, 4), (4, 4), (4, 6)]
+    assert page_ranges(chunk_text(join_pages(["", "", "Third page."]))) == [(3, 3)]       # leading empty pages
+    assert page_ranges(chunk_text("No pages at all.")) == [(1, 1)] and page_ranges([]) == []
+    assert page_ranges(["a\n\n\fb\n\n\fc", "\fd"]) == [(1, 3), (4, 4)]
 
 
 def test_claude_page_marks_split_a_batch_into_pages():
@@ -521,7 +575,7 @@ def test_ollama_reads_only_scanned_pages_with_vision_model(local, monkeypatch):
     from app import extract, ollama
     monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [("Page one has real text.", None), ("", b"png")])
     job = add(local, "mixed.pdf", blank_pdf(2))
-    assert job["status"] == "done" and job["result"]["title"] == "Scan" and job["total"] == 2
+    assert job["status"] == "done" and job["result"]["title"] == "Scan" and job["total"] == 1  # last: passages indexed
     vision = [c for c in local.calls if c["messages"][-1].get("images")]
     assert len(vision) == 1 and vision[0]["model"] == ollama.VISION_MODEL
     assert "page 2 of a 2-page document" in vision[0]["messages"][-1]["content"]
@@ -1057,8 +1111,11 @@ CREATE TABLE jobs (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT N
     partial TEXT, doc_id INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')));
 """
+# The schema of commit 712f372 (unit checks stored), before chunk pages and vectors.
+SCHEMA_712F372_EXTRA = "ALTER TABLE documents ADD COLUMN unit_findings TEXT;"
 OLD_SCHEMAS = {"894b984": SCHEMA_894B984, "cd8c125": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA,
-               "dc8b86a": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA + SCHEMA_DC8B86A_EXTRA}
+               "dc8b86a": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA + SCHEMA_DC8B86A_EXTRA,
+               "712f372": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA + SCHEMA_DC8B86A_EXTRA + SCHEMA_712F372_EXTRA}
 
 
 @pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())
@@ -2103,3 +2160,266 @@ def test_single_page_too_big_is_reported():
     from app import extract
     with pytest.raises(ValueError, match="page 1 alone"):
         extract.pdf_batches(blank_pdf(2), size=20, max_bytes=10)
+
+
+# ---- page-numbered citations, search by meaning, questions limited to chosen documents ----
+
+ENGINE = b"Engine oil: change the engine oil every 250 hours and check the oil level daily."
+GEARBOX = b"Transmission fluid: the gearbox case takes 38.0 litres of universal tractor fluid."
+BRAKES = ["Chapter 7 Brakes. Contents.", "Brake pedal free travel is 30-40 mm. " * 50, "Adjust both brake rods equally."]
+
+
+def _chunk_rows(doc_id=None):
+    """Chunks with their pages, and the model and size (bytes) of their vectors."""
+    from app import db
+    with db.connect() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT c.id, c.doc_id, c.idx, c.page_start, c.page_end, v.model, length(v.vector) AS size FROM chunks c"
+            " LEFT JOIN chunk_vectors v ON v.chunk_id = c.id WHERE ? IS NULL OR c.doc_id = ? ORDER BY c.id",
+            (doc_id, doc_id))]
+
+
+def test_answers_cite_the_pages_of_their_excerpts(local, monkeypatch):
+    """A PDF's chunks keep the pages they span. The model is told each excerpt's page and
+    asked to cite it; the answer lists its sources, one per document with its pages, and
+    the excerpts as the model read them."""
+    from app import extract, jobs
+    monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [(t, None) for t in BRAKES])
+    doc_id = add(local, "Chapter 7 Brake.pdf", blank_pdf(3), model="ollama:qwen3.5:9b")["doc_id"]
+    assert [(r["page_start"], r["page_end"]) for r in _chunk_rows(doc_id)] == [(1, 1), (2, 2), (2, 3)]
+    from app import llm
+    r = local.post("/api/chat", json={"question": "How much free travel has the brake pedal?"}).json
+    msg = local.calls[-1]["messages"][-1]["content"]
+    assert f"</excerpt>\n</excerpts>\n\n{llm.PAGE_NOTE}\n\nHow much free travel" in msg   # asked to cite pages
+    assert "like (Chapter 7 Brake.pdf, p. 12)" in llm.PAGE_NOTE and "p. 12" not in llm.SYSTEM
+    for label in ('page="1"', 'page="2"', 'pages="2-3"'):
+        assert f'<excerpt file="Chapter 7 Brake.pdf" {label}>' in msg
+    assert r["sources"] == [{"doc_id": doc_id, "filename": "Chapter 7 Brake.pdf", "title": "Scan", "has_file": True,
+                             "pdf": True, "pages": [1, 2, 3], "excerpts": [0, 1, 2]}]
+    assert sorted((e["page_start"], e["page_end"]) for e in r["excerpts"]) == [(1, 1), (2, 2), (2, 3)]
+    assert all("\f" not in e["text"] and e["text"] in msg for e in r["excerpts"])          # what the model read
+    (spans,) = [e["text"] for e in r["excerpts"] if e["page_end"] == 3]                    # where page 3 starts in it
+    assert spans.endswith("30-40 mm.\n\n[Page 3]\nAdjust both brake rods equally.") and spans.count("[Page") == 1
+    assert "[Page" not in "".join(e["text"] for e in r["excerpts"] if e["page_end"] < 3)
+    hit = local.get("/api/search?q=adjust rods").json[0]                                  # the library's search too
+    assert (hit["page_start"], hit["page_end"]) == (2, 3)
+    # A re-read keeps them; a text file has none.
+    monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [("", None), (BRAKES[2], None), ("", None)])
+    local.post(f"/api/documents/{doc_id}/reread", json={"model": "ollama:qwen3.5:9b"})
+    jobs.drain()
+    assert [(r["page_start"], r["page_end"]) for r in _chunk_rows(doc_id)] == [(2, 2)]
+    other = add(local, "notes.txt", b"Brake notes.\n\nMore brake notes.")["doc_id"]
+    assert [(r["page_start"], r["page_end"]) for r in _chunk_rows(other)] == [(None, None)]
+
+
+def test_questions_are_searched_without_their_stopwords(client):
+    """"what is the" matched nearly every passage, ranked them by how often they say "the",
+    and in the blend with search by meaning counted as a keyword match."""
+    from app.db import fts_query
+    assert fts_query("What is the hydraulic oil capacity?") == '"hydraulic" OR "oil" OR "capacity"'
+    assert fts_query("What is 2 + 2?") == ""                                              # nothing to search for
+    add(client, "gearbox.txt", GEARBOX)
+    assert client.get("/api/search?q=What is the oil capacity?").json == []               # "the" alone doesn't match
+    assert client.get("/api/search?q=what is the").json == []
+    r = client.post("/api/chat", json={"question": "What is the use of it?"}, headers=H).json
+    assert r["excerpts"] == [] and client.seen["msg"] == "What is the use of it?"
+
+
+def test_search_by_meaning_finds_what_keywords_miss(client, monkeypatch):
+    """"hydraulic oil capacity" shares no word with the gearbox passage, so the keyword
+    search can't find it; the passages nearest in meaning include it. The two rankings are
+    blended by reciprocal rank fusion: a passage found both ways comes first."""
+    from app import vectors
+    calls = fake_embedder(monkeypatch, [])
+    for name, body in (("engine.txt", ENGINE), ("gearbox.txt", GEARBOX), ("lease.txt", LEASE)):
+        add(client, name, body)
+    assert ("embed", [GEARBOX.decode()]) in calls                                         # passages as they are
+    assert [h["filename"] for h in client.get("/api/search?q=hydraulic oil capacity").json] == ["engine.txt"]
+    monkeypatch.setenv("TOP_K", "2")
+    r = client.post("/api/chat", json={"question": "hydraulic oil capacity"}, headers=H).json
+    assert [(e["filename"], e["match"]) for e in r["excerpts"]] == [("engine.txt", "both"), ("gearbox.txt", "meaning")]
+    assert "38.0 litres" in client.seen["msg"] and "900 euros" not in client.seen["msg"]
+    assert calls[-1] == ("embed-query", [vectors.QUERY.format("hydraulic oil capacity")])  # questions get the instruction
+    assert [r["kind"] for r in _usage_rows()][-2:] == ["embed-query", "chat"]             # logged with the answer
+    # A question near nothing (cosine under MIN_SIMILARITY everywhere) is sent no passages.
+    r = client.post("/api/chat", json={"question": "brake pedal"}, headers=H).json
+    assert r["excerpts"] == [] and r["sources"] == [] and client.seen["msg"] == "brake pedal"
+    monkeypatch.setattr(vectors, "MIN_SIMILARITY", -1.0)                                   # no floor: the nearest anyway
+    assert len(client.post("/api/chat", json={"question": "brake pedal"}, headers=H).json["excerpts"]) == 2
+
+
+def test_an_upload_is_indexed_for_search_by_meaning(local, monkeypatch):
+    """The upload job embeds its chunks before saving them ("Indexing"), a batch per call;
+    the vectors are stored with their model, and each call is in the usage log at no cost."""
+    from app import db, ollama, vectors
+    fake_embedder(monkeypatch)
+    monkeypatch.setattr(vectors, "BATCH", 2)
+    stages, real = [], db.update_job
+
+    def spy(job_id, when=("running",), **fields):
+        if "stage" in fields:
+            stages.append((fields["stage"], fields.get("progress"), fields.get("total")))
+        return real(job_id, when, **fields)
+
+    monkeypatch.setattr(db, "update_job", spy)
+    body = "\n\n".join(f"Part {i} is about the hydraulic fluid. " + "x" * 700 for i in range(5)).encode()
+    job = add(local, "long.txt", body)
+    assert job["status"] == "done" and job["result"]["chunks"] == 3 and job["result"]["embedded"] is True
+    i = stages.index(("Indexing for search by meaning: 0 of 3 passages", 0, 3))
+    assert stages[i + 1:i + 4] == [("Indexing for search by meaning: 2 of 3 passages", 2, 3),
+                                   ("Indexing for search by meaning: 3 of 3 passages", 3, 3), ("Saving", None, None)]
+    assert {(r["model"], r["size"]) for r in _chunk_rows()} == {(ollama.EMBED_MODEL, 4 * (len(MEANINGS) + 1))}
+    assert [(r["kind"], r["model"], r["doc_id"], r["cost_usd"]) for r in _usage_rows()] == [
+        ("analyze", ollama.MODEL, job["doc_id"], 0)] + [("embed", ollama.EMBED_MODEL, job["doc_id"], 0)] * 2
+
+
+def test_without_the_embedding_model_uploads_and_questions_go_on(local, monkeypatch):
+    """Ollama down, or the embedding model not pulled: the upload is added without vectors,
+    questions are answered by keyword search, and embedding pauses instead of being tried
+    for every question or upload. Later the worker's backfill embeds what is missing."""
+    from app import ollama, vectors
+    tries = []
+
+    def missing(texts, model=None, kind="embed", on_usage=None):
+        tries.append(kind)
+        raise ollama.OllamaError(f"{ollama.EMBED_MODEL}: model not found, try pulling it first")
+
+    monkeypatch.setattr(ollama, "embed", missing)
+    job = add(local, "gearbox.txt", GEARBOX)
+    assert job["status"] == "done" and job["result"]["embedded"] is False and tries == ["embed"]
+    assert [r["model"] for r in _chunk_rows()] == [None]
+    r = local.post("/api/chat", json={"question": "How many litres of transmission fluid?"})
+    assert r.status_code == 200 and r.json["excerpts"][0]["match"] == "keywords"
+    status = local.get("/api/search/status").json
+    assert (status["model"], status["chunks"], status["embedded"]) == (ollama.EMBED_MODEL, 1, 0)
+    assert "model not found" in status["error"]
+    assert vectors.backfill() == 0 and add(local, "engine.txt", ENGINE)["result"]["embedded"] is False
+    assert tries == ["embed"]                                                              # paused meanwhile
+    fake_embedder(monkeypatch)
+    monkeypatch.setattr(vectors, "_retry_at", 0.0)                                         # RETRY_SECONDS later
+    assert vectors.backfill() == 2 and vectors.backfill() == 0
+    status = local.get("/api/search/status").json
+    assert (status["embedded"], status["error"]) == (2, None)
+    assert [(r["kind"], r["doc_id"]) for r in _usage_rows() if r["kind"] == "embed"] == [("embed", 1), ("embed", 2)]
+    r = local.post("/api/chat", json={"question": "hydraulic capacity"}).json              # no word in common
+    assert [(e["filename"], e["match"]) for e in r["excerpts"]] == [("gearbox.txt", "meaning"), ("engine.txt", "meaning")]
+
+
+def test_vectors_follow_rereads_and_deletes(local, monkeypatch):
+    """A re-read's new chunks get new vectors (the old ones go with their chunks), a delete
+    takes them away, and the vectors held in memory are reloaded after each: SQLite gives a
+    new chunk the id of a deleted one, which must not keep the old one's vector."""
+    from app import db, extract, jobs, vectors
+    fake_embedder(monkeypatch)
+    monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [("Transmission fluid: 38 litres.", None)])
+    doc_id = add(local, "spec.pdf", blank_pdf(1), model="ollama:qwen3.5:9b")["doc_id"]
+    assert vectors._vectors()[2][0].argmax() == 0                                         # the fluid meaning
+    monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [("Brake pedal: 30 mm of free travel.", None)])
+    local.post(f"/api/documents/{doc_id}/reread", json={"model": "ollama:qwen3.5:9b"})
+    jobs.drain()
+    assert [(r["id"], r["model"] is not None) for r in _chunk_rows()] == [(1, True)]      # the same chunk id ...
+    assert vectors._vectors()[2][0].argmax() == 4                                         # ... with its own vector
+    assert local.delete(f"/api/documents/{doc_id}").status_code == 204
+    assert vectors._vectors() is None and _chunk_rows() == []
+    with db.connect() as con:
+        assert con.execute("SELECT count(*) FROM chunk_vectors").fetchone()[0] == 0
+
+
+def test_a_vector_made_for_text_that_changed_meanwhile_is_not_kept(client):
+    """The backfill embeds a chunk's text while uploads and re-reads go on: if the chunk
+    has other text by the time the vector is stored (a re-read, or a new chunk given the
+    id), the vector is dropped and the new text is embedded on the next round."""
+    from app import db, ollama
+    (row,) = _chunk_rows(add(client)["doc_id"])
+    assert db.store_vectors(ollama.EMBED_MODEL, [(row["id"], "Some other text.", bytes(24))]) == 0
+    assert db.store_vectors(ollama.EMBED_MODEL, [(row["id"], LEASE.decode(), bytes(24))]) == 1
+    assert db.store_vectors(ollama.EMBED_MODEL, [(999, LEASE.decode(), bytes(24))]) == 0  # no such chunk
+
+
+def test_vectors_of_another_embedding_model_are_made_again(client, monkeypatch):
+    from app import db, ollama, vectors
+    fake_embedder(monkeypatch)
+    add(client, "gearbox.txt", GEARBOX)
+    assert db.vector_counts(ollama.EMBED_MODEL) == (1, 1)
+    monkeypatch.setattr(ollama, "EMBED_MODEL", "other-embedding:1b")                       # OLLAMA_EMBED_MODEL changed
+    assert db.vector_counts("other-embedding:1b") == (1, 0) and vectors._vectors() is None  # never compared across models
+    assert vectors.backfill() == 1 and [r["model"] for r in _chunk_rows()] == ["other-embedding:1b"]
+
+
+def test_the_worker_embeds_chunks_that_have_no_vectors(client, monkeypatch):
+    """At start, and whenever no job is queued, the worker thread embeds the chunks that
+    have no vectors: the live library's, and uploads made while embedding was paused."""
+    import time
+    from app import db, jobs, ollama, vectors
+    add(client)                                                                           # no embedding model yet
+    assert db.vector_counts(ollama.EMBED_MODEL) == (1, 0)
+    fake_embedder(monkeypatch)
+    monkeypatch.setattr(vectors, "_retry_at", 0.0)
+    monkeypatch.setattr(jobs, "BACKGROUND", True)
+    monkeypatch.setattr(jobs, "_thread", None)
+    try:
+        jobs.start()
+        for _ in range(100):
+            if db.vector_counts(ollama.EMBED_MODEL) == (1, 1):
+                break
+            time.sleep(0.05)
+    finally:
+        jobs.stop()
+        monkeypatch.setattr(jobs, "BACKGROUND", False)
+    assert db.vector_counts(ollama.EMBED_MODEL) == (1, 1)
+
+
+def test_a_question_can_be_limited_to_chosen_documents(client, monkeypatch):
+    """doc_ids limits both searches, by keywords and by meaning, to those documents, and
+    the model is told which they are."""
+    from app import llm
+    fake_embedder(monkeypatch)
+    lease, gearbox, engine = (add(client, name, body)["doc_id"] for name, body in (
+        ("lease.txt", LEASE), ("gearbox.txt", GEARBOX), ("engine.txt", ENGINE)))
+
+    def ask(**kw):
+        return client.post("/api/chat", json={"question": "rent and oil and fluid", **kw}, headers=H)
+
+    assert {e["filename"] for e in ask().json["excerpts"]} == {"lease.txt", "gearbox.txt", "engine.txt"}
+    r = ask(doc_ids=[gearbox, engine]).json
+    assert r["scope"] == [gearbox, engine] and {e["doc_id"] for e in r["excerpts"]} == {gearbox, engine}
+    assert {s["doc_id"] for s in r["sources"]} == {gearbox, engine}
+    assert client.seen["msg"].startswith("<scope>Only these documents were searched: gearbox.txt, engine.txt</scope>\n")
+    assert [(e["filename"], e["match"]) for e in ask(doc_ids=[lease]).json["excerpts"]] == [("lease.txt", "both")]
+    assert ask(doc_ids=[]).json["scope"] is None and "<scope>" not in client.seen["msg"]   # [] is every document
+    assert ask(doc_ids=[lease, 99999, lease]).json["scope"] == [lease]                    # one deleted meanwhile
+    for bad in ("1", [True], ["1"], [1.5], {"ids": [1]}):
+        assert ask(doc_ids=bad).status_code == 400
+    r = ask(doc_ids=[99999, 2**70])
+    assert r.status_code == 400 and "None of the chosen documents" in r.json["error"]
+    names = [f"f{i}.pdf" for i in range(12)]
+    assert llm.build_user_message("Why?", [], names) == (
+        "<scope>Only these documents were searched: " + ", ".join(names[:10]) + " and 2 more</scope>\nWhy?")
+
+
+@pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())
+def test_chunks_from_before_pages_and_vectors_still_work(client, tmp_path, monkeypatch, schema):
+    """The live library's chunks have no pages and no vectors: they are cited by file name,
+    found by keywords at first, and embedded by the backfill from their stored text (no
+    model reads the documents again), after which search by meaning finds them too."""
+    import sqlite3
+    from app import db, ollama, vectors
+    path = tmp_path / "live.db"
+    con = sqlite3.connect(path)
+    con.executescript(schema)
+    con.close()
+    monkeypatch.setattr(db, "DB_PATH", str(path))
+    r = client.post("/api/chat", json={"question": "When do I change the hydraulic oil?"}, headers=H).json
+    assert r["sources"] == [{"doc_id": 1, "filename": "manual.pdf", "title": "Tractor manual", "has_file": False,
+                             "pdf": False, "pages": [], "excerpts": [0]}]
+    assert '<excerpt file="manual.pdf">\nChange the hydraulic oil every 400 hours.' in client.seen["msg"]
+    assert "page" not in client.seen["msg"].lower()                                       # nothing to make a page up from
+    assert _chunk_rows() == [{"id": 1, "doc_id": 1, "idx": 0, "page_start": None, "page_end": None, "model": None,
+                              "size": None}]
+    assert client.get("/api/search/status").json["embedded"] == 0
+    fake_embedder(monkeypatch)
+    assert vectors.backfill() == 1 and _chunk_rows()[0]["model"] == ollama.EMBED_MODEL
+    r = client.post("/api/chat", json={"question": "lubricant quantity"}, headers=H).json  # no word in common
+    assert [(e["doc_id"], e["match"]) for e in r["excerpts"]] == [(1, "meaning")]
+    (row,) = [u for u in _usage_rows() if u["kind"] == "embed"]
+    assert row["doc_id"] == 1 and row["cost_usd"] == 0

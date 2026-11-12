@@ -8,7 +8,7 @@ import anthropic
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from werkzeug.routing import IntegerConverter
 
-from . import db, extract, jobs, llm, ollama
+from . import db, extract, jobs, llm, ollama, vectors
 
 
 class RowId(IntegerConverter):
@@ -258,8 +258,18 @@ def documents():
 
 @app.get("/api/search")
 def search():
-    return jsonify([{**{k: h[k] for k in ("doc_id", "filename", "title", "idx")}, "snippet": extract.plain(h["snippet"])}
+    """Passages with the words of q, for the library's search box: by keywords only, since
+    it marks the words it found."""
+    return jsonify([{**{k: h[k] for k in ("doc_id", "filename", "title", "idx", "page_start", "page_end")},
+                     "snippet": extract.plain(h["snippet"])}
                     for h in db.search_chunks(request.args.get("q", ""), limit=10)])
+
+
+@app.get("/api/search/status")
+def search_status():
+    """Search by meaning: the embedding model, how many chunks it has embedded of how
+    many, and why it is paused, if it is (keyword search only meanwhile)."""
+    return jsonify(vectors.status())
 
 
 @app.post("/api/upload")
@@ -482,38 +492,75 @@ def delete_instruction(rule_id):
     return ("", 204) if db.delete_instruction(rule_id) else (jsonify(error="Not found"), 404)
 
 
+def _scope(raw):
+    """POST /api/chat's doc_ids: the documents a question is limited to, as {id: file
+    name}, those deleted meanwhile left out. None (or []) means every document."""
+    if raw is None or raw == []:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in raw):
+        raise BadChoice("doc_ids must be a list of document ids")
+    names = db.document_names([i for i in dict.fromkeys(raw) if -2**63 <= i < 2**63])  # others can't exist
+    if not names:
+        raise BadChoice("None of the chosen documents is in the library any more: choose others, or ask all documents")
+    return names
+
+
+def _cited(hits):
+    """The excerpts a question was given, as the model read them, and their sources: one per
+    document, in the order first retrieved, with its pages (none for documents read before
+    pages were kept, and files without pages) and its excerpts (indexes into excerpts)."""
+    excerpts, sources = [], {}
+    for i, h in enumerate(hits):
+        pages = list(range(h["page_start"], h["page_end"] + 1)) if h["page_start"] else []
+        doc = {k: h[k] for k in ("doc_id", "filename", "title", "has_file", "pdf")}
+        excerpts.append({**doc, "idx": h["idx"], "page_start": h["page_start"], "page_end": h["page_end"],
+                         "match": h.get("match", "keywords"), "text": llm.excerpt_text(h)})
+        source = sources.setdefault(h["doc_id"], {**doc, "pages": [], "excerpts": []})
+        source["pages"] = sorted({*source["pages"], *pages})
+        source["excerpts"].append(i)
+    return excerpts, list(sources.values())
+
+
 @app.post("/api/chat")
 def chat():
+    """Answer a question from the passages that best match it, by keywords and by meaning
+    (vectors.search), in all documents or only those in doc_ids."""
     body = _body()
     question = body.get("question")
     question = question.strip() if isinstance(question, str) else ""
     if not question:
         return jsonify(error="Empty question"), 400
     choice = _choice(body.get("model"))
+    scope = _scope(body.get("doc_ids"))
     history = body.get("history") or []
-    hits = db.search_chunks(question, limit=int(os.environ.get("TOP_K", "5")))
-    user_message = llm.build_user_message(question, hits)
-
+    if not isinstance(history, list) or not all(isinstance(t, dict) for t in history):
+        raise BadChoice("history must be a list of turns, as earlier answers returned them")
     system = llm.system_prompt(db.active_instructions())
     calls = []
 
     def on_usage(*call):
         calls.append(jobs.priced(*call))
 
-    def answer(backend, model):
-        if backend == "ollama":
-            return ollama.chat(None, history, user_message, model, system=system, on_usage=on_usage)
-        return llm.chat(_client(), history, user_message, model, system=system, on_usage=on_usage)
-
-    fits = ollama.fits([{"content": system}, *history, {"content": user_message}])
     try:
+        hits = vectors.search(question, int(os.environ.get("TOP_K", "5")), scope and list(scope), on_usage=on_usage)
+        user_message = llm.build_user_message(question, hits, scope and list(scope.values()))
+
+        def answer(backend, model):
+            if backend == "ollama":
+                return ollama.chat(None, history, user_message, model, system=system, on_usage=on_usage)
+            return llm.chat(_client(), history, user_message, model, system=system, on_usage=on_usage)
+
+        fits = ollama.fits([{"content": system}, *history, {"content": user_message}])
         (text, usage), used, note = _run(choice, answer, fits_local=fits)
     finally:
-        jobs.log_usage(calls)  # a refused Claude answer is billed too
+        jobs.log_usage(calls)  # the question's embedding, and a refused Claude answer (billed too)
+    excerpts, sources = _cited(hits)
     return jsonify(
         answer=text,
         usage=usage,
-        sources=sorted({h["filename"] for h in hits}),
+        sources=sources,
+        excerpts=excerpts,
+        scope=scope and list(scope),
         **jobs.used(used, note),
         # The client stores these and sends them back as `history` next turn.
         turns=[{"role": "user", "content": user_message}, {"role": "assistant", "content": text}],

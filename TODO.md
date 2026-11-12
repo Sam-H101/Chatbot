@@ -114,6 +114,28 @@ Everything below is uncommitted in the working tree.
   unit badge is 25 px tall on phones. 126 tests pass. Staging on a copy of the live library: the same 4 misprints,
   a 66K-character half-table text in 4 sections (real prompts 8.5-9.7K tokens; 2 sections of about 17K each before),
   page 1 on a one-page PDF, 515 findings capped at 500; 24/24 browser checks (light, dark, 390px).
+- 2026-11-12: Plan items 2, 1 and 11. Citations: chunks record the pages they span (`chunks.page_start`/`page_end`,
+  from the kept `\f` breaks, `extract.page_ranges`); excerpts reach the model labelled with file and page(s), with a
+  `[Page n]` line where a new page starts inside one, and a note asking for (file, p. n) citations that is added only
+  when an excerpt has a page (in the system prompt, qwen3.5 gave page-less excerpts made-up pages in 7 of 15 answers;
+  this way 0 of 15). `/api/chat` returns `sources` as one object per document (`doc_id`, `filename`, `pages`,
+  `excerpts` indexes) and the `excerpts` as the model read them; chips show "file, p. 4" and open the passages with
+  **Open page 4** (`/file#page=4`). Search by meaning (`app/vectors.py`): `qwen3-embedding:0.6b` (`OLLAMA_EMBED_MODEL`)
+  embeds each chunk in the upload job ("Indexing" stage) into the new `chunk_vectors` table (float32 + model name); a
+  question is embedded with an instruction, compared by cosine (numpy, vectors held in memory and reloaded after
+  uploads, re-reads and deletes) and blended with FTS5 by reciprocal rank fusion. Meaning matches under
+  `SEARCH_MIN_SIMILARITY` (0.35) are dropped, so "hi" gets no passages, and stopwords are left out of keyword search
+  (they made every chunk a keyword match). The worker embeds chunks without vectors when idle (the live library's 588
+  at the first start); if Ollama or the model is unavailable, uploads and questions go on by keywords and embedding
+  pauses for 2 minutes. Embedding calls are in the usage log at $0; `numpy` added. Scope: `doc_ids` on `/api/chat` limits
+  both searches and tells the model; the **Ask** chip under the question box opens a list to filter and tick, there is
+  **Ask** on cards and table rows and **Ask about N** in the table, and the choice is kept in localStorage. Also: `/api/chat` gives a
+  400, not a 500, for a `history` that isn't a list of turns. 143 tests pass. Staging (qwen3.5, minicpm, qwen3-embedding;
+  two Haiku answers, $0.0007): on KIOTI-like chapters, keyword search never finds the "Transmission fluid ... 38.0
+  litres" passage for "What is the hydraulic oil capacity?", hybrid search does, and qwen3.5 and Haiku cite p. 4;
+  a library made by 894b984 was migrated and its 8 chunks embedded at start, cited by file name only, scoped and
+  searched by meaning; a missing embedding model left uploads and chat working and the backfill caught up after; 29/29
+  browser checks (light, dark, 390, 360 and 320 px).
 
 ## To do
 
@@ -141,10 +163,10 @@ Ordered by priority. Suggested start: 1 and 2, then 5. Item 12 is small and wort
 
 ### Phase 1: Answer quality
 
-- [ ] 1. Search by meaning, not just keywords. FTS5 only matches exact words ("hydraulic oil" missed
+- [x] 1. Search by meaning, not just keywords. FTS5 only matches exact words ("hydraulic oil" missed
       the "transmission fluid" passage). Add an embedding model in Ollama on the GPU and blend its
       results with the keyword search.
-- [ ] 2. Page-numbered citations. Chunks don't record their page, so answers cite only a filename.
+- [x] 2. Page-numbered citations. Chunks don't record their page, so answers cite only a filename.
       Store the page range per chunk, show "manual.pdf, p. 142", click to see the excerpt.
 - [x] 3. Full analysis of long documents. Text over the character limit gets a "partial" analysis.
       Summarise section by section, then combine, so local models cover the whole document.
@@ -166,7 +188,7 @@ Ordered by priority. Suggested start: 1 and 2, then 5. Item 12 is small and wort
 
 - [ ] 9. Streaming answers, instead of the whole reply appearing after a wait.
 - [ ] 10. Saved conversations. History lives only in the browser tab; store it on the server.
-- [ ] 11. Scope a question to chosen documents ("ask only this manual").
+- [x] 11. Scope a question to chosen documents ("ask only this manual").
 
 ### Phase 4: Safety and operations
 
