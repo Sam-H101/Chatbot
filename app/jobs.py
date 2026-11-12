@@ -49,6 +49,9 @@ _keys = {}  # job id -> the browser's Claude key: in memory only, never stored
 _wake, _stop = threading.Event(), threading.Event()
 _thread = None
 _start_lock = threading.Lock()
+# When this process started (UTC, as SQLite's datetime('now')): answers begun before it and
+# never finished were cut off by a restart (recover).
+STARTED = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 
 class NoText(ValueError):
@@ -188,9 +191,15 @@ def start():
 
 
 def recover():
+    """After a restart: jobs left running go back in the queue, and answers left being written
+    fail, saying so (their questions stay; a page showing one stops waiting for it). Answers
+    this process began are left alone, should this run again later."""
     n = db.requeue_running()
     if n:
         log.warning("Re-queued %d job(s) interrupted by a restart", n)
+    cut = db.end_interrupted_answers(STARTED)
+    if cut:
+        log.warning("%d answer(s) were cut off by a restart", cut)
     return n
 
 

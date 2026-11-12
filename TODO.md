@@ -174,6 +174,22 @@ Everything below is uncommitted in the working tree.
   over 0.8 s through gunicorn, Ollama's log shows a stopped answer's generation cancelled), Auto's switch with a local
   model that isn't pulled, a copy of the live library migrated and answered in a saved conversation (7/7), and 49/49
   browser checks plus 30/30 header checks (light, dark, 320-1400 px).
+- 2026-11-12: Review fixes for items 9 and 10. Conversation ids are never given out again (`AUTOINCREMENT`; a table
+  made by the first version is copied into one on connect), so a tab or phone holding a deleted one gets 404 instead
+  of writing into someone's new chat. A question is kept as it is asked, its answer `answering` until it ends, and the
+  stream's first event, `start`, names the conversation and the answer: a page reloaded mid-answer shows the question
+  and reads the conversation again until the answer is in (another tab too), a restart marks answers it cut off
+  failed, and a refusal or failure keeps the question with the reason (empty answers stay out of history) instead of
+  dropping a conversation the page already follows. **Stop**, and leaving or reloading the page, tell the server how
+  much the page showed (`POST /api/chat/stop`): exactly that is kept, so "Stopped before the answer began" keeps no
+  words. `done` carries the title as it is now (renamed while answering). The conversation's documents are saved when
+  the question is asked (a delete meanwhile sticks) and follow a **Replace** to the new copy. Auto keeps a long
+  conversation on the local model with the latest exchanges that fit, and says how many questions it left out, instead
+  of sending every question from about the 7th to Claude. Questions are limited to 20,000 characters (the page says so
+  and keeps the text). **New chat** starts on all documents. Unexpected errors no longer send their text (paths) to
+  the page. 184 tests pass. Staging (qwen3.5, nothing spent on Claude): 19/19 API checks, a server killed mid-answer
+  (3/3), a 7-question conversation at `OLLAMA_NUM_CTX=4096` kept local (5/5), and 18/18 browser checks (reload and Stop
+  mid-answer, another tab, rename, a deleted id, light, dark, 390 px).
 
 ## To do
 

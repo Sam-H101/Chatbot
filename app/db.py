@@ -29,6 +29,19 @@ _schema_ready = set()
 _index_version = 0
 _version_lock = threading.Lock()
 
+# AUTOINCREMENT: a deleted conversation's id is never given out again, so a tab or device
+# that still has it open gets 404 rather than writing into someone's new chat. The table
+# as first released lacked it and is copied into this one on connect (_keep_conversation_ids).
+CONVERSATIONS = """CREATE TABLE IF NOT EXISTS {table} (  -- saved chats: questions and their answers (messages)
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT NOT NULL DEFAULT '',    -- its first question, cut short, until renamed
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),  -- its last question
+    model      TEXT NOT NULL DEFAULT '',    -- the model choice of its last question: 'auto', 'ollama:<m>', 'claude:<m>'
+    doc_ids    TEXT                         -- JSON: the documents its last question was limited to (deleted
+                                            -- ones taken out, so [] when all were); NULL: every document
+);"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     id          INTEGER PRIMARY KEY,
@@ -109,29 +122,23 @@ CREATE TABLE IF NOT EXISTS instructions (
     enabled    INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS conversations (  -- saved chats: questions and their answers (messages)
-    id         INTEGER PRIMARY KEY,
-    title      TEXT NOT NULL DEFAULT '',    -- its first question, cut short, until renamed
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),  -- its last question
-    model      TEXT NOT NULL DEFAULT '',    -- the model choice of its last question: 'auto', 'ollama:<m>', 'claude:<m>'
-    doc_ids    TEXT                         -- JSON: the documents its last question was limited to (deleted
-                                            -- ones taken out, so [] when all were); NULL: every document
-);
+{conversations}
 CREATE TABLE IF NOT EXISTS messages (
     id              INTEGER PRIMARY KEY,
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    role            TEXT NOT NULL,          -- 'user' or 'assistant'; a question and its answer are saved together
+    role            TEXT NOT NULL,          -- 'user' or 'assistant'; a question and its answer are added together
+                                            -- when it is asked, the answer filled in when it ends
     content         TEXT NOT NULL,          -- what the page shows: the question, or the answer
     sent            TEXT,                   -- a question as the model got it, excerpts and all: what later questions
                                             -- send as history (answers are sent as shown)
-    sources         TEXT,                   -- JSON, answers: sources, excerpts, overview, scope, scope_names
+    sources         TEXT,                   -- JSON, answers: sources, excerpts, overview, scope, scope_names, left_out
     model           TEXT,                   -- answers: the model that wrote it, 'ollama:<m>' or 'claude:<m>'
     model_label     TEXT,
     switched        TEXT,                   -- why Auto switched to Claude, if it did
     usage           TEXT,                   -- JSON: its tokens (input, output, cache_read, cache_write)
-    status          TEXT NOT NULL DEFAULT 'done',  -- answers: 'done', 'stopped' (by the user) or 'broken'
-                                                   -- (the model failed part way, error says why)
+    status          TEXT NOT NULL DEFAULT 'done',  -- answers: 'answering' (being written), 'done', 'stopped' (by
+                                                   -- the user), 'broken' (the model failed part way) or 'failed'
+                                                   -- (no words at all); error says why for the last two
     error           TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -142,7 +149,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     text, tokenize='porter unicode61'
 );
-"""
+""".replace("{conversations}", CONVERSATIONS.format(table="conversations"))
 
 
 # Columns added after the first release. Older databases gain them on connect; their
@@ -189,6 +196,36 @@ def _migrate(con):
                         raise
     con.execute("CREATE INDEX IF NOT EXISTS documents_sha256 ON documents(sha256)")
     con.execute("CREATE INDEX IF NOT EXISTS usage_job ON usage(job_id)")
+    _keep_conversation_ids(con)
+
+
+def _autoincrement(con):
+    sql = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations'").fetchone()[0]
+    return "AUTOINCREMENT" in sql.upper()
+
+
+def _keep_conversation_ids(con):
+    """A conversations table as first released (no AUTOINCREMENT, so SQLite gave a deleted
+    conversation's id to the next one) is copied into one that never does. Foreign keys are
+    off meanwhile: dropping the old table must not take the messages with it."""
+    if _autoincrement(con):
+        return
+    con.commit()
+    con.execute("PRAGMA foreign_keys = OFF")
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        if not _autoincrement(con):  # another process may have done it while this one waited
+            con.execute(CONVERSATIONS.format(table="conversations_new"))
+            con.execute("INSERT INTO conversations_new (id, title, created_at, updated_at, model, doc_ids)"
+                        " SELECT id, title, created_at, updated_at, model, doc_ids FROM conversations")
+            con.execute("DROP TABLE conversations")
+            con.execute("ALTER TABLE conversations_new RENAME TO conversations")
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        con.execute("PRAGMA foreign_keys = ON")
 
 
 def _doc_columns(t):
@@ -342,8 +379,10 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
         wrote = False
         try:
             with connect() as con:
+                following = []
                 if replace and sha:
                     old = [r[0] for r in con.execute("SELECT id FROM documents WHERE sha256=?", (sha,))]
+                    following = _scoped_to(con, old)  # before _delete_rows takes them out
                     _delete_rows(con, old)  # the file stays: the new row points at it
                     if job:
                         job[1]["replaced"] = old
@@ -357,6 +396,9 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
                 con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords)"
                             " VALUES (?,?,?,?,?,?)", (doc_id, filename, *_meta(meta)))
                 _insert_chunks(con, doc_id, chunks, pages, vectors)
+                for conv_id, ids in following:  # conversations limited to a replaced copy ask the new one
+                    con.execute("UPDATE conversations SET doc_ids=? WHERE id=?",
+                                (_ids(dict.fromkeys(doc_id if i in old else i for i in ids)), conv_id))
                 if job:
                     _finish_job(con, job, doc_id)
                 if data is not None:  # last, so a failed insert leaves no file behind
@@ -471,6 +513,13 @@ def _delete_rows(con, ids):
                     f" (SELECT 1 FROM json_each(doc_ids) WHERE value IN ({marks}))", [*part, *part])
         deleted += con.execute(f"DELETE FROM documents WHERE id IN ({marks})", part).rowcount
     return deleted, files
+
+
+def _scoped_to(con, ids):
+    """[(id, doc_ids)] of the conversations limited to any of these documents."""
+    return [(r[0], json.loads(r[1])) for r in con.execute(
+        "SELECT id, doc_ids FROM conversations WHERE doc_ids IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(doc_ids)"
+        " WHERE value IN (SELECT value FROM json_each(?)))", (json.dumps(list(ids)),))]
 
 
 def _unused(con, file_path):
@@ -800,54 +849,77 @@ def _ids(doc_ids):
     return None if doc_ids is None else json.dumps(list(doc_ids))
 
 
-def add_conversation(title, model="", doc_ids=None):
-    """A new, empty conversation (a streamed answer makes one before its first words, so
-    the page can follow it even if the answer is stopped). Returns its id."""
+def begin_exchange(conv_id, question, model="", doc_ids=None, title=""):
+    """Keep a question as it is asked, with an empty answer ('answering') that finish_exchange
+    fills in: a reloaded page, another tab, or a restart still finds the question. A new
+    conversation titled `title` when conv_id is None. The conversation takes the question's
+    model choice and documents (doc_ids, None for all; those deleted meanwhile left out, so a
+    delete while it is answered isn't undone). Returns {conversation_id, title, question_id,
+    answer_id}, or None if the conversation was deleted meanwhile (nothing is kept then)."""
     with connect() as con:
-        return con.execute("INSERT INTO conversations (title, model, doc_ids) VALUES (?,?,?)",
-                           (title, model, _ids(doc_ids))).lastrowid
-
-
-def conversation_exists(conv_id):
-    with connect() as con:
-        return con.execute("SELECT 1 FROM conversations WHERE id=?", (conv_id,)).fetchone() is not None
-
-
-def add_exchange(conv_id, question, sent, answer, model="", doc_ids=None, title=""):
-    """Keep a question and its answer, one after the other, in a conversation: a new one
-    titled `title` when conv_id is None. `sent`: the question as the model got it. `answer`:
-    {content, sources, model, model_label, switched, usage, status, error}. The conversation
-    takes the question's model choice and documents (doc_ids, None for all). Returns the
-    conversation's id, or None if it was deleted meanwhile (nothing is kept then)."""
-    with connect() as con:
+        if doc_ids is not None:
+            doc_ids = [r[0] for r in con.execute(
+                "SELECT value FROM json_each(?) WHERE value IN (SELECT id FROM documents)", (_ids(doc_ids),))]
         if conv_id is None:
             conv_id = con.execute("INSERT INTO conversations (title, model, doc_ids) VALUES (?,?,?)",
                                   (title, model, _ids(doc_ids))).lastrowid
         elif not con.execute("UPDATE conversations SET updated_at=datetime('now'), model=?, doc_ids=? WHERE id=?",
                              (model, _ids(doc_ids), conv_id)).rowcount:
             return None
-        con.execute("INSERT INTO messages (conversation_id, role, content, sent) VALUES (?, 'user', ?, ?)",
-                    (conv_id, question, sent))
-        con.execute("INSERT INTO messages (conversation_id, role, content, sources, model, model_label, switched,"
-                    " usage, status, error) VALUES (?, 'assistant', ?,?,?,?,?,?,?,?)",
-                    (conv_id, answer["content"], json.dumps(answer.get("sources"), ensure_ascii=False),
-                     answer.get("model"), answer.get("model_label"), answer.get("switched"),
-                     json.dumps(answer.get("usage")), answer.get("status", "done"), answer.get("error")))
-    return conv_id
+        title = con.execute("SELECT title FROM conversations WHERE id=?", (conv_id,)).fetchone()[0]
+        question_id = con.execute("INSERT INTO messages (conversation_id, role, content) VALUES (?, 'user', ?)",
+                                  (conv_id, question)).lastrowid
+        answer_id = con.execute("INSERT INTO messages (conversation_id, role, content, status)"
+                                " VALUES (?, 'assistant', '', 'answering')", (conv_id,)).lastrowid
+    return {"conversation_id": conv_id, "title": title, "question_id": question_id, "answer_id": answer_id}
 
 
-def drop_empty_conversation(conv_id):
-    """Delete a conversation that has no message (its first answer failed)."""
+def finish_exchange(exchange, sent, answer):
+    """Fill in the answer of a question begin_exchange kept. `sent`: the question as the model
+    got it. `answer`: {content, sources, model, model_label, switched, usage, status, error}.
+    Returns the conversation's title as it is now (it may have been renamed meanwhile), or
+    None if it was deleted meanwhile. Rows are found by their conversation too: SQLite gives a
+    deleted message's id to the next one, never a deleted conversation's."""
+    conv_id = exchange["conversation_id"]
     with connect() as con:
-        con.execute("DELETE FROM conversations WHERE id=? AND NOT EXISTS"
-                    " (SELECT 1 FROM messages WHERE conversation_id=?)", (conv_id, conv_id))
+        con.execute("UPDATE messages SET sent=? WHERE id=? AND conversation_id=?",
+                    (sent, exchange["question_id"], conv_id))
+        if not con.execute(
+                "UPDATE messages SET content=?, sources=?, model=?, model_label=?, switched=?, usage=?, status=?, error=?"
+                " WHERE id=? AND conversation_id=?",
+                (answer["content"], json.dumps(answer.get("sources"), ensure_ascii=False), answer.get("model"),
+                 answer.get("model_label"), answer.get("switched"), json.dumps(answer.get("usage")),
+                 answer.get("status", "done"), answer.get("error"), exchange["answer_id"], conv_id)).rowcount:
+            return None
+        return con.execute("SELECT title FROM conversations WHERE id=?", (conv_id,)).fetchone()[0]
+
+
+def cut_answer(conv_id, answer_id, shown):
+    """An answer the page stopped after showing `shown` characters of it, kept already: cut
+    there and marked stopped. One still being written ('answering') is left to whoever writes
+    it. False if there is no such answer."""
+    with connect() as con:
+        row = con.execute("SELECT status FROM messages WHERE id=? AND conversation_id=? AND role='assistant'",
+                          (answer_id, conv_id)).fetchone()
+        if row and row[0] != "answering":
+            con.execute("UPDATE messages SET content=substr(content, 1, ?), status='stopped', error=NULL WHERE id=?",
+                        (shown, answer_id))
+    return row is not None
+
+
+def end_interrupted_answers(before):
+    """Answers begun before `before` (this process's start, as UTC 'YYYY-MM-DD HH:MM:SS') and
+    never finished: a restart cut them off. They fail, saying so, and pages stop waiting."""
+    with connect() as con:
+        return con.execute("UPDATE messages SET status='failed', error='The server restarted before this was answered'"
+                           " WHERE status='answering' AND created_at < ?", (before,)).rowcount
 
 
 def history(conv_id):
     """A conversation's questions and answers as the model is sent them, oldest first:
     [{role, content}], each question as it was sent (excerpts and all, byte for byte, so
-    Claude's prompt cache still hits). An empty answer is left out with its question:
-    Claude refuses an empty turn."""
+    Claude's prompt cache still hits). An empty answer (still being written, stopped before
+    its first words, failed) is left out with its question: Claude refuses an empty turn."""
     with connect() as con:
         rows = con.execute("SELECT role, content, sent FROM messages WHERE conversation_id=? ORDER BY id",
                            (conv_id,)).fetchall()
@@ -914,7 +986,7 @@ def _message(row):
         return {k: m[k] for k in ("id", "role", "content", "created_at")}
     m["usage"] = json.loads(m["usage"]) if m["usage"] else None
     found = json.loads(m.pop("sources") or "null") or {}
-    return {**m, **{k: found.get(k) for k in ("sources", "excerpts", "overview", "scope", "scope_names")}}
+    return {**m, **{k: found.get(k) for k in ("sources", "excerpts", "overview", "scope", "scope_names", "left_out")}}
 
 
 def rename_conversation(conv_id, title):

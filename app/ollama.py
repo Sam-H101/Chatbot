@@ -163,6 +163,26 @@ def fits(messages, reply_tokens=2000):
     return sum(tokens(m.get("content") or "") for m in messages) * MARGIN + reply_tokens <= NUM_CTX
 
 
+def recent(history, *fixed, reply_tokens=2000):
+    """What a local model is sent of a long conversation: the latest turns of `history` that
+    fit the context window beside the `fixed` messages (system prompt, question) with room
+    for the reply, as fits() counts, starting at a question. Left to itself, Ollama would cut
+    the oldest text wherever it falls. None when the fixed messages alone don't fit."""
+    room = (NUM_CTX - reply_tokens) / MARGIN
+    used = sum(tokens(m.get("content") or "") for m in fixed)
+    if used > room:
+        return None
+    start = len(history)
+    for i in range(len(history) - 1, -1, -1):
+        used += tokens(history[i].get("content") or "")
+        if used > room:
+            break
+        start = i
+    while start < len(history) and history[start].get("role") != "user":
+        start += 1
+    return history[start:]
+
+
 def _usage(r):
     """Token counts from an /api/chat reply. Ollama leaves prompt_eval_count out when
     the whole prompt came from its cache."""

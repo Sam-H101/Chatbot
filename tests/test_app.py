@@ -739,9 +739,12 @@ def test_auto_sends_long_prompts_to_claude(local, monkeypatch):
     from app import llm, ollama
     monkeypatch.setattr(ollama, "NUM_CTX", 4096)
     long_history = [{"role": "user", "content": "x" * 20000}, {"role": "assistant", "content": "ok"}]
-    r = local.post("/api/chat", headers=H, json={"question": "hi", "history": long_history, "model": "auto"})
+    r = local.post("/api/chat", headers=H, json={"question": "rent " * 3000, "history": long_history, "model": "auto"})
     assert r.json["model"] == f"claude:{llm.MODEL}" and r.json["switched"] == "too long for the local model"
     assert local.calls == []
+    r = local.post("/api/chat", headers=H, json={"question": "hi", "history": long_history, "model": "auto"})
+    assert r.json["model"] == f"ollama:{ollama.MODEL}" and r.json["left_out"] == 1        # a long history alone stays local
+    assert local.calls[-1]["messages"][1:] == [{"role": "user", "content": local.calls[-1]["messages"][-1]["content"]}]
 
 
 def test_mass_delete(client):
@@ -1140,11 +1143,24 @@ ALTER TABLE chunks ADD COLUMN page_end INTEGER;
 CREATE TABLE chunk_vectors (chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
     model TEXT NOT NULL, vector BLOB NOT NULL);
 """
+# The schema of commit 42a0a88 (saved conversations), whose conversations had no AUTOINCREMENT.
+SCHEMA_42A0A88_EXTRA = """
+CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    model TEXT NOT NULL DEFAULT '', doc_ids TEXT);
+CREATE TABLE messages (id INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role TEXT NOT NULL, content TEXT NOT NULL, sent TEXT, sources TEXT, model TEXT, model_label TEXT,
+    switched TEXT, usage TEXT, status TEXT NOT NULL DEFAULT 'done', error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE INDEX messages_conversation ON messages(conversation_id, id);
+"""
 OLD_SCHEMAS = {"894b984": SCHEMA_894B984, "cd8c125": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA,
                "dc8b86a": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA + SCHEMA_DC8B86A_EXTRA,
                "712f372": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA + SCHEMA_DC8B86A_EXTRA + SCHEMA_712F372_EXTRA,
                "ae11627": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA + SCHEMA_DC8B86A_EXTRA + SCHEMA_712F372_EXTRA
                + SCHEMA_AE11627_EXTRA}
+OLD_SCHEMAS["42a0a88"] = OLD_SCHEMAS["ae11627"] + SCHEMA_42A0A88_EXTRA
 
 
 @pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())
@@ -2572,9 +2588,13 @@ def test_chunks_from_before_pages_and_vectors_still_work(client, tmp_path, monke
 
 def sse(r):
     """A streamed answer's events: [(name, data)]; comment lines left out."""
+    return _events(r.get_data(as_text=True))
+
+
+def _events(text):
     import json
     events = []
-    for block in r.get_data(as_text=True).split("\n\n"):
+    for block in text.split("\n\n"):
         lines = [line for line in block.split("\n") if line and not line.startswith(":")]
         if lines:
             fields = dict(line.split(": ", 1) for line in lines)
@@ -2582,8 +2602,28 @@ def sse(r):
     return events
 
 
+def stream(client, body, until):
+    """A streamed answer read as the page reads it, an event at a time, up to the first one
+    called `until`: (the response, its iterator to read on with, the events so far)."""
+    r = client.post("/api/chat/stream", json=body, headers=H, buffered=False)
+    chunks, events = iter(r.response), []
+    while not events or events[-1][0] != until:
+        events += _events(next(chunks).decode())
+    return r, chunks, events
+
+
+def rest(chunks):
+    """The events still to come."""
+    return _events(b"".join(chunks).decode())
+
+
 def _messages(client, conv_id):
     return client.get(f"/api/conversations/{conv_id}").json["messages"]
+
+
+def event(events, name):
+    """The data of a streamed answer's first event called `name`."""
+    return next(d for n, d in events if n == name)
 
 
 def test_answers_stream_as_they_are_written(client):
@@ -2593,13 +2633,16 @@ def test_answers_stream_as_they_are_written(client):
     assert r.headers["Cache-Control"] == "no-cache" and r.headers["X-Accel-Buffering"] == "no"  # nothing may buffer it
     assert r.get_data(as_text=True).startswith(": answering\n\n")                       # the headers leave at once
     events = sse(r)
-    assert [name for name, _ in events] == ["meta", "delta", "delta", "done"]
-    meta, done = events[0][1], events[-1][1]
+    assert [name for name, _ in events] == ["start", "meta", "delta", "delta", "done"]
+    start, meta, done = events[0][1], events[1][1], events[-1][1]
+    assert start == {"conversation_id": meta["conversation_id"], "title": "How much is the rent?",
+                     "answer_id": _messages(client, meta["conversation_id"])[1]["id"]}
     assert (meta["model"], meta["model_label"], meta["switched"]) == ("claude:claude-opus-5-5", "Claude Opus 5.5", None)
     assert meta["sources"][0]["doc_id"] == doc_id and meta["excerpts"][0]["text"] == LEASE.decode()
-    assert meta["title"] == "How much is the rent?" and meta["scope"] is None
+    assert meta["title"] == "How much is the rent?" and meta["scope"] is None and meta["left_out"] == 0
     assert [d for name, d in events if name == "delta"] == ["4", "2"]
     assert done["answer"] == "42" and done["usage"]["output"] == 1 and done["conversation_id"] == meta["conversation_id"]
+    assert done["status"] == "done"
     assert done["turns"] == [{"role": "user", "content": client.seen["msg"]}, {"role": "assistant", "content": "42"}]
     assert '<excerpt file="lease.txt">' in client.seen["msg"]                            # the same prompt as /api/chat
     (row,) = [u for u in _usage_rows() if u["kind"] == "chat"]                           # in the usage log
@@ -2659,9 +2702,9 @@ def test_local_answers_stream_from_ollama(local, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     upload(local)
     events = sse(local.post("/api/chat/stream", json={"question": "How much is the rent?"}))
-    assert [name for name, _ in events] == ["meta", "delta", "delta", "done"]
+    assert [name for name, _ in events] == ["start", "meta", "delta", "delta", "done"]
     assert "".join(d for name, d in events if name == "delta") == "1800" and events[-1][1]["usage"]["input"] == 7
-    assert events[0][1]["model"] == f"ollama:{ollama.MODEL}"
+    assert event(events, "meta")["model"] == f"ollama:{ollama.MODEL}"
     sent = local.calls[-1]
     assert sent["stream"] is True and sent["think"] is False and sent["messages"][0]["role"] == "system"
     assert "900 euros" in sent["messages"][-1]["content"]
@@ -2678,22 +2721,55 @@ def test_auto_streams_from_claude_when_ollama_fails_before_its_first_words(local
 
     monkeypatch.setattr(ollama, "_stream", down)
     events = sse(local.post("/api/chat/stream", json={"question": "hi", "model": "auto"}, headers=H))
-    assert [name for name, _ in events] == ["meta", "delta", "delta", "done"]
-    assert events[0][1]["model"] == f"claude:{llm.MODEL}" and "local model failed" in events[0][1]["switched"]
+    assert [name for name, _ in events] == ["start", "meta", "delta", "delta", "done"]
+    meta = event(events, "meta")
+    assert meta["model"] == f"claude:{llm.MODEL}" and "local model failed" in meta["switched"]
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)                                # no key: the local error stands
     events = sse(local.post("/api/chat/stream", json={"question": "hi again", "model": "auto"}))
-    assert events == [("error", {"error": f"Could not reach Ollama at {ollama.URL}. Is it running?", "status": 502,
-                                 "kept": False})]
-    assert [c["title"] for c in local.get("/api/conversations").json] == ["hi"]          # none made for the failed one
+    conv_id = event(events, "start")["conversation_id"]
+    assert events[1:] == [("error", {"error": f"Could not reach Ollama at {ollama.URL}. Is it running?", "status": 502,
+                                     "kept": False, "conversation_id": conv_id, "title": "hi again"})]
+    question, answer = _messages(local, conv_id)                                          # kept, with the reason
+    assert (question["content"], answer["content"], answer["status"]) == ("hi again", "", "failed")
+    assert "Could not reach Ollama" in answer["error"]
 
 
 def test_auto_streams_long_prompts_from_claude(local, monkeypatch):
     from app import llm, ollama
     monkeypatch.setattr(ollama, "NUM_CTX", 4096)
     long_history = [{"role": "user", "content": "x" * 20000}, {"role": "assistant", "content": "ok"}]
-    events = sse(local.post("/api/chat/stream", headers=H, json={"question": "hi", "history": long_history}))
-    assert events[0][1]["model"] == f"claude:{llm.MODEL}" and events[0][1]["switched"] == "too long for the local model"
-    assert local.calls == [] and local.seen["history"] == long_history                   # an API client's own history
+    events = sse(local.post("/api/chat/stream", headers=H, json={"question": "rent " * 3000, "history": long_history}))
+    meta = event(events, "meta")
+    assert meta["model"] == f"claude:{llm.MODEL}" and meta["switched"] == "too long for the local model"
+    assert local.calls == [] and local.seen["history"] == long_history                   # an API client's own, all of it
+
+
+def test_a_long_conversation_stays_on_the_local_model(local, monkeypatch):
+    """Saved history grows with every question (each with its excerpts). Auto doesn't send a
+    conversation to Claude once it outgrows the local context: the local model is given the
+    latest exchanges that fit, and the answer says how many questions it wasn't given.
+    Claude, picked or switched to, is given them all."""
+    from app import llm, ollama
+    upload(local)
+    monkeypatch.setattr(ollama, "NUM_CTX", 4096)
+    conv_id = None
+    for i in range(4):
+        q = f"Question {i}: " + "rent " * 500                                             # ~500 tokens a turn
+        r = local.post("/api/chat", json={"question": q, **({"conversation_id": conv_id} if conv_id else {})},
+                       headers=H).json
+        conv_id = r["conversation_id"]
+        assert r["model"] == f"ollama:{ollama.MODEL}" and r["switched"] is None           # never to Claude
+    sent = local.calls[-1]["messages"]
+    assert sent[0]["role"] == "system" and sent[1]["role"] == "user" and sent[-1]["content"].endswith(q.strip())
+    asked = [m["content"] for m in sent[1:-1] if m["role"] == "user"]
+    assert 0 < len(asked) < 3 and r["left_out"] == 3 - len(asked)                        # the latest that fit
+    assert asked[-1].endswith(f"Question 2: " + "rent " * 499 + "rent")                 # as they were sent
+    assert ollama.fits(sent)
+    answer = _messages(local, conv_id)[-1]
+    assert answer["left_out"] == r["left_out"]                                            # the note comes back after a reload
+    r = local.post("/api/chat", json={"question": "And pets?", "conversation_id": conv_id,
+                                      "model": f"claude:{llm.MODEL}"}, headers=H).json
+    assert len(local.seen["history"]) == 8 and r["left_out"] == 0                         # Claude gets it all
 
 
 def test_a_local_answer_that_breaks_off_keeps_its_words(local, monkeypatch):
@@ -2709,10 +2785,10 @@ def test_a_local_answer_that_breaks_off_keeps_its_words(local, monkeypatch):
     monkeypatch.setattr(ollama, "_stream", breaks)
     upload(local)
     events = sse(local.post("/api/chat/stream", json={"question": "How much is the rent?"}, headers=H))
-    assert [name for name, _ in events] == ["meta", "delta", "error"]
-    assert events[-1][1] == {"error": f"Ollama error: {ollama.MODEL}: the answer broke off (connection reset)",
-                             "status": 502, "kept": True}
+    assert [name for name, _ in events] == ["start", "meta", "delta", "error"]
     conv_id = events[0][1]["conversation_id"]
+    assert events[-1][1] == {"error": f"Ollama error: {ollama.MODEL}: the answer broke off (connection reset)",
+                             "status": 502, "kept": True, "conversation_id": conv_id, "title": "How much is the rent?"}
     answer = _messages(local, conv_id)[1]
     assert (answer["content"], answer["status"]) == ("The rent ", "broken") and "connection reset" in answer["error"]
     (row,) = [u for u in _usage_rows() if u["kind"] == "chat"]                           # estimated: Ollama counts at the end
@@ -2722,10 +2798,12 @@ def test_a_local_answer_that_breaks_off_keeps_its_words(local, monkeypatch):
     assert events[-1][0] == "done" and local.calls[-1]["messages"][2] == {"role": "assistant", "content": "The rent "}
 
 
-def test_a_refused_streamed_answer_is_dropped(client, monkeypatch):
-    """A refusal after some words (no fallback took over): they are dropped, not saved,
-    and the conversation made for them goes again."""
+def test_a_refused_streamed_answer_drops_its_words_but_keeps_its_question(client, monkeypatch):
+    """A refusal after some words (no fallback took over): the words are dropped, the question
+    is kept with the reason, and the page, already following the new conversation from its
+    start event, asks its next question there."""
     from app import llm
+    fake = llm.chat_stream
 
     def refused(c, history, msg, model=None, system=None, on_usage=None):
         yield "Sure, "
@@ -2733,15 +2811,20 @@ def test_a_refused_streamed_answer_is_dropped(client, monkeypatch):
 
     monkeypatch.setattr(llm, "chat_stream", refused)
     events = sse(client.post("/api/chat/stream", json={"question": "hi"}, headers=H))
-    assert [name for name, _ in events] == ["meta", "delta", "error"]
+    assert [name for name, _ in events] == ["start", "meta", "delta", "error"]
+    conv_id = events[0][1]["conversation_id"]
     assert events[-1][1] == {"error": "Claude declined this request. Try rewording it, or another model.",
-                             "status": 502, "kept": False}
-    assert client.get("/api/conversations").json == []
+                             "status": 502, "kept": False, "conversation_id": conv_id, "title": "hi"}
+    question, answer = _messages(client, conv_id)
+    assert (answer["content"], answer["status"]) == ("", "failed") and "declined" in answer["error"]
+    monkeypatch.setattr(llm, "chat_stream", fake)
+    events = sse(client.post("/api/chat/stream", json={"question": "Rent?", "conversation_id": conv_id}, headers=H))
+    assert events[-1][0] == "done" and client.seen["history"] == []                       # the refusal isn't history
 
 
-def test_a_failure_after_the_model_began_closes_its_stream(client, monkeypatch):
-    """Say the database stays locked when the new conversation is made: the model's stream
-    is closed at once, and what it used is logged, not left to the garbage collector."""
+def test_an_answer_the_database_could_not_keep_is_still_given(client, monkeypatch):
+    """Say the database stays locked when the answer is filled in: the model's stream is
+    closed all the same, what it used is logged, and the page gets its answer."""
     import sqlite3
     from app import db, llm
     closed = []
@@ -2758,10 +2841,32 @@ def test_a_failure_after_the_model_began_closes_its_stream(client, monkeypatch):
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(llm, "chat_stream", model)
-    monkeypatch.setattr(db, "add_conversation", locked)
+    monkeypatch.setattr(db, "finish_exchange", locked)
     events = sse(client.post("/api/chat/stream", json={"question": "Rent?"}, headers=H))
-    assert events == [("error", {"error": "The answer failed: database is locked", "status": 500, "kept": False})]
+    done = events[-1][1]
+    assert events[-1][0] == "done" and done["answer"] == "The rent"
+    assert (done["conversation_id"], done["title"]) == (events[0][1]["conversation_id"], "Rent?")
     assert closed == [True] and [u["input_tokens"] for u in _usage_rows() if u["kind"] == "chat"] == [9]
+    assert _messages(client, done["conversation_id"])[1]["status"] == "answering"         # until a restart (below)
+
+
+def test_unexpected_failures_keep_their_details_in_the_log(client, monkeypatch, caplog):
+    """An error _failure doesn't know (a missing file, say) reaches the page without its
+    text, which may name server paths; the log has it."""
+    from app import vectors
+
+    def broken(*a, **kw):
+        raise FileNotFoundError(2, "No such file or directory", "/data/files/secret-internal-path")
+
+    monkeypatch.setattr(vectors, "search", broken)
+    events = sse(client.post("/api/chat/stream", json={"question": "Rent?"}, headers=H))
+    error = events[-1][1]
+    assert events[-1][0] == "error" and (error["error"], error["status"]) == (
+        "The answer failed (the server log has the details)", 500)
+    assert "secret" not in str(events) and "secret-internal-path" in caplog.text
+    assert "secret" not in str(_messages(client, error["conversation_id"]))
+    r = client.post("/api/chat", json={"question": "Rent?"}, headers=H)
+    assert r.status_code == 500 and b"secret" not in r.data
 
 
 def test_claude_streams_its_answer_and_reports_what_it_used():
@@ -2911,16 +3016,23 @@ def test_conversations_are_kept_on_the_server(client):
     assert client.get(f"/api/conversations/{2**70}").status_code == 404
 
 
-def test_a_failed_answer_is_not_kept(local, monkeypatch):
+def test_a_failed_answer_keeps_its_question_and_the_reason(local, monkeypatch):
     from app import ollama
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    fake = ollama._chat
 
     def down(model, messages, **kw):
         raise ollama.OllamaUnavailable(f"Could not reach Ollama at {ollama.URL}")
 
     monkeypatch.setattr(ollama, "_chat", down)
-    assert local.post("/api/chat", json={"question": "hi"}).status_code == 502
-    assert local.get("/api/conversations").json == []
+    r = local.post("/api/chat", json={"question": "hi"})
+    assert r.status_code == 502 and r.json["title"] == "hi"                               # the error names its conversation
+    question, answer = _messages(local, r.json["conversation_id"])
+    assert (question["content"], answer["content"], answer["status"]) == ("hi", "", "failed")
+    assert answer["error"] == r.json["error"]
+    monkeypatch.setattr(ollama, "_chat", fake)
+    local.post("/api/chat", json={"question": "Rent?", "conversation_id": r.json["conversation_id"]})
+    assert [m["role"] for m in local.calls[-1]["messages"]] == ["system", "user"]       # not history
 
 
 def test_a_conversation_keeps_the_documents_it_was_limited_to(client):
@@ -2950,13 +3062,183 @@ def test_a_conversation_keeps_the_documents_it_was_limited_to(client):
 def test_history_leaves_out_empty_answers(tmp_path, monkeypatch):
     from app import db
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
-    conv =db.add_exchange(None, "q1", "sent q1", {"content": "a1"}, title="t")
-    db.add_exchange(conv, "q2", "sent q2", {"content": "  "})                            # Claude refuses an empty turn
-    db.add_exchange(conv, "q3", None, {"content": "a3", "status": "stopped"})
+    first = db.begin_exchange(None, "q1", title="t")
+    conv = first["conversation_id"]
+    db.finish_exchange(first, "sent q1", {"content": "a1"})
+    db.finish_exchange(db.begin_exchange(conv, "q2"), "sent q2", {"content": "  "})      # Claude refuses an empty turn
+    db.begin_exchange(conv, "q3")                                                        # still being answered
+    db.finish_exchange(db.begin_exchange(conv, "q4"), None, {"content": "a4", "status": "stopped"})
     assert db.history(conv) == [{"role": "user", "content": "sent q1"}, {"role": "assistant", "content": "a1"},
-                                {"role": "user", "content": "q3"}, {"role": "assistant", "content": "a3"}]
-    assert db.add_exchange(9999, "q", "q", {"content": "a"}) is None                      # deleted meanwhile: not kept
+                                {"role": "user", "content": "q4"}, {"role": "assistant", "content": "a4"}]
+    assert db.begin_exchange(9999, "q") is None                                          # deleted meanwhile: not kept
     assert db.get_conversation(9999) is None
+    assert db.finish_exchange({**first, "conversation_id": 9999}, "s", {"content": "a"}) is None
+
+
+def test_conversation_ids_are_never_given_out_again(client):
+    """A tab or device still holding a deleted conversation's id gets 404, not someone else's
+    new chat, even when the deleted one was the newest."""
+    add(client)
+    ask = lambda **kw: client.post("/api/chat", json={"question": "Rent?", **kw}, headers=H).json  # noqa: E731
+    a, b = ask()["conversation_id"], ask()["conversation_id"]
+    assert client.delete(f"/api/conversations/{b}").status_code == 204
+    c = ask()["conversation_id"]
+    assert c not in (a, b)
+    r = client.post("/api/chat", json={"question": "and cats?", "conversation_id": b}, headers=H)
+    assert r.status_code == 404 and r.json["error"] == "This conversation was deleted."
+    assert [m["content"] for m in _messages(client, c)] == ["Rent?", "42"]
+
+
+def test_conversations_tables_from_the_first_release_keep_their_ids_from_now_on(client, tmp_path, monkeypatch):
+    """The conversations table as first released had no AUTOINCREMENT: it is copied into one
+    that has, its conversations and their messages kept."""
+    import sqlite3
+    from app import db
+    path = tmp_path / "p5.db"
+    con = sqlite3.connect(path)
+    con.executescript(OLD_SCHEMAS["42a0a88"] + """
+        INSERT INTO conversations (id, title, model, doc_ids) VALUES (1, 'Oil', 'auto', '[1]'), (2, 'Newest', 'auto', NULL);
+        INSERT INTO messages (conversation_id, role, content, sent) VALUES (1, 'user', 'When?', 'sent When?'),
+            (2, 'user', 'Hi', 'sent Hi');
+        INSERT INTO messages (conversation_id, role, content, model_label, usage) VALUES
+            (1, 'assistant', 'At 400 hours.', 'qwen3.5:9b', '{"input": 5}'), (2, 'assistant', 'Hello', 'x', 'null');
+    """)
+    con.close()
+    monkeypatch.setattr(db, "DB_PATH", str(path))
+    assert [(c["id"], c["title"], c["questions"], c["doc_ids"]) for c in client.get("/api/conversations").json] == [
+        (2, "Newest", 1, None), (1, "Oil", 1, [1])]
+    assert [m["content"] for m in _messages(client, 1)] == ["When?", "At 400 hours."]
+    assert db.history(1) == [{"role": "user", "content": "sent When?"}, {"role": "assistant", "content": "At 400 hours."}]
+    with db.connect() as con:
+        assert "AUTOINCREMENT" in con.execute("SELECT sql FROM sqlite_master WHERE name='conversations'").fetchone()[0]
+        assert con.execute("PRAGMA foreign_keys").fetchone()[0] == 1 and not con.execute("PRAGMA foreign_key_check").fetchall()
+    assert client.delete("/api/conversations/2").status_code == 204
+    with db.connect() as con:                                                              # its messages went with it
+        assert con.execute("SELECT count(*) FROM messages WHERE conversation_id=2").fetchone()[0] == 0
+    r = client.post("/api/chat", json={"question": "When do I change the hydraulic oil?"}, headers=H).json
+    assert r["conversation_id"] == 3                                                       # not 2 again
+    assert client.post("/api/chat", json={"question": "x", "conversation_id": 2}, headers=H).status_code == 404
+
+
+def test_a_question_is_kept_while_it_is_answered(client):
+    """The question is kept as it is asked, its answer marked as being written: a page
+    reloaded meanwhile, or another tab, shows it (and waits). A restart fails such answers
+    begun before it, saying so, and leaves those begun since alone."""
+    from app import db, jobs
+    add(client)
+    r, chunks, events = stream(client, {"question": "How much is the rent?"}, "start")
+    start = events[-1][1]
+    (c,) = client.get("/api/conversations").json
+    assert (c["id"], c["title"], c["questions"]) == (start["conversation_id"], "How much is the rent?", 1)
+    question, answer = _messages(client, c["id"])
+    assert question["content"] == "How much is the rent?"
+    assert (answer["id"], answer["status"], answer["content"]) == (start["answer_id"], "answering", "")
+    assert rest(chunks)[-1][0] == "done" and _messages(client, c["id"])[1]["status"] == "done"
+    old, new = db.begin_exchange(c["id"], "Deposit?"), db.begin_exchange(c["id"], "Pets?")
+    with db.connect() as con:
+        con.execute("UPDATE messages SET created_at = datetime('now', '-1 hour') WHERE id IN (?, ?)",
+                    (old["question_id"], old["answer_id"]))
+    jobs.recover()
+    assert [(m["content"], m["status"], m["error"]) for m in _messages(client, c["id"])[2:] if m["role"] == "assistant"] == [
+        ("", "failed", "The server restarted before this was answered"), ("", "answering", None)]
+
+
+def test_a_stopped_answer_keeps_what_the_page_showed(client, monkeypatch):
+    """The page says how much of an answer it showed when it stopped it (POST /api/chat/stop):
+    that much is kept, whether the answer is still being written or was kept already (the
+    server notices a closed stream only a piece or two later). Stopped before its first
+    words, the question stays with an empty answer, which later questions aren't sent."""
+    from app import llm
+    closed = []
+
+    def slow(c, history, msg, model=None, system=None, on_usage=None):
+        try:
+            for word in ("The ", "rent ", "is ", "900 ", "euros."):
+                yield word
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr(llm, "chat_stream", slow)
+    add(client)
+
+    def stop(s, shown, **kw):
+        return client.post("/api/chat/stop", json={"conversation_id": s["conversation_id"], "answer_id": s["answer_id"],
+                                                   "shown": shown}, **kw)
+
+    # Stopped before the first words: the server learns it when the model begins, and ends there.
+    r, chunks, events = stream(client, {"question": "How much is the rent?"}, "start")
+    s1 = events[-1][1]
+    conv_id = s1["conversation_id"]
+    assert stop(s1, 0).status_code == 204
+    (done,) = rest(chunks)
+    assert done[0] == "done" and (done[1]["answer"], done[1]["status"]) == ("", "stopped") and closed == [True]
+    assert [(m["content"], m.get("status")) for m in _messages(client, conv_id)] == [
+        ("How much is the rent?", None), ("", "stopped")]
+    # Two pieces sent, one shown: it ends before its next piece, with what was shown.
+    r, chunks, events = stream(client, {"question": "Rent?", "conversation_id": conv_id}, "delta")
+    events += _events(next(chunks).decode())
+    s2 = events[0][1]
+    assert stop(s2, len("The ")).status_code == 204
+    assert rest(chunks)[-1][1]["answer"] == "The " and len(closed) == 2
+    # The stream closed first (kept as written), the stop after: it is cut all the same.
+    r, chunks, events = stream(client, {"question": "Rent again?", "conversation_id": conv_id}, "delta")
+    events += _events(next(chunks).decode())
+    r.close()
+    s3 = events[0][1]
+    assert _messages(client, conv_id)[-1]["content"] == "The rent "
+    assert stop(s3, 1).status_code == 204 and _messages(client, conv_id)[-1]["content"] == "T"
+    assert [(m["content"], m.get("status")) for m in _messages(client, conv_id)[2:]] == [
+        ("Rent?", None), ("The ", "stopped"), ("Rent again?", None), ("T", "stopped")]
+    client.post("/api/chat", json={"question": "Go on", "conversation_id": conv_id}, headers=H)
+    assert [t["content"] for t in client.seen["history"] if t["role"] == "assistant"] == ["The ", "T"]
+    # Checked like any other request.
+    assert stop({"conversation_id": conv_id, "answer_id": 9999}, 0).status_code == 404
+    assert stop({"conversation_id": 9999, "answer_id": s3["answer_id"]}, 0).status_code == 404
+    for bad in ({}, {"conversation_id": "1", "answer_id": 1, "shown": 0}, {"conversation_id": 1, "answer_id": 1, "shown": -1}):
+        assert client.post("/api/chat/stop", json=bad).status_code == 400
+    assert stop(s3, 0, headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_renaming_a_conversation_while_it_is_answered_keeps_the_new_title(client):
+    add(client)
+    r, chunks, events = stream(client, {"question": "How much is the rent?"}, "delta")
+    conv_id = events[0][1]["conversation_id"]
+    assert client.patch(f"/api/conversations/{conv_id}", json={"title": "My rent questions"}).status_code == 200
+    assert rest(chunks)[-1][1]["title"] == "My rent questions"
+
+
+def test_a_document_deleted_while_answering_leaves_the_conversations_scope(client):
+    a = add(client, "a.txt", b"The rent is 900 euros.")["doc_id"]
+    b = add(client, "b.txt", b"The rent is 500 euros.")["doc_id"]
+    r, chunks, events = stream(client, {"question": "Rent?", "doc_ids": [a, b]}, "delta")
+    conv = f"/api/conversations/{events[0][1]['conversation_id']}"
+    assert client.delete(f"/api/documents/{b}").status_code == 204
+    assert rest(chunks)[-1][0] == "done" and client.get(conv).json["doc_ids"] == [a]
+    add(client, "c.txt", b"Something else.")                                              # may be given b's id
+    assert client.get(conv).json["doc_ids"] == [a]
+
+
+def test_replacing_a_document_keeps_conversations_on_its_new_copy(client):
+    old = add(client)["doc_id"]
+    other = add(client, "b.txt", b"The deposit is 1800 euros.")["doc_id"]
+    both = client.post("/api/chat", json={"question": "Rent?", "doc_ids": [old, other]}, headers=H).json
+    only = client.post("/api/chat", json={"question": "Rent?", "doc_ids": [old]}, headers=H).json
+    job = add(client, on_duplicate="replace")
+    new = job["doc_id"]
+    assert job["result"]["replaced"] == [old] and client.get("/api/documents").json[0]["id"] == new
+    assert client.get(f"/api/conversations/{only['conversation_id']}").json["doc_ids"] == [new]
+    assert client.get(f"/api/conversations/{both['conversation_id']}").json["doc_ids"] == [new, other]
+
+
+def test_questions_have_a_length_limit(client):
+    """Each question is kept twice and sent again with every later one of its conversation."""
+    from app import main
+    for route in ("/api/chat", "/api/chat/stream"):
+        r = client.post(route, json={"question": "x" * (main.QUESTION_CHARS + 1)}, headers=H)
+        assert r.status_code == 400 and r.json["error"] == "The question is too long (20,000 characters at most)"
+    assert client.get("/api/conversations").json == []
+    assert client.post("/api/chat", json={"question": "x " * (main.QUESTION_CHARS // 2)}, headers=H).status_code == 200
+    assert client.get("/api/models").json["max_question_chars"] == main.QUESTION_CHARS
 
 
 @pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())

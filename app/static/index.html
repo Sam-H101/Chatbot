@@ -1509,6 +1509,8 @@ async function loadChats() {
   }
   if (mine !== chatsLoading) return;
   chats = list;
+  const open = chats.find(c => c.id === chat?.id);
+  if (open && open.title !== chat.title && !renaming) setChat(open);  // renamed in another tab
   drawChats();
 }
 
@@ -1590,9 +1592,8 @@ async function openChat(id, picked = false) {
   }
   if (mine !== chatShown) return;
   setChat(c);
-  $('log').replaceChildren();
-  for (let i = 0; i < c.messages.length; i += 2) showExchange(c.messages[i], c.messages[i + 1]);
-  if (!c.messages.length) emptyState();
+  drawChat(c);
+  if (pending(c)) watchChat(id, mine, sign(c));
   if (picked) {
     if (c.model && [...$('chatModel').options].some(o => o.value === c.model)) {
       $('chatModel').value = c.model;
@@ -1605,10 +1606,40 @@ async function openChat(id, picked = false) {
   scroll();
 }
 
-function newChat(focus = true) {
+function drawChat(c) {  // a saved conversation's questions and answers
+  $('log').replaceChildren();
+  for (let i = 0; i < c.messages.length; i += 2) showExchange(c.messages[i], c.messages[i + 1]);
+  if (!c.messages.length) emptyState();
+}
+
+// An answer still being written, in another tab or by this page before a reload (the server
+// fills it in once it notices the page went), is read again until it is done.
+const pending = c => c.messages.some(m => m.status === 'answering');
+const sign = c => c.messages.map(m => `${m.id}:${m.status}:${m.content.length}`).join();
+function watchChat(id, mine, seen, wait = 1000) {
+  setTimeout(async () => {
+    if (mine !== chatShown) return;
+    if (busy) { watchChat(id, mine, seen, wait); return; }  // this page's own answer is on screen
+    let c;
+    try { c = await api('/api/conversations/' + id); } catch (err) {
+      if (err.status !== 404) watchChat(id, mine, seen, Math.min(wait * 2, 10000));
+      return;
+    }
+    if (mine !== chatShown || busy) { if (mine === chatShown) watchChat(id, mine, seen, wait); return; }
+    if (sign(c) !== seen) {
+      const pinned = nearBottom();
+      drawChat(c);
+      if (pinned) scroll();
+    }
+    if (pending(c)) watchChat(id, mine, sign(c), Math.min(wait * 1.5, 5000));
+  }, wait);
+}
+
+function newChat(focus = true) {  // a new conversation starts on all documents (picking one brings back its own)
   stopAnswer();
   ++chatShown;
   setChat(null);
+  setScope([]);
   emptyState();
   drawChats();
   document.body.classList.remove('chatsopen');
@@ -1667,6 +1698,7 @@ function finishAnswer(bot, r) {
   }
   bot.append(foot);
   if (r.overview) bot.append(el('div', 'switched', 'No passage matched this question, so the model was given the titles and summaries of your documents.'));
+  if (r.left_out) bot.append(el('div', 'switched', `This conversation is too long for the local model: it was not given the ${r.left_out === 1 ? 'earliest question and its answer' : `${r.left_out} earliest questions and their answers`}.`));
   if (r.switched) bot.append(el('div', 'switched', `Switched to ${r.model_label}: ${r.switched}`));
   if (r.status === 'stopped') bot.append(el('div', 'switched', 'Stopped. The answer ends here.'));
   if (r.status === 'broken') bot.append(el('div', 'switched bad', `The answer broke off here. ${r.error || ''}`));
@@ -1677,9 +1709,18 @@ function showExchange(q, a) {  // a saved question and its answer
   showQuestion(q.content, only);
   if (!a) return;
   const { bot, body } = answerTurn();
-  body.textContent = a.content;
-  finishAnswer(bot, { ...a, answer: a.content });
+  if (a.status === 'answering') {  // see watchChat
+    body.append(dots());
+    bot.append(el('div', 'switched', 'Still being answered. It shows here when it is done.'));
+  } else if (!a.content) {  // stopped before its first words, or failed: as the page showed it then
+    bot.classList.add('err');
+    body.textContent = a.status === 'stopped' ? 'Stopped before the answer began.' : a.error || 'No answer.';
+  } else {
+    body.textContent = a.content;
+    finishAnswer(bot, { ...a, answer: a.content });
+  }
 }
+const dots = () => Object.assign(el('span', 'dots'), { innerHTML: '<i></i><i></i><i></i>' });
 
 // Answers come from /api/chat/stream as Server-Sent Events, read from fetch's body as they
 // arrive, so the text shows as it is written. Without that (an older browser, or a server
@@ -1688,6 +1729,18 @@ const canStream = typeof TextDecoder === 'function' && typeof ReadableStream ===
 let answering = null;  // the answer being written (its AbortController): Stop aborts the fetch
 const stopAnswer = () => answering?.abort();
 $('stop').onclick = () => { stopAnswer(); $('question').focus(); };
+
+// A stopped answer is kept as far as the page showed it, which the server can't know: it
+// notices a closed stream only when a piece fails to go out, and the piece or two sent just
+// before never showed. live: the streamed answer being written, from its start event, and
+// how many characters of it are shown (code points, as the server counts).
+let live = null;
+function reportStop(l) {
+  if (!l) return;
+  fetch('/api/chat/stop', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversation_id: l.conversation_id, answer_id: l.answer_id, shown: l.shown }) }).catch(() => {});
+}
+addEventListener('pagehide', () => reportStop(live));  // a reload or a closed tab stops it too
 
 async function fetchAnswer(req, signal, on) {
   const opts = { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req) };
@@ -1707,8 +1760,9 @@ async function fetchAnswer(req, signal, on) {
   return r;
 }
 
-// The events: meta, delta (a piece of text), then done, or error ({error, status, kept}: kept
-// when the words so far stand). A stream that ends without either broke off on the way.
+// The events: start (the conversation, and the answer's id), meta, delta (a piece of text),
+// then done, or error ({error, status, kept}: kept when the words so far stand). A stream
+// that ends without either broke off on the way.
 async function readEvents(res, on) {
   let done = null;
   const handle = block => {
@@ -1719,7 +1773,8 @@ async function readEvents(res, on) {
     }
     if (!data) return;  // a comment
     const d = JSON.parse(data);
-    if (name === 'meta') on.meta(d);
+    if (name === 'start') on.start(d);
+    else if (name === 'meta') on.meta(d);
     else if (name === 'delta') on.delta(d);
     else if (name === 'done') done = d;
     else if (name === 'error') throw Object.assign(new Error(d.error), { status: d.status, kept: d.kept, data: d });
@@ -1756,24 +1811,29 @@ async function ask(question) {
   const shown = chatShown, ctl = answering = new AbortController();
   showQuestion(question, scope.length ? scopeText(scope) : '');
   const { bot, body } = answerTurn();
-  body.append(Object.assign(el('span', 'dots'), { innerHTML: '<i></i><i></i><i></i>' }));
+  body.append(dots());
   scroll();
-  let meta = {}, text = '', stopped = false;
-  const follow = m => {  // the conversation the server keeps this in (null: it couldn't)
-    if (shown !== chatShown || !('conversation_id' in m)) return;
+  let meta = {}, text = '', stopped = false, mine = null;
+  // The conversation the server keeps this in, from the start event on (null: it was deleted
+  // meanwhile). Its title is the list's business after that: renamed while this is answered,
+  // the header keeps the new one.
+  const follow = m => {
+    if (shown !== chatShown || !m || !('conversation_id' in m)) return;
     if (!m.conversation_id) setChat(null);
-    else if (m.conversation_id !== chat?.id || m.title !== chat.title) { setChat({ id: m.conversation_id, title: m.title }); loadChats(); }
+    else if (m.conversation_id !== chat?.id) { setChat({ id: m.conversation_id, title: m.title }); loadChats(); }
   };
   try {
     if (scopeGone) throw new Error(GONE);  // never every document unasked
     const req = { question, model: $('chatModel').value, ...(scope.length ? { doc_ids: scope } : {}),
                   ...(chat ? { conversation_id: chat.id } : {}) };
     const r = await fetchAnswer(req, ctl.signal, {
+      start: s => { live = mine = { conversation_id: s.conversation_id, answer_id: s.answer_id, shown: 0 }; follow(s); },
       meta: m => { meta = m; follow(m); },
       delta: piece => {
         const pinned = nearBottom();
         if (!text) { body.replaceChildren(); bot.classList.add('live'); }
         text += piece;
+        if (mine) mine.shown += [...piece].length;
         body.append(piece);
         if (pinned) scroll();
       },
@@ -1787,6 +1847,8 @@ async function ask(question) {
   } catch (err) {
     bot.classList.remove('live');
     stopped = err.name === 'AbortError';
+    if (stopped || (err.kept && !err.data)) reportStop(mine);  // stopped here, or the connection was lost
+    follow(err.data);  // a failed question is kept too: in a new conversation, made for it
     if ((stopped || err.kept) && text) {  // the words so far stand, and are kept with the conversation
       finishAnswer(bot, { ...meta, answer: text, status: stopped ? 'stopped' : 'broken', error: err.message });
     } else {
@@ -1804,6 +1866,7 @@ async function ask(question) {
     }
   }
   if (answering === ctl) answering = null;
+  if (live === mine) live = null;
   busy = false;
   $('send').hidden = false; $('stop').hidden = true;
   if (shown === chatShown) loadChats();
@@ -1811,12 +1874,18 @@ async function ask(question) {
 }
 
 const qbox = $('question');
-qbox.oninput = () => { qbox.style.height = 'auto'; qbox.style.height = qbox.scrollHeight + 'px'; };
+qbox.oninput = () => { qbox.setCustomValidity(''); qbox.style.height = 'auto'; qbox.style.height = qbox.scrollHeight + 'px'; };
 qbox.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('ask').requestSubmit(); } };
 $('ask').onsubmit = e => {
   e.preventDefault();
   const question = qbox.value.trim();
   if (!question || busy) return;
+  const max = MODELS.max_question_chars || 20000, n = [...question].length;
+  if (n > max) {  // said here, so the text stays in the box to shorten
+    qbox.setCustomValidity(`A question can be ${fmtInt(max)} characters at most; this one has ${fmtInt(n)}.`);
+    qbox.reportValidity();
+    return;
+  }
   qbox.value = ''; qbox.oninput();
   ask(question);
 };

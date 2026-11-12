@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import re
+import threading
 from urllib.parse import urlsplit
 
 import anthropic
@@ -43,6 +44,12 @@ mimetypes.add_type("text/plain", ".log")
 MissingKey = llm.MissingKey
 # Most characters of a new conversation's title, taken from its first question.
 TITLE_CHARS = 80
+# Most characters of a question (about 5,000 tokens). Each one is kept, twice (as asked and
+# as sent), and sent again with every later question of its conversation.
+QUESTION_CHARS = 20000
+# Streamed answers being written in this process, by (conversation id, answer id): how many
+# characters of it the page showed when it stopped it (POST /api/chat/stop), None until then.
+_live, _live_lock = {}, threading.Lock()
 
 
 class BadChoice(ValueError):
@@ -197,6 +204,11 @@ def _failure(e):
     return None
 
 
+# An answer that failed for a reason _failure doesn't know: the details (paths, say) stay in
+# the server log, as with /api/chat's plain 500.
+UNEXPECTED = "The answer failed (the server log has the details)"
+
+
 def _error_reply(e):
     error, status = _failure(e)
     return jsonify(error=error), status
@@ -251,7 +263,7 @@ def models():
         local=local, local_error=local_error, vision=ollama.VISION_MODEL,
         claude=[{"id": m, "label": name} for m, name in llm.MODELS],
         server_key=bool(os.environ.get("ANTHROPIC_API_KEY")),
-        max_upload_mb=MAX_UPLOAD_MB,
+        max_upload_mb=MAX_UPLOAD_MB, max_question_chars=QUESTION_CHARS,
         claude_pages=jobs.CLAUDE_PDF_PAGES, confirm_cost_usd=jobs.CONFIRM_COST_USD,
     )
 
@@ -544,7 +556,11 @@ def _question(body):
     question = question.strip() if isinstance(question, str) else ""
     if not question:
         raise BadChoice("Empty question")
+    if len(question) > QUESTION_CHARS:
+        raise BadChoice(f"The question is too long ({QUESTION_CHARS:,} characters at most)")
     choice, scope = _choice(body.get("model")), _scope(body.get("doc_ids"))
+    if choice[0] == "claude" and not _has_key():  # before anything is kept
+        raise MissingKey()
     conv_id = body.get("conversation_id")
     if conv_id is not None:
         if not isinstance(conv_id, int) or isinstance(conv_id, bool):
@@ -564,7 +580,10 @@ def _question(body):
 def _prompt(question, scope, history, on_usage):
     """What the model is sent for a question: (system prompt, the user turn with the passages
     that best match it, by keywords and by meaning (vectors.search), what the page shows of
-    them (sources, excerpts, ...), whether it all fits the local model's context)."""
+    them (sources, excerpts, ...), and the history a local model is sent: the latest turns
+    that fit its context with the question (ollama.recent), None if the question alone doesn't).
+    Claude is sent all of it. So a long conversation stays on the local model with Auto,
+    which switches to Claude only for a question too long for it however short the history."""
     system = llm.system_prompt(db.active_instructions())
     hits = vectors.search(question, int(os.environ.get("TOP_K", "5")), scope and list(scope), on_usage=on_usage)
     # No passage at all ("Summarise everything in my library", or small talk): the model is
@@ -575,25 +594,42 @@ def _prompt(question, scope, history, on_usage):
     found = {"sources": sources, "excerpts": excerpts,
              "overview": bool(library and library[1]),  # given the library's summaries instead of passages
              "scope": scope and list(scope), "scope_names": scope and list(scope.values())}
-    fits = ollama.fits([{"content": system}, *history, {"content": user_message}])
-    return system, user_message, found, fits
+    local = ollama.recent(history, {"content": system}, {"content": user_message})
+    return system, user_message, found, local
 
 
-def _save(conv, question, user_message, text, found, choice, used, note, usage, status="done", error=None):
-    """Keep a question and its answer in their conversation, a new one (titled by the
-    question) when conv is None. Returns {conversation_id, title}, both None when it couldn't
-    be kept (the conversation was deleted meanwhile, or the database stayed locked): the
-    answer is given all the same."""
+def _left_out(found, history, local, used):
+    """found gains left_out: how many earlier questions of a long conversation the local
+    model that answered was not given (0 for Claude, which is given them all). A local model
+    picked by name gets none when the question alone is too long for it (local is None)."""
+    cut = history[:len(history) - len(local or [])] if used[0] == "ollama" else []
+    found["left_out"] = sum(t["role"] == "user" for t in cut)
+
+
+def _begin(conv, question, choice, scope):
+    """Keep a question as it is asked, in its conversation (a new one, titled by the question,
+    when conv is None), its answer to be filled in by _finish: {conversation_id, title,
+    question_id, answer_id}. NotFound if the conversation was deleted since _question."""
+    ex = db.begin_exchange(conv and conv["id"], question, _choice_text(choice), scope and list(scope),
+                           _title(question))
+    if not ex:
+        raise NotFound("This conversation was deleted.")
+    return ex
+
+
+def _finish(ex, sent, text, found, used, note, usage, status="done", error=None):
+    """Fill in a question's answer (_begin), however it ended. Returns {conversation_id,
+    title}: the title as it is now (renamed while it was answered, say), both None when the
+    conversation was deleted meanwhile. If the database stays locked, the answer is given all
+    the same, and a restart marks it failed (db.end_interrupted_answers)."""
     answer = {"content": text, "sources": found, "usage": usage, "status": status, "error": error,
-              **jobs.used(used, note)}
+              **(jobs.used(used, note) if used else {})}
     try:
-        conv_id = db.add_exchange(conv and conv["id"], question, user_message, answer, model=_choice_text(choice),
-                                  doc_ids=found["scope"], title=_title(question))
+        title = db.finish_exchange(ex, sent, answer)
     except Exception:
         log.exception("Could not keep an answer in its conversation")
-        conv_id = None
-    title = (conv["title"] if conv else _title(question)) if conv_id else None
-    return {"conversation_id": conv_id, "title": title}
+        title = ex["title"]
+    return {"conversation_id": ex["conversation_id"] if title is not None else None, "title": title}
 
 
 def _turns(user_message, text):
@@ -605,42 +641,50 @@ def _turns(user_message, text):
 def chat():
     """Answer a question from the passages that best match it, in all documents or only
     those in doc_ids, and keep both in the conversation conversation_id (a new one without).
-    The whole answer at once; /api/chat/stream sends it as it is written."""
+    The whole answer at once; /api/chat/stream sends it as it is written. The question is
+    kept as it is asked; if it then fails, it is kept with the reason, and the error names
+    the conversation (conversation_id, title) as an answer would."""
     question, choice, scope, conv, history = _question(_body())
-    calls = []
+    ex = _begin(conv, question, choice, scope)
+    calls, user_message, found = [], None, None
 
     def on_usage(*call):
         calls.append(jobs.priced(*call))
 
     try:
-        system, user_message, found, fits = _prompt(question, scope, history, on_usage)
+        system, user_message, found, local = _prompt(question, scope, history, on_usage)
 
         def answer(backend, model):
             if backend == "ollama":
-                return ollama.chat(None, history, user_message, model, system=system, on_usage=on_usage)
+                return ollama.chat(None, local or [], user_message, model, system=system, on_usage=on_usage)
             return llm.chat(_client(), history, user_message, model, system=system, on_usage=on_usage)
 
-        (text, usage), used, note = _run(choice, answer, fits_local=fits)
+        (text, usage), used, note = _run(choice, answer, fits_local=local is not None)
+        _left_out(found, history, local, used)
+    except Exception as e:
+        error = _failure(e)
+        kept = _finish(ex, user_message, "", found, None, None, None, "failed", (error or (UNEXPECTED, 500))[0])
+        if not error:
+            raise
+        return jsonify(error=error[0], **kept), error[1]
     finally:
         jobs.log_usage(calls)  # the question's embedding, and a refused Claude answer (billed too)
     return jsonify(answer=text, usage=usage, **found, **jobs.used(used, note),
-                   **_save(conv, question, user_message, text, found, choice, used, note, usage),
-                   turns=_turns(user_message, text))
+                   **_finish(ex, user_message, text, found, used, note, usage), turns=_turns(user_message, text))
 
 
 @app.post("/api/chat/stream")
 def chat_stream():
     """/api/chat, sent as it is written: Server-Sent Events (text/event-stream), each with
-    a JSON data line. "meta" when the model has begun: the conversation, the model, why
-    Auto switched, the sources; "delta": the next piece of the answer's text; then "done"
-    (the answer, its usage, the conversation) or "error" ({error, status, kept}: kept when
-    the text so far stands). A request that is wrong (an empty question, an unknown model,
-    a deleted conversation, a Claude model and no key) gets a plain HTTP error instead,
-    as from /api/chat. Closing the stream stops the answer, which is kept as far as it got.
-    Nothing may buffer it on the way: no-cache, and X-Accel-Buffering for nginx-like proxies."""
+    a JSON data line. "start" at once: the conversation and the answer's id (to stop it
+    with); "meta" when the model has begun: the model, why Auto switched, the sources;
+    "delta": the next piece of the answer's text; then "done" (the answer, its status, usage
+    and conversation) or "error" ({error, status, kept}: kept when the text so far stands).
+    A request that is wrong (an empty question, an unknown model, a deleted conversation, a
+    Claude model and no key) gets a plain HTTP error instead, as from /api/chat. Closing the
+    stream stops the answer, which is kept as far as it got (see chat_stop). Nothing may
+    buffer it on the way: no-cache, and X-Accel-Buffering for nginx-like proxies."""
     question, choice, scope, conv, history = _question(_body())
-    if choice[0] == "claude" and not _has_key():
-        raise MissingKey()
     events = _answer_events(question, choice, scope, conv, history)
     return Response(stream_with_context(_sse(events)), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -657,39 +701,51 @@ def _sse(events):
 
 
 def _answer_events(question, choice, scope, conv, history):
-    """A streamed answer's events (chat_stream). Auto picks its model as _run does: by the
-    fits check, and by switching to Claude when Ollama fails before its first words; a model
-    that fails after them ends the answer where it got to. The question and its answer are
-    kept in the conversation when the answer is done, stopped (the stream closed:
-    GeneratorExit) or broken off part way (an error event with kept: true); not when nothing
-    was written, nor after a refusal, whose words are dropped (kept: false). A new
-    conversation is made just before "meta", so the page has its id even if it stops the
-    answer; it goes again if nothing ends up in it."""
-    calls, pieces, gen, found, used, note, status, error, made = [], [], None, None, None, None, None, None, False
+    """A streamed answer's events (chat_stream). The question is kept first (_begin), so a
+    page reloaded meanwhile still shows it, and "start" names it at once. Auto picks its model
+    as _run does: by what fits the local model, and by switching to Claude when Ollama fails
+    before its first words; a model that fails after them ends the answer where it got to.
+    The answer is filled in however it ends: done; stopped (the page closed the stream, which
+    is noticed as GeneratorExit at the next piece, or said so through chat_stop, checked
+    before each piece); broken off part way (an error event with kept: true); or failed with
+    no words (kept: false; a refusal's words are dropped too). A stop the page reported keeps
+    exactly what it showed: a stream closed at once still had a piece or two on the way."""
+    calls, pieces, gen, ex, key = [], [], None, None, None
+    user_message = found = used = note = saved = None
+    status, error = "failed", None
 
     def on_usage(*call):
         calls.append(jobs.priced(*call))
 
+    def stopped():
+        return _live.get(key) is not None
+
     try:
-        system, user_message, found, fits = _prompt(question, scope, history, on_usage)
+        ex = _begin(conv, question, choice, scope)
+        key = ex["conversation_id"], ex["answer_id"]
+        with _live_lock:
+            _live[key] = None
+        yield "start", {k: ex[k] for k in ("conversation_id", "title", "answer_id")}
+        system, user_message, found, local = _prompt(question, scope, history, on_usage)
 
         def begin(backend, model):  # the model's stream, and its first piece ([] if it wrote nothing)
             if backend == "ollama":
-                g = ollama.chat_stream(None, history, user_message, model, system=system, on_usage=on_usage)
+                g = ollama.chat_stream(None, local or [], user_message, model, system=system, on_usage=on_usage)
             else:
                 g = llm.chat_stream(_client(), history, user_message, model, system=system, on_usage=on_usage)
             return g, list(itertools.islice(g, 1))
 
-        (gen, first), used, note = _run(choice, begin, fits_local=fits)
-        if conv is None:
-            conv = {"id": db.add_conversation(_title(question), _choice_text(choice), found["scope"]),
-                    "title": _title(question)}
-            made = True
-        yield "meta", {"conversation_id": conv["id"], "title": conv["title"], **found, **jobs.used(used, note)}
-        for piece in itertools.chain(first, gen):
-            pieces.append(piece)
-            yield "delta", piece
-        status = "done"
+        (gen, first), used, note = _run(choice, begin, fits_local=local is not None)
+        _left_out(found, history, local, used)
+        if not stopped():
+            yield "meta", {"conversation_id": ex["conversation_id"], "title": ex["title"], **found,
+                           **jobs.used(used, note)}
+            for piece in itertools.chain(first, gen):
+                if stopped():
+                    break
+                pieces.append(piece)
+                yield "delta", piece
+        status = "stopped" if stopped() else "done"
     except GeneratorExit:  # stopped: the page closed the stream
         status = "stopped"
         raise
@@ -698,7 +754,7 @@ def _answer_events(question, choice, scope, conv, history):
         error = _failure(e)
         if not error:
             log.exception("A streamed answer failed")
-            error = f"The answer failed: {e}", 500
+            error = UNEXPECTED, 500
     finally:
         try:  # the model's stream ends with the answer, however it ended, and reports what it used
             if gen:
@@ -706,17 +762,39 @@ def _answer_events(question, choice, scope, conv, history):
         except Exception:
             log.exception("Could not close an answer's stream")
         jobs.log_usage(calls)
-        text = "".join(pieces)
+        text = "".join(pieces) if status != "failed" else ""
         usage = next((c[3] for c in reversed(calls) if c[0] == "chat"), None)
-        if status == "done" or (status in ("stopped", "broken") and text):
-            saved = _save(conv, question, user_message, text, found, choice, used, note, usage, status,
-                          error and error[0])
-        elif made:
-            db.drop_empty_conversation(conv["id"])
-    if status == "done":
-        yield "done", {"answer": text, "usage": usage, **saved, "turns": _turns(user_message, text)}
+        if ex:
+            with _live_lock:  # a stop sent meanwhile finds the answer either still live, or kept
+                shown = _live.pop(key, None)
+                if shown is not None:  # the page stopped it there: what it showed is what is kept
+                    text, status, error = "".join(pieces)[:shown], "stopped", None
+                saved = _finish(ex, user_message, text, found, used, note, usage, status, error and error[0])
+    if status in ("done", "stopped"):
+        yield "done", {"answer": text, "status": status, "usage": usage, **saved, "turns": _turns(user_message, text)}
     else:
-        yield "error", {"error": error[0], "status": error[1], "kept": status == "broken"}
+        yield "error", {"error": error[0], "status": error[1], "kept": status == "broken", **(saved or {})}
+
+
+@app.post("/api/chat/stop")
+def chat_stop():
+    """The page stopped a streamed answer after showing `shown` characters of it (Unicode
+    code points): {conversation_id, answer_id, shown}, as its "start" event named them. The
+    answer keeps that much and no more, whether it is still being written (it ends before
+    its next piece, or as soon as the model begins) or was kept already. Otherwise the
+    server only notices a stop when a piece fails to go out, and keeps the pieces sent just
+    before it, which the page never showed: "Stopped before the answer began" with words."""
+    body = _body()
+    conv_id, answer_id, shown = (body.get(k) for k in ("conversation_id", "answer_id", "shown"))
+    if not all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**63 for v in (conv_id, answer_id, shown)):
+        raise BadChoice('Expected {"conversation_id", "answer_id", "shown"}: whole numbers')
+    with _live_lock:
+        live = (conv_id, answer_id) in _live
+        if live:
+            _live[conv_id, answer_id] = shown
+    if live or db.cut_answer(conv_id, answer_id, shown):
+        return "", 204
+    return jsonify(error="Not found"), 404
 
 
 # ---- saved conversations ----
@@ -732,7 +810,8 @@ def conversation_list():
 @app.get("/api/conversations/<id:conv_id>")
 def conversation_get(conv_id):
     """A conversation and its messages, oldest first: each question as asked, and its
-    answer with the sources, excerpts, model, usage and status (done, stopped or broken)."""
+    answer with the sources, excerpts, model, usage and status: answering (still being
+    written), done, stopped, broken (failed part way) or failed (no words), with the error."""
     c = db.get_conversation(conv_id)
     return jsonify(c) if c else (jsonify(error="Not found"), 404)
 
