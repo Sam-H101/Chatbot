@@ -79,7 +79,8 @@
   .shelfhead { display: flex; align-items: center; gap: 10px; padding: 18px 20px 8px; }
   .shelfhead input { flex: 1; min-width: 0; border: 0; border-bottom: 1px solid var(--line); background: none; padding: 5px 2px; }
   .shelfhead input:focus { outline: 0; border-color: var(--accent); }
-  #docs { flex: 1; overflow-y: auto; padding: 4px 20px 20px; display: grid; gap: 10px; align-content: start; }
+  /* minmax(0, 1fr): a card's long words or chips would otherwise widen the column past a narrow drawer. */
+  #docs { flex: 1; overflow-y: auto; padding: 4px 20px 20px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; align-content: start; }
   .doc { background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 4px 12px 12px 4px; padding: 11px 12px; position: relative; }
   .doc h3 { font: 600 16px/1.25 var(--serif); margin: 0 26px 3px 0; overflow-wrap: anywhere; }
   .doc .meta { font: 11px/1.4 var(--mono); color: var(--soft); overflow-wrap: anywhere; }
@@ -575,8 +576,14 @@ $('theme').onclick = () => {
   store.set('theme', document.documentElement.dataset.theme = isDark() ? 'light' : 'dark');
   syncDark();
 };
-const showKey = () => $('keydot').classList.toggle('set', !!key.value.trim());
-key.oninput = () => { store.set('claudeKey', key.value); showKey(); fillPickers(); };
+// The dot is green when Claude can be used: a key typed here, or the server's own (/api/models).
+function showKey() {
+  const typed = !!key.value.trim(), server = !!MODELS.server_key;
+  $('keydot').classList.toggle('set', typed || server);
+  $('keybtn').title = typed ? 'Claude API key: yours, kept in this browser'
+    : server ? 'Claude API key: the server has one (a key typed here is used instead)' : 'Claude API key: none yet';
+}
+key.oninput = () => { store.set('claudeKey', key.value); fillPickers(); };
 $('keybtn').onclick = () => { $('settings').hidden = !$('settings').hidden; if (!$('settings').hidden) key.focus(); };
 $('keydone').onclick = () => $('settings').hidden = true;
 $('keyclear').onclick = () => { key.value = ''; key.oninput(); key.focus(); };
@@ -603,11 +610,11 @@ document.addEventListener('keydown', e => {
     syncChatsButton();
   }
 });
-showKey();
 
 // ---- model pickers ----
 // Values: 'auto', 'ollama:<model>' or 'claude:<model>'. Each picker remembers its choice.
 let MODELS = { local: [], claude: [], auto: {}, default: 'auto' };
+showKey();  // a typed key at once; the server's once /api/models says so
 const PICKERS = { docModel: 'docModel', chatModel: 'chatModel', rereadModel: 'rereadModel' };
 const claudeReady = () => MODELS.server_key || !!key.value.trim();
 // "Claude reads every page", beside the pickers that read documents. Shown only for a
@@ -644,7 +651,7 @@ function fillPicker(sel) {
   sel.append(g1, g2);
   sel.value = [...sel.options].some(o => o.value === want) ? want : 'auto';
 }
-const fillPickers = () => { Object.keys(PICKERS).forEach(id => fillPicker($(id))); syncPageBoxes(); };
+const fillPickers = () => { Object.keys(PICKERS).forEach(id => fillPicker($(id))); syncPageBoxes(); showKey(); };
 
 async function loadModels() {
   try { MODELS = await api('/api/models'); } catch {}

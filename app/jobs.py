@@ -6,6 +6,7 @@ embeds chunks that have no vectors yet (vectors.backfill). Flask-free, like llm.
 ollama.py: the routes that create jobs and report on them are in main.py."""
 import logging
 import os
+import sqlite3
 import threading
 import time
 
@@ -49,6 +50,9 @@ _keys = {}  # job id -> the browser's Claude key: in memory only, never stored
 _wake, _stop = threading.Event(), threading.Event()
 _thread = None
 _start_lock = threading.Lock()
+_current, _current_lock = None, threading.Lock()  # (job id, thread id) of the job being read (interrupt)
+# Seconds between tries to mark a job failed while the database stays locked (_fail).
+FAIL_RETRY_SECONDS = (2, 10, 30)
 # When this process started (UTC, as SQLite's datetime('now')): answers begun before it and
 # never finished were cut off by a restart (recover).
 STARTED = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
@@ -260,11 +264,32 @@ def _loop():
 
 def run_next():
     """Run the oldest queued job in this thread. False if nothing was queued."""
+    global _current
     job = db.claim_next_job()
     if not job:
         return False
-    _process(job)
+    with _current_lock:
+        _current = job["id"], threading.get_ident()
+    try:
+        _process(job)
+    finally:
+        with _current_lock:
+            _current = None
     return True
+
+
+def interrupt():
+    """If the job being read is no longer running (cancelled, or its document deleted), cut
+    off the Ollama call it waits on, so it stops now rather than when the call returns: up
+    to OLLAMA_TIMEOUT later for a call Ollama never answers, with the queue held up behind
+    it. Claude calls are left to finish. Under _current_lock, so the worker can't have moved
+    on to another job meanwhile. Best effort: the job stops at its next step anyway."""
+    with _current_lock:
+        try:
+            if _current and db.job_status(_current[0]) != "running":
+                ollama.abort(_current[1])
+        except sqlite3.Error:
+            log.warning("Could not check whether job %d still runs", _current[0], exc_info=True)
 
 
 def drain():
@@ -353,7 +378,7 @@ def _process(job):
         elif not isinstance(e, (NoText, extract.Unsupported, llm.MissingKey, db.JobGone, anthropic.APIError,
                                 ollama.OllamaError, AnalysisFailed, pypdfium2.PdfiumError)):  # explained by the job's error
             log.exception("Job %d (%s) failed", job_id, job["filename"])
-        db.update_job(job_id, status="failed", stage="Failed", error=describe(e, job["filename"]))
+        _fail(job_id, describe(e, job["filename"]))
     finally:
         if status != "awaiting_confirmation":
             _keys.pop(job_id, None)
@@ -364,6 +389,22 @@ def _process(job):
                 db.link_usage(job_id, doc_id)
             except Exception:
                 log.exception("Could not link the usage of job %d", job_id)
+
+
+def _fail(job_id, error):
+    """Mark a job failed (unless it was cancelled meanwhile). While the database stays locked
+    past its busy timeout (say a huge document being saved or deleted), try again a few
+    times: a job left 'running' would show its last stage until a restart, with nothing
+    working on it, since only queued jobs are picked up."""
+    for wait in (*FAIL_RETRY_SECONDS, None):
+        try:
+            db.update_job(job_id, status="failed", stage="Failed", error=error)
+            return
+        except sqlite3.OperationalError as e:
+            if wait is None:
+                raise
+            log.warning("Could not mark job %d failed (%s); trying again in %d s", job_id, e, wait)
+            time.sleep(wait)
 
 
 def _index(chunks, progress, on_usage):

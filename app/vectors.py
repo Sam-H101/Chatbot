@@ -27,16 +27,27 @@ RRF_K = 60            # reciprocal rank fusion: a chunk scores 1 / (RRF_K + rank
 RETRY_SECONDS = 120   # after a failed embedding call, how long that kind of embedding (questions, passages) pauses
 ASIDE_SECONDS = 1800  # a passage that fails to embed on its own waits this long before the backfill tries it again
 # Passages less similar than this (cosine) to a question don't count as found by meaning.
-# With qwen3-embedding:0.6b on manuals, off-topic questions ("hi", "What is 2 + 2?") came
-# to 0.30 at most, and the passages that answered real ones to 0.47-0.69; without a floor,
-# small talk would be sent the five nearest passages however far they are.
-MIN_SIMILARITY = float(os.environ.get("SEARCH_MIN_SIMILARITY") or "0.35")
+# With qwen3-embedding:0.6b on the live library (14 manuals, MIN_CHARS below), greetings,
+# thanks and other small talk ("hi", "thanks, that helps", "How much is the rent?") came to
+# 0.45 at most, questions about the bot itself ("What is this?") to 0.49, and real
+# questions' nearest passages to 0.59-0.81, the passages that answer them from 0.49. Without
+# a floor, small talk would be sent the five nearest passages however far they are. (0.35,
+# set on a small test library, let every short question through.)
+MIN_SIMILARITY = float(os.environ.get("SEARCH_MIN_SIMILARITY") or "0.47")
 # Passages found by meaning alone that are this much less similar than the nearest one are
 # left out too. In-domain passages nearly all clear MIN_SIMILARITY, so it alone let a
 # workshop guide's parts lists fill the places of "How long is the warranty?" (0.39-0.41,
 # its answer 0.57) and "How much is the rent?" (0.36, its answer 0.55). Not tighter: for
 # "hydraulic oil capacity", the "transmission fluid ... 38.0 litres" passage was 0.10 behind.
 MEANING_MARGIN = float(os.environ.get("SEARCH_MEANING_MARGIN") or "0.12")
+# Chunks shorter than this (characters) are left out of search by meaning, unless they are
+# their document's only chunk; keyword search still finds them. A scrap of a longer document
+# (the tail of a table, a page footer: "h Squareness Item Factory Specification Allowable
+# Limit", 57 characters) carries next to no meaning, and on the live library came nearest to
+# nearly every short question ("hi" 0.54, "How much is the rent?" 0.56), taking a place
+# among real questions' passages too. The 10 chunks there under 100 characters are all such
+# scraps; from 101 on they hold figures (valve clearances, 105).
+MIN_CHARS = 100
 # qwen3-embedding matches a question best when told the task; passages are embedded as they are.
 QUERY = "Instruct: Given a question, retrieve passages from the user's documents that answer it\nQuery: {}"
 
@@ -114,6 +125,8 @@ def for_chunks(chunks, on_usage=None, on_progress=None):
         texts = [extract.plain(c) for c in chunks[len(out):len(out) + size]]
         try:
             out += _embed(texts, on_usage=on_usage)
+        except ollama.Aborted:  # the job was cancelled: not a failure of the embedding model
+            raise
         except Exception as e:  # any failure: an upload is never lost for its vectors
             if len(texts) > 1:
                 size = 1
@@ -182,16 +195,31 @@ def _vectors():
     with _cache_lock:  # one load at a time
         if _cache and _cache[0] == key:
             return _cache[1]
-        rows = db.all_vectors(key[1])
+        # Loaded into arrays sized up front, row by row, and normalized in place, the old ones
+        # let go first: a load takes about the room of the vectors once (50,000 chunks: 205
+        # MB), not three times (four to reload).
+        _cache = None
+        rows = db.all_vectors(key[1], MIN_CHARS)
+        try:  # closed however it ends: the read transaction would hold up writers
+            most, n, matrix = next(rows), 0, None
+            ids, docs = np.empty(most, dtype=np.int64), np.empty(most, dtype=np.int64)
+            for cid, doc, blob in rows:
+                v = np.frombuffer(blob, dtype="<f4")
+                if matrix is None:
+                    matrix = np.empty((most, len(v)), dtype=np.float32)
+                elif len(v) != matrix.shape[1]:  # another size than the first: not comparable
+                    continue
+                ids[n], docs[n], matrix[n] = cid, doc, v
+                n += 1
+        finally:
+            rows.close()
         held = None
-        if rows:
-            size = len(rows[0][2])
-            rows = [r for r in rows if len(r[2]) == size]
-            matrix = np.frombuffer(b"".join(r[2] for r in rows), dtype="<f4").reshape(len(rows), -1).astype(np.float32)
-            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        if n:
+            matrix = matrix[:n]
+            norms = np.sqrt(np.einsum("ij,ij->i", matrix, matrix))[:, None]  # no squared copy, as linalg.norm makes
             norms[norms == 0] = 1
-            held = (np.array([r[0] for r in rows], dtype=np.int64), np.array([r[1] for r in rows], dtype=np.int64),
-                    matrix / norms)
+            matrix /= norms
+            held = ids[:n], docs[:n], matrix
         _cache = (key, held)
     return held
 

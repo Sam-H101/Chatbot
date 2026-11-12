@@ -14,6 +14,8 @@ services:
       - OLLAMA_EMBED_MODEL
       - OLLAMA_NUM_CTX
       - OLLAMA_ANALYZE_CHARS
+      - OLLAMA_TIMEOUT
+      - OLLAMA_KEEP_ALIVE
       - ANALYZE_MAX_SECTIONS
       # Claude backend only. Optional: set a key here instead of typing it into the page.
       - ANTHROPIC_API_KEY
@@ -30,10 +32,13 @@ services:
       # Which PDF pages count as scanned (read by a model, and paid for with Claude), and
       # how Claude's reading is split up.
       - MIN_PAGE_CHARS
+      - RENDER_SCALE
       - PDF_PAGES_PER_CALL
       - PDF_CONCURRENCY
       - PDF_MAX_BATCH_MB
       - MAX_UPLOAD_MB
+      # DB_PATH and FILES_DIR are left at the image's /data/metabase.db and /data/files: the
+      # backup and restore services below look for both in the metabase volume.
       # Login: set APP_PASSWORD (in .env, say) to ask everyone for it. Unset, there is no login.
       # SECRET_KEY signs the session cookie; unset, a random one is kept in /data/secret_key.
       - APP_PASSWORD

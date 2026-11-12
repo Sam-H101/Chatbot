@@ -274,12 +274,40 @@ Everything below is committed (as of 2026-11-12); nothing after 894b984 has been
   restore refused while staging ran (nothing moved) and worked once it stopped; staging waited 12 s for a held lock;
   after a code change `run restore` used the new code. The PowerShell checks ran on scratch folders and with mocked
   service and process starts (nothing on the machine changed); the task is still not installed.
+- 2026-11-12: Fixes from the integration review, which ran the new code on a copy of the live library. Local
+  models: analysis calls no longer send `shift: false`. Ollama starts a model with that setting, so qwen3.5 was
+  restarted between every analysis call and question (136 starts in Ollama's log that day, 5-13 s each), and after a
+  restart mid-answer such calls went unanswered, so uploads failed after 10 minutes. A reply that runs past the
+  context is now caught from its token counts. A call Ollama takes but never answers fails with "no answer within
+  600 s (OLLAMA_TIMEOUT); Ollama may be busy", not "Could not reach Ollama ... Is it running?". **Cancel**, or
+  deleting a document being re-read, cuts off the job's Ollama call at once: on staging the next upload started 0.1 s
+  after Cancel, and Ollama logged "cancel task". The pickers no longer offer the embedding model (`/api/show`
+  capabilities). Answers: the system prompt no longer invites general-knowledge figures. qwen3.5 had given the
+  tractor a made-up 11.0 L hydraulic oil capacity; asked of a chapter without tire pressures, it gave pressures from
+  general knowledge in 2 of 3 answers before and 0 of 3 now, while still explaining terms ("SAE 80/90").
+  Search by meaning: scraps of a longer document under 100 characters are left out (a 57-character table scrap was
+  nearest to nearly every short question, "hi" included), and greetings are stopwords. `SEARCH_MIN_SIMILARITY` is now
+  0.47, measured on the live library: small talk scored 0.45 at most, and real questions' nearest passages 0.59-0.81.
+  Now 17 of 24 small-talk and library questions get the overview (1 before). All 23 real questions still get 5
+  passages: 18 are unchanged, and the 3 that had the scrap get a real passage in its place. Database: a 30 s busy timeout (saving a 44 MB upload held the database for 7 s, past the old 5 s). A job
+  whose failure can't be written is retried, rather than left 'running'. Deleting a document drops the pages its
+  re-read kept. Vectors load into arrays sized up front: the peak for 50,000 chunks fell from 625 MB to 206 MB. UI:
+  the key dot is green when the server has a key, and phone drawer cards no longer overflow at 320-359 px. Ops:
+  gunicorn's `--graceful-timeout 8` means a restart with an answer streaming stops cleanly in 8.5 s, inside Docker's
+  10 s. Compose passes `OLLAMA_TIMEOUT`, `OLLAMA_KEEP_ALIVE` and `RENDER_SCALE`, now in the README, which also says
+  `DB_PATH`, `FILES_DIR` and `BACKUP_DIR` are fixed by the image. 216 tests pass. Staging on a copy of the live library
+  (qwen3.5, nothing spent on Claude): 10/10 end-to-end checks (cancel mid-analysis, an upload then a question then an
+  upload on one runner, restart mid-answer then an upload) and 19/19 browser checks (light, dark, 320-390 px drawer).
+  The deploy script now tags a rollback image (`chatbot-chatbot:894b984`, tagged already), copies the library first,
+  logs in when a password is set, and deletes its smoke-test conversation.
 
 ## To do
 
 - Deploy the enhancement plan to the live container, which still runs 894b984: `docker compose up -d --build`
   inside WSL `vostok` (this also starts the new `backup` service; naming services, as in `up -d --build chatbot`,
-  would leave it out: name `chatbot backup` then). On its first start the library gains the new tables and
+  would leave it out: name `chatbot backup` then). Before it, keep a way back: the old code is tagged as
+  `chatbot-chatbot:894b984` (it runs on the migrated library), and a copy of `/data/metabase.db` made with SQLite's
+  backup API is worth taking, since the backup service's first snapshot is already of the migrated library. On its first start the library gains the new tables and
   columns and its 588 passages are embedded. Afterwards, check from the LAN address that the page, uploads and
   deletes work (and logging in, if `APP_PASSWORD` is set), and that `docker compose ps backup` shows it up and
   `docker compose logs backup` its first snapshot.

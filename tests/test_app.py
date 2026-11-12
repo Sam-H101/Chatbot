@@ -1700,9 +1700,8 @@ def test_analysis_limits_differ_per_backend(monkeypatch):
     bodies = [re.search(r"<part>\n(.*)\n</part>", m[0]["content"], re.S).group(1) for m, _ in parts]
     assert all(len(b) <= 40_000 for b in bodies) and " ".join(bodies).split() == text.split()   # every word, once
     assert all(ollama.fits(m, ollama.REPLY_TOKENS) and kw["num_predict"] == ollama.REPLY_TOKENS for m, kw in sent["local"])
-    # Ollama is told to refuse a prompt it would have to cut, and to stop a reply at the end
-    # of the context rather than drop the start of the text (test_text_denser_than_reckoned_...).
-    assert all(kw["truncate"] is False and kw["shift"] is False for _, kw in sent["local"])
+    # Ollama is told to refuse a prompt it would have to cut (test_text_denser_than_reckoned_...).
+    assert all(kw["truncate"] is False and "shift" not in kw for _, kw in sent["local"])
     assert "## Part 3 of 3\nKey topics:\n- words" in final[0][0]["content"]
 
 
@@ -2026,30 +2025,37 @@ def _ollama_http(monkeypatch, answer):
         bodies.append(json.loads(req.data))
         return io.BytesIO(json.dumps(answer(bodies[-1])).encode())
 
-    monkeypatch.setattr(ollama.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(ollama, "_urlopen", urlopen)
     return bodies
 
 
 def test_text_denser_than_reckoned_is_read_in_smaller_pieces(monkeypatch):
     """Analysis calls ask Ollama to refuse a prompt it would have to cut (truncate=False:
-    HTTP 400 "exceeds the available context size") and to stop a reply at the end of the
-    context (shift=False) rather than drop the start of the text. Either is
+    HTTP 400 "exceeds the available context size"), and a reply that ran past the end of
+    the context is caught after it: Ollama either went on with the start of the context
+    dropped (its context shift, more tokens than NUM_CTX in all) or stopped there. Each is
     ContextExceeded, and that text is read again in smaller pieces, their notes put
     together: nothing is cut off unnoticed."""
     import io
+    import itertools
     import json
     import urllib.error
     from app import ollama
     room = {"prompt": 9000, "reply": 99_999}  # the fake model's context, in prompt characters
+    garbled = json.dumps({"topics": ["999"], "specifications": [], "procedures": [], "warnings": []})
+    past_the_end = itertools.cycle([
+        {"message": {"content": garbled}, "done_reason": "stop", "prompt_eval_count": ollama.NUM_CTX - 200,
+         "eval_count": 300},                                                               # shifted, and went on
+        {"message": {"content": '{"topics": ["cut'}, "done_reason": "length", "eval_count": 300}])  # stopped there
 
     def answer(body):
         prompt = body["messages"][0]["content"]
-        assert body["truncate"] is False and body["shift"] is False
+        assert body["truncate"] is False and "shift" not in body                           # see _chat_body
         if len(prompt) > room["prompt"]:
             raise urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(
                 b'{"error": "request (17012 tokens) exceeds the available context size (16384 tokens), try increasing it"}'))
         if len(prompt) > room["reply"]:                                                   # the context ran out mid-reply
-            return {"message": {"content": '{"topics": ["cut'}, "done_reason": "length", "eval_count": 300}
+            return next(past_the_end)
         if "topics" in body["format"]["properties"]:
             steps = re.findall(r"Step (\d+)\.", prompt)
             return {"message": {"content": json.dumps({"topics": steps, "specifications": [], "procedures": [],
@@ -2075,8 +2081,8 @@ def test_text_denser_than_reckoned_is_read_in_smaller_pieces(monkeypatch):
     prompts = [b["messages"][0]["content"] for b in bodies]
     answered = [p for p in prompts if len(p) <= 4000]
     assert analysis == "full" and all(", piece " in p for p in answered[:-1])             # all but the final call
-    assert any(4000 < len(p) <= 9000 for p in prompts)                                    # one stopped mid-reply
-    assert sorted(map(int, re.findall(r"- (\d+)", prompts[-1]))) == sorted(list(range(1, 25)) * 2)
+    assert sum(4000 < len(p) <= 9000 for p in prompts) >= 2                               # both kinds of reply past the end
+    assert sorted(map(int, re.findall(r"- (\d+)", prompts[-1]))) == sorted(list(range(1, 25)) * 2)  # no "999"
     # Nothing left that fits: the error is the job's (Auto takes it to Claude).
     room.update(prompt=10)
     with pytest.raises(ollama.ContextExceeded, match="exceeds the available context"):
@@ -2942,7 +2948,7 @@ def test_ollama_streams_its_answer_line_by_line(monkeypatch):
         bodies.append(json.loads(req.data))
         return io.BytesIO(b"".join(json.dumps(line).encode() + b"\n" for line in lines))
 
-    monkeypatch.setattr(ollama.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(ollama, "_urlopen", urlopen)
     report = lambda *call: seen.append(call)  # noqa: E731
     history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
     assert list(ollama.chat_stream(None, history, "msg", "qwen", system="sys", on_usage=report)) == ["The rent ", "is 900."]
@@ -2961,7 +2967,7 @@ def test_ollama_streams_its_answer_line_by_line(monkeypatch):
     def missing(req, timeout):
         raise urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b'{"error": "model \\"qwen\\" not found"}'))
 
-    monkeypatch.setattr(ollama.urllib.request, "urlopen", missing)
+    monkeypatch.setattr(ollama, "_urlopen", missing)
     seen.clear()
     with pytest.raises(ollama.OllamaError, match='qwen: model "qwen" not found'):
         list(ollama.chat_stream(None, [], "msg", "qwen", on_usage=report))
@@ -3752,3 +3758,183 @@ def test_the_backup_command_line(client, tmp_path):
     assert r.returncode == 1 and "must be whole numbers" in r.stderr
     r = run("--now", DB_PATH=str(tmp_path / "none.db"))
     assert r.returncode == 1 and "nothing to back up" in r.stdout and "Traceback" not in r.stdout + r.stderr
+
+
+# ---- found on a copy of the live library: Ollama calls, locks, search by meaning ----
+
+def test_every_call_to_a_local_model_starts_it_the_same_way(monkeypatch):
+    """Ollama starts a model with some settings (num_ctx, context shift) and starts it again
+    when a call asks for others: with shift=False on analysis calls only, qwen3.5 restarted
+    between every analysis call and question (5-13 s each), and after a restart mid-answer
+    such calls went unanswered. Chat, streamed chat and analysis send the same ones."""
+    import io
+    import json
+    from app import ollama
+    bodies = []
+
+    def urlopen(req, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if body["stream"]:
+            return io.BytesIO(json.dumps({"message": {"content": "ok"}, "done": True}).encode() + b"\n")
+        meta = '{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}'
+        return io.BytesIO(json.dumps({"message": {"content": meta if "format" in body else "ok"},
+                                      "done_reason": "stop"}).encode())
+
+    monkeypatch.setattr(ollama, "_urlopen", urlopen)
+    ollama.chat(None, [], "hi")
+    list(ollama.chat_stream(None, [], "hi"))
+    assert ollama.analyze(None, "a.txt", "Some text.")[1] == "full"
+    assert len(bodies) == 3 and {b["model"] for b in bodies} == {ollama.MODEL}
+    assert [b["options"]["num_ctx"] for b in bodies] == [ollama.NUM_CTX] * 3
+    assert not any("shift" in b or "shift" in b["options"] for b in bodies)
+
+
+def test_ollama_errors_say_what_went_wrong(client, monkeypatch):
+    """A call Ollama took but never answered (busy, or stuck) says so: it was reported as
+    "Could not reach Ollama ... Is it running?" while Ollama answered other calls. A refused
+    connection still says that."""
+    import urllib.error
+    from app import jobs, ollama
+    busy = f"qwen3.5:9b: no answer within {ollama.TIMEOUT} s (OLLAMA_TIMEOUT); Ollama may be busy"
+
+    def no_answer(req, timeout):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(ollama, "_urlopen", no_answer)
+    with pytest.raises(ollama.OllamaTimeout) as e:
+        ollama.chat(None, [], "hi", "qwen3.5:9b")
+    assert str(e.value) == busy
+    r = post(client, model="ollama:qwen3.5:9b")
+    jobs.drain()
+    assert job_of(client, r)["error"] == f"Ollama error: {busy}"
+
+    def refused(req, timeout):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(ollama, "_urlopen", refused)
+    with pytest.raises(ollama.OllamaUnavailable, match="Could not reach Ollama"):
+        ollama.chat(None, [], "hi")
+
+
+def test_cancel_cuts_off_an_ollama_call_that_never_answers(client, monkeypatch):
+    """A job waiting on an Ollama call that never answers held the queue for OLLAMA_TIMEOUT
+    (600 s), and Cancel only took effect once the call gave up. Cancel now closes the call's
+    connection: the job stops at once, and Ollama sees the request go."""
+    import socket
+    import threading
+    from app import jobs, ollama
+    server = socket.create_server(("127.0.0.1", 0))
+    asked, closed = threading.Event(), threading.Event()
+
+    def never_answer():
+        conn, _ = server.accept()
+        with conn:
+            conn.recv(65536)  # the request
+            asked.set()
+            while conn.recv(65536):
+                pass
+            closed.set()  # the app hung up
+
+    threading.Thread(target=never_answer, daemon=True).start()
+    monkeypatch.setattr(ollama, "URL", f"http://127.0.0.1:{server.getsockname()[1]}")
+    r = post(client, model="ollama:qwen3.5:9b")
+    worker = threading.Thread(target=jobs.drain, daemon=True)
+    worker.start()
+    try:
+        assert asked.wait(10)                                                              # analyzing, and waiting
+        assert client.post(f"/api/jobs/{r.json['job']['id']}/cancel").json["job"]["status"] == "cancelled"
+        worker.join(10)
+        assert not worker.is_alive() and closed.wait(5)
+        job = job_of(client, r)
+        assert job["status"] == "cancelled" and job["error"] is None
+    finally:
+        server.close()
+
+
+def test_a_failed_job_is_marked_so_when_the_database_was_locked(local, monkeypatch):
+    """A job whose failure couldn't be written (the database locked past its busy timeout)
+    was left 'running', with nothing working on it, until a restart. It is tried again."""
+    import sqlite3
+    from app import db, jobs, ollama
+    real, tries = db.update_job, []
+
+    def locked_once(job_id, when=("running",), **fields):
+        if fields.get("status") == "failed":
+            tries.append(job_id)
+            if len(tries) == 1:
+                raise sqlite3.OperationalError("database is locked")
+        return real(job_id, when, **fields)
+
+    def broken(model, messages, **kw):
+        raise ollama.OllamaError(f"{model}: out of memory")
+
+    monkeypatch.setattr(db, "update_job", locked_once)
+    monkeypatch.setattr(jobs, "FAIL_RETRY_SECONDS", (0, 0, 0))
+    monkeypatch.setattr(ollama, "_chat", broken)
+    job = add(local, model="ollama:qwen3.5:9b")
+    assert len(tries) == 2 and job["status"] == "failed" and job["error"] == "Ollama error: qwen3.5:9b: out of memory"
+
+
+def test_the_database_waits_out_a_long_write(client):
+    """Saving a large upload holds the database for seconds (7 s for a 44 MB text): with
+    sqlite3's default 5 s, polls and questions meanwhile failed with "database is locked"."""
+    from app import db
+    with db.connect() as con:
+        assert con.execute("PRAGMA busy_timeout").fetchone()[0] == db.BUSY_SECONDS * 1000 >= 30_000
+
+
+def test_deleting_a_document_drops_the_pages_its_reread_had_read(local):
+    """The re-read is cancelled with the document, and the page texts it kept for a retry go
+    too, as when a job is cancelled; they stayed in the jobs table and every backup."""
+    from app import db
+    doc_id = add(local)["doc_id"]
+    job_id = local.post(f"/api/documents/{doc_id}/reread", json={"model": "auto"}).json["job"]["id"]
+    db.update_job(job_id, when=("queued",), partial={"ollama:minicpm-v4.6": {"1": "Salary of J. Smith"}})
+    assert local.delete(f"/api/documents/{doc_id}").status_code == 204
+    job = db.get_job(job_id)
+    assert job["status"] == "cancelled" and job["partial"] is None
+
+
+def test_models_that_cannot_chat_are_not_offered(monkeypatch):
+    """The embedding model was offered for reading and answering, where it fails ("does not
+    support chat"). Models are offered when /api/show lists "completion", asked once per
+    model version, or says nothing (an older Ollama)."""
+    import io
+    import json
+    from app import ollama
+    shown = []
+    tags = {"models": [{"name": n, "digest": f"d-{n}"} for n in (
+        "qwen3.5:9b", "minicpm-v4.6:latest", ollama.EMBED_MODEL, "nomic-embed-text:latest", "old:1b")]}
+    capabilities = {"qwen3.5:9b": ["completion", "vision"], "minicpm-v4.6:latest": ["completion", "vision"],
+                    "nomic-embed-text:latest": ["embedding"], "old:1b": None}
+
+    def urlopen(req, timeout):
+        if req.full_url.endswith("/api/tags"):
+            return io.BytesIO(json.dumps(tags).encode())
+        name = json.loads(req.data)["model"]
+        shown.append(name)
+        return io.BytesIO(json.dumps({"capabilities": capabilities[name]} if capabilities[name] else {}).encode())
+
+    monkeypatch.setattr(ollama, "_urlopen", urlopen)
+    monkeypatch.setattr(ollama, "_capabilities", {})
+    assert ollama.models() == ["minicpm-v4.6:latest", "old:1b", "qwen3.5:9b"]
+    assert ollama.models() == ["minicpm-v4.6:latest", "old:1b", "qwen3.5:9b"] and len(shown) == 4  # asked once each
+
+
+def test_scraps_of_long_documents_are_left_out_of_search_by_meaning(client, monkeypatch):
+    """On the live library a 57-character scrap of a table ("h Squareness Item Factory
+    Specification Allowable Limit") came nearest to nearly every short question, small talk
+    included. Chunks under MIN_CHARS are left out of search by meaning unless they are their
+    document's only one; keywords still find them. Greetings are no keywords either: "hi"
+    found a manual's "Hi-Low range shift"."""
+    from app import db, vectors
+    fake_embedder(monkeypatch)
+    text = "Brake pedal free travel is 30-40 mm. " * 40 + "\n\nOne dog at most may live in the flat, on a lead."
+    page, scrap = _chunk_rows(add(client, "manual.txt", text.encode())["doc_id"])          # a page, and a scrap
+    (only,) = _chunk_rows(add(client, "note.txt", b"A dog lives here.")["doc_id"])         # a document's only chunk
+    r = client.post("/api/chat", json={"question": "pets allowed?"}, headers=H).json         # no word in common
+    assert [(e["filename"], e["match"]) for e in r["excerpts"]] == [("note.txt", "meaning")]
+    assert sorted(vectors._vectors()[0].tolist()) == [page["id"], only["id"]] and scrap["model"]  # embedded, not compared
+    assert {h["filename"] for h in client.get("/api/search?q=dog").json} == {"manual.txt", "note.txt"}
+    assert db.fts_query("Hi! Thanks, hello", question=True) == ""

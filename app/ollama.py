@@ -5,6 +5,8 @@ import http.client
 import json
 import os
 import re
+import socket
+import threading
 import urllib.error
 import urllib.request
 
@@ -60,13 +62,87 @@ class OllamaUnavailable(OllamaError):
     """Ollama could not be reached at all."""
 
 
+class OllamaTimeout(OllamaError):
+    """Ollama took the request but sent no answer within the time allowed: busy with other
+    requests, or stuck. Not OllamaUnavailable: it answers other requests meanwhile."""
+
+
+class Aborted(OllamaError):
+    """The call was cut off from another thread (abort): its job was cancelled."""
+
+
 class ContextExceeded(OllamaError, sections.TooLong):
     """A prompt and its reply that NUM_CTX can't hold. Analysis calls ask Ollama to refuse
-    such a prompt rather than cut it (truncate) and to stop such a reply rather than drop
-    the start of the context (shift); sections.py then reads the text in smaller pieces."""
+    such a prompt rather than cut it (truncate), and a reply that ran past the end of the
+    context is caught after it; sections.py then reads the text in smaller pieces."""
+
+
+# Calls under way, by thread: the connection each waits on, so abort() can cut one off.
+_waiting, _aborted, _waiting_lock = {}, set(), threading.Lock()
+
+
+class _Handler(urllib.request.HTTPHandler):
+    """Opens connections that abort() can find by the thread waiting on them."""
+
+    def http_open(self, req):
+        def connection(host, **kw):
+            conn = http.client.HTTPConnection(host, **kw)
+            with _waiting_lock:
+                _waiting[threading.get_ident()] = conn
+            return conn
+        return self.do_open(connection, req)
+
+
+_opener = urllib.request.build_opener(_Handler)
+
+
+def _urlopen(req, timeout):
+    return _opener.open(req, timeout=timeout)
+
+
+def _done(thread_id=None):
+    """The call this thread (or `thread_id`) made is over."""
+    thread_id = thread_id or threading.get_ident()
+    with _waiting_lock:
+        _waiting.pop(thread_id, None)
+        _aborted.discard(thread_id)
+
+
+def abort(thread_id):
+    """Cut off the call to Ollama that thread `thread_id` is waiting on, if any: it raises
+    Aborted at once, and Ollama, seeing the connection close, stops working on it. A
+    cancelled job stops now rather than when the call returns (up to TIMEOUT later)."""
+    with _waiting_lock:
+        conn = _waiting.get(thread_id)
+        if conn is None or conn.sock is None:
+            return False
+        _aborted.add(thread_id)
+        try:
+            conn.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:  # closed meanwhile
+            pass
+        return True
+
+
+def _call_error(model, e, timeout):
+    """The OllamaError a call that failed with `e` raises; None when it is none of these."""
+    if threading.get_ident() in _aborted:
+        return Aborted(f"{model}: stopped, as the job was cancelled")
+    if isinstance(e, urllib.error.HTTPError):  # before URLError: it is a subclass
+        return _http_error(model, e)
+    if isinstance(e, TimeoutError):  # connected, then no answer (a refused connection is a URLError)
+        setting = " (OLLAMA_TIMEOUT)" if timeout == TIMEOUT else ""
+        return OllamaTimeout(f"{model}: no answer within {timeout} s{setting}; Ollama may be busy")
+    if isinstance(e, (urllib.error.URLError, ConnectionError)):
+        return OllamaUnavailable(f"Could not reach Ollama at {URL}")
+    return None
 
 
 def _chat_body(model, messages, think=None, temperature=None, num_predict=None, stream=False, **extra):
+    # Settings Ollama starts a model's runner with (num_ctx; "shift", left at its default)
+    # are the same in every call: Ollama restarts the model when they change. With
+    # shift=False on analysis calls only, qwen3.5 restarted between each analysis call and
+    # question (5-13 s each), and after a restart mid-answer such calls went unanswered.
     options = {"num_ctx": NUM_CTX}
     if temperature is not None:
         options["temperature"] = temperature
@@ -101,53 +177,80 @@ def _http_error(model, e):
 
 
 def _post(path, body, timeout=TIMEOUT):
-    model = body["model"]
     try:
-        with urllib.request.urlopen(_request(path, body), timeout=timeout) as r:
+        with _urlopen(_request(path, body), timeout) as r:
             return json.load(r)
-    except urllib.error.HTTPError as e:  # before URLError: it is a subclass
-        raise _http_error(model, e) from e
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-        raise OllamaUnavailable(f"Could not reach Ollama at {URL}") from e
+    except Exception as e:
+        error = _call_error(body["model"], e, timeout)
+        if error is None:
+            raise
+        raise error from e
+    finally:
+        _done()
 
 
 def _stream(model, messages, **kw):
     """/api/chat streamed: Ollama's reply chunks as they come, the last one marked done
     with the token counts. An error before the first chunk (Ollama down, model not pulled)
     is raised as _post raises it; one after it as an OllamaError saying the answer broke off."""
+    me = threading.get_ident()  # closing the generator may happen in another thread
     try:
-        r = urllib.request.urlopen(_request("/api/chat", _chat_body(model, messages, stream=True, **kw)),
-                                   timeout=TIMEOUT)
-    except urllib.error.HTTPError as e:
-        raise _http_error(model, e) from e
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-        raise OllamaUnavailable(f"Could not reach Ollama at {URL}") from e
-    with r:  # closing it (the generator closed: the user stopped the answer) stops Ollama writing
-        while True:
-            try:
-                line = r.readline()
-                chunk = json.loads(line) if line.strip() else None
-            except (OSError, ValueError, http.client.HTTPException) as e:  # timeouts and resets are OSErrors
-                raise OllamaError(f"{model}: the answer broke off ({e or type(e).__name__})") from e
-            if not line:
-                raise OllamaError(f"{model}: the answer broke off before its end")
-            if chunk is None:
-                continue
-            if chunk.get("error"):  # say the model ran out of memory part way
-                raise OllamaError(f"{model}: {chunk['error']}")
-            yield chunk
-            if chunk.get("done"):
-                return
+        r = _urlopen(_request("/api/chat", _chat_body(model, messages, stream=True, **kw)), TIMEOUT)
+    except Exception as e:
+        error = _call_error(model, e, TIMEOUT)
+        _done(me)
+        if error is None:
+            raise
+        raise error from e
+    try:
+        with r:  # closing it (the generator closed: the user stopped the answer) stops Ollama writing
+            while True:
+                try:
+                    line = r.readline()
+                    chunk = json.loads(line) if line.strip() else None
+                except (OSError, ValueError, http.client.HTTPException) as e:  # timeouts and resets are OSErrors
+                    raise OllamaError(f"{model}: the answer broke off ({e or type(e).__name__})") from e
+                if not line:
+                    raise OllamaError(f"{model}: the answer broke off before its end")
+                if chunk is None:
+                    continue
+                if chunk.get("error"):  # say the model ran out of memory part way
+                    raise OllamaError(f"{model}: {chunk['error']}")
+                yield chunk
+                if chunk.get("done"):
+                    return
+    finally:
+        _done(me)
 
 
 def models():
-    """Names of the models pulled into Ollama."""
-    req = urllib.request.Request(f"{URL}/api/tags")
+    """Names of the models pulled into Ollama that can chat, so read and answer: an embedding
+    model (OLLAMA_EMBED_MODEL) is left out, as it would fail at either."""
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return sorted(m["name"] for m in json.load(r).get("models", []))
+        with _urlopen(urllib.request.Request(f"{URL}/api/tags"), 5) as r:
+            pulled = json.load(r).get("models", [])
     except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as e:
         raise OllamaUnavailable(f"Could not reach Ollama at {URL}") from e
+    finally:
+        _done()
+    return sorted(m["name"] for m in pulled if _chats(m))
+
+
+_capabilities = {}  # a model's digest -> its capabilities, as /api/show lists them
+
+
+def _chats(model):
+    """Whether a model from /api/tags can chat ("completion" in the capabilities /api/show lists,
+    asked once per model version). Offered when Ollama doesn't say, as before."""
+    if model["name"] in (EMBED_MODEL, f"{EMBED_MODEL}:latest"):
+        return False
+    key = model.get("digest") or model["name"]
+    if key not in _capabilities:
+        try:
+            _capabilities[key] = _post("/api/show", {"model": model["name"]}, timeout=5).get("capabilities")
+        except (OllamaError, ValueError):
+            return True
+    return not _capabilities[key] or "completion" in _capabilities[key]
 
 
 def tokens(text):
@@ -222,21 +325,26 @@ def _analysis_size(text):
 def analyze(_client, filename, text, model=MODEL, on_usage=None, **hooks):
     """Same contract as llm.analyze. Every call fits the context window: sections.py keeps
     the text in each within analyze_tokens() (as _analysis_size reckons it), and the reply
-    within REPLY_TOKENS. Text denser than reckoned can't be cut silently: Ollama refuses a
-    prompt too long for NUM_CTX, and stops a reply that reaches its end (ContextExceeded),
-    and sections.py then reads that text in smaller pieces."""
+    within REPLY_TOKENS. Text denser than reckoned is not cut silently: Ollama refuses a
+    prompt too long for NUM_CTX (truncate=False), a reply that ran past the end of the
+    context is caught after it (ContextExceeded), and sections.py then reads that text in
+    smaller pieces."""
     def ask(prompt, schema, kind):
         messages = [{"role": "user", "content": prompt}]
         if not fits(messages, REPLY_TOKENS):
             raise ContextExceeded(f"{model}: a prompt of about {tokens(prompt):,} tokens and a {REPLY_TOKENS:,}-token "
                                   f"reply don't fit OLLAMA_NUM_CTX={NUM_CTX}")
-        r = _chat(model, messages, think=False, temperature=0, num_predict=REPLY_TOKENS, format=schema,
-                  truncate=False, shift=False)
+        # truncate is checked per request; shift is not sent (see _chat_body).
+        r = _chat(model, messages, think=False, temperature=0, num_predict=REPLY_TOKENS, format=schema, truncate=False)
         if on_usage:
             on_usage(kind, "ollama", model, _usage(r))
+        # A reply that reached the end of the context either went on with the start of the context
+        # dropped (Ollama's context shift: more tokens than NUM_CTX in all, as counted when the
+        # prompt was read anew, not from Ollama's cache), or stopped there, short of num_predict.
+        used, wrote = (r.get("prompt_eval_count") or 0) + (r.get("eval_count") or 0), r.get("eval_count") or 0
+        if used > NUM_CTX or (r.get("done_reason") == "length" and wrote < REPLY_TOKENS):
+            raise ContextExceeded(f"{model}: the prompt and its reply ran past OLLAMA_NUM_CTX={NUM_CTX}")
         if r.get("done_reason") == "length":
-            if (r.get("eval_count") or 0) < REPLY_TOKENS:  # stopped by the end of the context, not num_predict
-                raise ContextExceeded(f"{model}: the prompt and its reply ran past OLLAMA_NUM_CTX={NUM_CTX}")
             raise ValueError(f"the reply was cut off at {REPLY_TOKENS:,} tokens")
         return json.loads(r["message"]["content"])
 

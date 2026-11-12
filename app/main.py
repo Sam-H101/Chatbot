@@ -365,9 +365,10 @@ def job_get(job_id):
 
 @app.post("/api/jobs/<id:job_id>/cancel")
 def job_cancel(job_id):
-    """Cancel a job that hasn't finished (a running one stops after its current page),
-    or dismiss a failed one."""
+    """Cancel a job that hasn't finished, or dismiss a failed one. A running one stops at
+    once if it waits on Ollama, else after its current step (a Claude call, say)."""
     j = db.cancel_job(job_id)
+    jobs.interrupt()
     jobs.prune_keys()  # a job that won't run again needs no key
     if not j:
         return jsonify(error="Not found"), 404
@@ -444,7 +445,8 @@ def document_units(doc_id):
 @app.delete("/api/documents/<id:doc_id>")
 def delete(doc_id):
     deleted = db.delete_document(doc_id)
-    jobs.prune_keys()  # its re-read, if any, was cancelled
+    jobs.interrupt()  # its re-read, if any, was cancelled
+    jobs.prune_keys()
     return ("", 204) if deleted else (jsonify(error="Not found"), 404)
 
 
@@ -454,6 +456,7 @@ def delete_many():
     if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
         return jsonify(error="Expected {\"ids\": [1, 2, ...]}"), 400
     deleted = db.delete_documents(ids)
+    jobs.interrupt()
     jobs.prune_keys()
     return jsonify(deleted=deleted)
 

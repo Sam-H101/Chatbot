@@ -28,6 +28,11 @@ _schema_ready = set()
 # vectors in memory and reloads them when it moves (one process, see the Dockerfile).
 _index_version = 0
 _version_lock = threading.Lock()
+# Seconds a statement waits for another connection's write to finish (sqlite3's default is
+# 5). Saving a large upload (every chunk, its FTS row and its vector in one transaction)
+# can hold the database longer: 7 s for a 44 MB text, when polls and questions failed with
+# "database is locked".
+BUSY_SECONDS = 30
 
 # AUTOINCREMENT: a deleted conversation's id is never given out again, so a tab or device
 # that still has it open gets 404 rather than writing into someone's new chat. The table
@@ -173,7 +178,7 @@ _DOC_FIELDS = ("id", "filename", "uploaded_at", "char_count", "title", "doc_type
 def connect():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     fresh = not os.path.exists(DB_PATH)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=BUSY_SECONDS)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     if fresh or DB_PATH not in _schema_ready:
@@ -520,8 +525,8 @@ def _delete_rows(con, ids):
         con.execute(f"DELETE FROM docs_fts WHERE rowid IN ({marks})", part)
         # SQLite hands a deleted id to the next document: keep the cost, drop the link.
         con.execute(f"UPDATE usage SET doc_id = NULL WHERE doc_id IN ({marks})", part)
-        # A re-read of a deleted document has nothing left to update.
-        con.execute(f"UPDATE jobs SET status='cancelled', stage='The document was deleted',"
+        # A re-read of a deleted document has nothing left to update; the pages it read go too.
+        con.execute(f"UPDATE jobs SET status='cancelled', stage='The document was deleted', partial=NULL,"
                     f" updated_at=datetime('now') WHERE kind='reread' AND doc_id IN ({marks})"
                     f" AND status IN ({','.join('?' * len(HOLDING_JOBS))})", [*part, *HOLDING_JOBS])
         con.execute(f"UPDATE jobs SET doc_id = NULL WHERE doc_id IN ({marks})", part)
@@ -679,11 +684,13 @@ def cancel_job(job_id):
 
 # Words too common to tell passages apart. A question's "what is the" matched nearly every
 # chunk, which ranked them by how often they say "the", and in the blend with search by
-# meaning (vectors.search) counted as being found by keywords too.
+# meaning (vectors.search) counted as being found by keywords too. Greetings and thanks
+# too: "hi" found a manual's "Hi-Low range shift".
 STOPWORDS = frozenset(
     "about an and are as at be by can could do does did for from had has have how i if in into is it its many me "
     "much my of on or our should so than that the their them then there these they this those to was we were what "
-    "when where which who whom why will with would you your".split())
+    "when where which who whom why will with would you your "
+    "hi hello hey hiya thanks thank thx please ok okay yes yeah bye goodbye cheers".split())
 
 
 def fts_query(text, question=False):
@@ -781,11 +788,18 @@ def document_names(ids):
 
 # ---- vectors for search by meaning (vectors.py) ----
 
-def all_vectors(model):
-    """[(chunk id, document id, vector bytes)] of every chunk this embedding model embedded."""
+def all_vectors(model, min_chars=0):
+    """The chunks this embedding model embedded, for vectors.py to load: yields first how many
+    vectors the model has (the most rows that can follow), then (chunk id, document id, vector
+    bytes) of each, one at a time, read in one transaction so the count holds. A chunk
+    shorter than `min_chars` is left out, unless it is its document's only one."""
     with connect() as con:
-        return con.execute("SELECT v.chunk_id, c.doc_id, v.vector FROM chunk_vectors v JOIN chunks c ON c.id = v.chunk_id"
-                           " WHERE v.model=?", (model,)).fetchall()
+        con.execute("BEGIN")
+        yield con.execute("SELECT count(*) FROM chunk_vectors WHERE model=?", (model,)).fetchone()[0]
+        yield from con.execute(
+            "SELECT v.chunk_id, c.doc_id, v.vector FROM chunk_vectors v JOIN chunks c ON c.id = v.chunk_id"
+            " WHERE v.model=? AND (length(trim(c.text, char(9, 10, 12, 13, 32))) >= ?"
+            " OR c.doc_id IN (SELECT doc_id FROM chunks GROUP BY doc_id HAVING count(*) = 1))", (model, min_chars))
 
 
 def missing_vectors(model, limit, skip=()):

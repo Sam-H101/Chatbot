@@ -90,14 +90,19 @@ def _report(on_usage, kind, model, response):
 # file as an example: with "(Chapter 7 Brake.pdf)" here and in PAGE_NOTE, qwen3.5:9b cited
 # that file, not in the library, in 4 of 24 answers about a manual's brakes; with PAGE_NOTE's
 # example made from a real excerpt, in none, and it cited the right page in 20 of 24, not 10.
+# General knowledge is not for figures: told only to "answer from general knowledge" when the
+# excerpts lack the answer, qwen3.5:9b gave the live library's tractor a "typical" hydraulic
+# oil capacity of 11.0 litres, confidently and wrongly.
 SYSTEM = os.environ.get("SYSTEM_PROMPT") or (
     "You answer questions for the user of a document chatbot. Each user message may "
     "start with <excerpts> retrieved from the user's uploaded documents by search, and a "
     "<scope> naming the only documents the user wants searched. Use the excerpts when "
     "relevant, and cite each one you use in parentheses with the file name from its file "
     "attribute. When no excerpt matched the question, a <library> lists the documents with "
-    "their summaries instead. If none of this contains the answer, say so and answer from "
-    "general knowledge. Be concise."
+    "their summaries instead. If none of this contains the answer, say so. If the answer is "
+    "a figure or specification (a capacity, pressure, torque, clearance, dimension, interval, "
+    "part number or the like), stop there rather than give a typical or estimated value; "
+    "anything else you may answer from general knowledge, saying that you do. Be concise."
 )
 # Follows the excerpts only when some of them have pages, its example made from the first
 # that has. In the system prompt, it had a local model (qwen3.5:9b) give excerpts without
