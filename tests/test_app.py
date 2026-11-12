@@ -3483,3 +3483,240 @@ def test_the_login_leaves_the_job_worker_alone(guarded, monkeypatch):
     monkeypatch.setattr(jobs, "start", lambda: started.append(True))
     assert guarded.get("/api/jobs").status_code == 401 and guarded.get("/login").status_code == 200
     assert len(started) == 2
+
+
+# ---- backups (app/backup.py) ----
+
+def at(day, hour=3, minute=0, second=0):
+    import datetime
+    return datetime.datetime(2026, 11, day, hour, minute, second)
+
+
+def test_a_backup_is_a_checked_snapshot_of_the_library_and_its_originals(client, tmp_path):
+    import os
+    import sqlite3
+    from app import backup, db
+    add(client)
+    dest = tmp_path / "backups"
+    before = os.stat(db.DB_PATH).st_mtime_ns
+    r = backup.run_once(str(dest), keep=14, now=at(12))
+    snap = r["snapshot"]
+    assert snap["path"] == str(dest / "metabase-20261112-0300.db") and snap["documents"] == 1 and snap["removed"] == []
+    with sqlite3.connect(snap["path"]) as con:
+        assert con.execute("SELECT filename, title FROM documents").fetchall() == [("lease.txt", "Lease")]
+        assert con.execute("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'rent'").fetchone()[0] == 1
+    assert os.stat(db.DB_PATH).st_mtime_ns == before and not os.path.exists(db.DB_PATH + "-journal")  # only read
+    assert r["files"] == {"copied": 1, "bytes": len(LEASE), "failed": 0, "missing": 0}
+    assert (dest / "files" / hashlib.sha256(LEASE).hexdigest()).read_bytes() == LEASE
+    assert not [n for n in os.listdir(dest) + os.listdir(dest / "files") if n.startswith(".")]  # nothing half written
+
+
+def test_a_snapshot_leaves_out_a_write_still_under_way(client, tmp_path):
+    """The backup API reads the library in one transaction: a write not yet committed is not
+    in the copy (a plain file copy could catch it half done)."""
+    import sqlite3
+    from app import backup, db
+    add(client)
+    writer = sqlite3.connect(db.DB_PATH)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("UPDATE documents SET title = 'Half done'")
+    try:
+        path = backup.snapshot(str(tmp_path / "b"), keep=3)["path"]
+    finally:
+        writer.rollback()
+        writer.close()
+    with sqlite3.connect(path) as con:
+        assert con.execute("SELECT title FROM documents").fetchone()[0] == "Lease"
+
+
+def test_a_backup_reads_a_library_it_may_not_write(client, tmp_path, monkeypatch):
+    """The backup service mounts the library read-only; here its folder and file are read-only
+    (that stops a test run as root only through mode=ro, which is what the code relies on)."""
+    import os
+    import shutil
+    from app import backup, db
+    add(client)
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    shutil.copy(db.DB_PATH, ro / "t.db")
+    monkeypatch.setattr(db, "DB_PATH", str(ro / "t.db"))
+    os.chmod(ro / "t.db", 0o444)
+    os.chmod(ro, 0o555)
+    try:
+        assert backup.snapshot(str(tmp_path / "b"), keep=3)["documents"] == 1
+        assert os.listdir(ro) == ["t.db"]                                                    # no journal, nothing else
+    finally:
+        os.chmod(ro, 0o755)
+
+
+def test_backups_keep_the_newest_and_leave_other_files_alone(client, tmp_path):
+    import os
+    from app import backup
+    add(client)
+    dest = tmp_path / "b"
+    removed = [backup.snapshot(str(dest), keep=3, now=at(day))["removed"] for day in range(1, 6)]
+    assert removed == [[], [], [], ["metabase-20261101-0300.db"], ["metabase-20261102-0300.db"]]
+    (dest / "my copy.db").write_bytes(b"x")
+    (dest / "metabase-latest.db").write_bytes(b"x")
+    (dest / ".backup-crashed.db").write_bytes(b"x")
+    os.utime(dest / ".backup-crashed.db", (0, 0))                                            # left by a crash long ago
+    (dest / ".backup-writing.db").write_bytes(b"x")                                          # a --now writing right now
+    backup.snapshot(str(dest), keep=3, now=at(6, minute=1))
+    backup.snapshot(str(dest), keep=3, now=at(6, minute=1, second=40))                       # the same minute: replaced
+    assert sorted(os.listdir(dest)) == [".backup-writing.db", "metabase-20261104-0300.db", "metabase-20261105-0300.db",
+                                        "metabase-20261106-0301.db", "metabase-latest.db", "my copy.db"]
+    assert backup.newest(str(dest)) == at(6, minute=1) and backup.newest(str(tmp_path / "none")) is None
+
+
+def test_backed_up_originals_stay_after_their_document_is_deleted(client, tmp_path, caplog):
+    import os
+    from app import backup, db
+    a = add(client)["doc_id"]
+    add(client, "pets.txt", b"Dogs are welcome.")
+    dest = str(tmp_path / "b" / "files")
+    assert backup.mirror_files(dest=dest)["copied"] == 2
+    assert client.delete(f"/api/documents/{a}").status_code == 204
+    assert not os.path.exists(os.path.join(db.files_dir(), hashlib.sha256(LEASE).hexdigest()))
+    open(os.path.join(db.files_dir(), ".upload-x"), "wb").close()                           # an upload being written
+    assert backup.mirror_files(dest=dest) == {"copied": 0, "bytes": 0, "failed": 0, "missing": 0}
+    assert sorted(os.listdir(dest)) == sorted(hashlib.sha256(b).hexdigest() for b in (LEASE, b"Dogs are welcome."))
+    damaged = "0" * 64
+    with open(os.path.join(db.files_dir(), damaged), "wb") as f:
+        f.write(b"not what its name says")
+    assert backup.mirror_files(dest=dest)["copied"] == 1 and "doesn't match its SHA-256" in caplog.text
+    assert backup.mirror_files(src=str(tmp_path / "no files yet"), dest=dest)["copied"] == 0
+
+
+def test_backups_are_due_after_the_hour_and_make_up_a_missed_night():
+    from app.backup import due
+    assert due(at(12, 14), None, 3)                                                          # none yet: at once
+    assert not due(at(12, 23, 59), at(12), 3) and not due(at(13, 2, 59), at(12), 3)
+    assert due(at(13), at(12), 3)
+    assert due(at(14, 9, 30), at(12), 3)                                                     # the machine was off at 3
+    assert not due(at(14, 9, 31), at(14, 9, 30), 3)                                          # made up: next at 3 tomorrow
+    assert due(at(13, 0), at(12, 0), 0) and not due(at(12, 23, 59), at(12, 0), 0)
+
+
+def test_the_backup_service_tries_a_failed_night_again_half_an_hour_later(tmp_path, monkeypatch):
+    import datetime
+    from app import backup
+
+    class Stop(Exception):
+        pass
+
+    clock = [at(13)]
+    runs = []
+
+    def run_once(folder, keep, now):
+        runs.append(now)
+        if len(runs) == 1:
+            raise backup.BackupError("database is locked")
+        (tmp_path / now.strftime("metabase-%Y%m%d-%H%M.db")).write_bytes(b"")
+
+    def sleep(seconds):
+        clock[0] += datetime.timedelta(seconds=seconds)
+        if clock[0] > at(14, 3, 30):
+            raise Stop
+
+    (tmp_path / "metabase-20261112-0300.db").write_bytes(b"")
+    monkeypatch.setattr(backup, "_now", lambda: clock[0])
+    monkeypatch.setattr(backup, "run_once", run_once)
+    monkeypatch.setattr(backup.time, "sleep", sleep)
+    with pytest.raises(Stop):
+        backup.loop(3, 14, str(tmp_path))
+    assert runs == [at(13), at(13, 3, 30), at(14)]
+
+
+def test_a_snapshot_can_be_restored_with_its_originals(client, tmp_path):
+    import os
+    from app import backup, db
+    a = add(client)["doc_id"]
+    dest = str(tmp_path / "b")
+    backup.run_once(dest, keep=3, now=at(12))
+    assert client.delete(f"/api/documents/{a}").status_code == 204                          # its original goes too
+    add(client, "pets.txt", b"Dogs are welcome.")
+    r = backup.restore("latest", dest, now=at(13, 9, 15))
+    assert (r["snapshot"], r["documents"]) == ("metabase-20261112-0300.db", 1)
+    assert r["kept"] == os.path.abspath(db.DB_PATH) + ".before-restore-20261113-091500" and os.path.exists(r["kept"])
+    assert r["files"] == {"copied": 1, "bytes": len(LEASE), "failed": 0, "missing": 0}
+    (doc,) = client.get("/api/documents").json
+    assert doc["filename"] == "lease.txt" and doc["has_file"]
+    assert client.get(f"/api/documents/{doc['id']}/file").data == LEASE
+    assert client.get("/api/search?q=rent").json                                             # its index came along
+    # The pets.txt original is no longer used: it stays in the library's folder, unused.
+    assert backup.restore("metabase-20261112-0300.db", dest, now=at(13, 9, 16))["files"]["copied"] == 0
+
+
+def test_a_snapshot_of_the_live_librarys_schema_restores_and_is_brought_up_to_date(client, tmp_path, monkeypatch):
+    """The live library (made by 894b984) has no kept files and none of the newer tables: its
+    snapshot restores as it is, here onto a machine with no library yet, and the app brings
+    it up to date when it next opens it."""
+    import sqlite3
+    from app import backup, db
+    old = tmp_path / "live" / "metabase.db"
+    old.parent.mkdir()
+    con = sqlite3.connect(old)
+    con.executescript(SCHEMA_894B984)
+    con.close()
+    monkeypatch.setattr(db, "DB_PATH", str(old))
+    dest = str(tmp_path / "b")
+    r = backup.run_once(dest, keep=3, now=at(12))
+    assert r["snapshot"]["documents"] == 1 and r["files"]["copied"] == 0
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new" / "metabase.db"))
+    r = backup.restore("latest", dest)
+    assert (r["documents"], r["kept"], r["files"]["copied"], r["files"]["missing"]) == (1, None, 0, 0)
+    doc = client.get("/api/documents").json[0]
+    assert doc["title"] == "Tractor manual" and doc["has_file"] is False and doc["sha256"] is None
+    assert client.get("/api/search?q=hydraulic").json[0]["doc_id"] == 1
+    with db.connect() as con:
+        assert con.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0                   # its newer tables were added
+
+
+def test_a_restore_refuses_names_it_does_not_list_and_damaged_snapshots(client, tmp_path):
+    import os
+    from app import backup, db
+    add(client)
+    dest = tmp_path / "b"
+    with pytest.raises(backup.BackupError, match="No snapshots"):
+        backup.restore("latest", str(dest))
+    backup.snapshot(str(dest), keep=3, now=at(12))
+    for name in ("../t.db", "metabase-20261112-0300.db/..", "t.db", ""):
+        with pytest.raises(backup.BackupError, match="No snapshot named"):
+            backup.restore(name, str(dest))
+    (dest / "metabase-20261113-0300.db").write_bytes(b"SQLite format 3\0" + b"\x10\x00" + b"\xff" * 4000)
+    with pytest.raises(backup.BackupError, match="metabase-20261113-0300.db is damaged"):
+        backup.restore("latest", str(dest))
+    assert os.listdir(os.path.dirname(db.DB_PATH)).count("t.db") == 1                         # left as it was
+    assert not [n for n in os.listdir(os.path.dirname(db.DB_PATH)) if "before-restore" in n or n.startswith(".")]
+    assert client.get("/api/documents").json[0]["filename"] == "lease.txt"
+
+
+def test_the_backup_command_line(client, tmp_path):
+    import os
+    import subprocess
+    import sys
+    from app import db
+    add(client)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {**os.environ, "DB_PATH": db.DB_PATH, "FILES_DIR": "", "BACKUP_DIR": str(tmp_path / "b"), "BACKUP_KEEP": "2"}
+
+    def run(*args, **more):
+        return subprocess.run([sys.executable, "-m", "app.backup", *args], cwd=root, env={**env, **more},
+                              capture_output=True, text=True, timeout=120)
+
+    r = run("--now")
+    assert r.returncode == 0 and "Backed up the library to metabase-" in r.stdout and "1 document)" in r.stdout
+    assert "1 new original copied" in r.stdout
+    r = run("--list")
+    assert r.returncode == 0 and "(the newest 2 are kept)" in r.stdout and ": 1 (0.0 MB)" in r.stdout
+    assert re.search(r"^  metabase-\d{8}-\d{4}\.db ", r.stdout, re.M)
+    r = run("--restore")
+    assert r.returncode == 2 and "Name the snapshot to restore" in r.stdout
+    r = run("--restore", "latest")
+    assert r.returncode == 0 and "Restored metabase-" in r.stdout and "docker compose start chatbot" in r.stdout
+    r = run("--now", BACKUP_HOUR="25")
+    assert r.returncode == 1 and "BACKUP_HOUR must be an hour from 0 to 23, not 25" in r.stderr
+    r = run("--now", BACKUP_KEEP="none")
+    assert r.returncode == 1 and "must be whole numbers" in r.stderr
+    r = run("--now", DB_PATH=str(tmp_path / "none.db"))
+    assert r.returncode == 1 and "nothing to back up" in r.stdout and "Traceback" not in r.stdout + r.stderr

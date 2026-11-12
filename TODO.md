@@ -1,6 +1,6 @@
 # Where this stopped (2026-11-10)
 
-Everything below is uncommitted in the working tree.
+Everything below is committed (as of 2026-11-12); nothing after 894b984 has been pushed yet.
 
 ## Done
 
@@ -233,24 +233,51 @@ Everything below is uncommitted in the working tree.
   wait cut short by the first one's timer; the page now keeps the time of the latest Log out instead of a timer, so
   each gets its full 10 s. 196 tests pass. Staging (nothing spent on Claude): logout 15/15, including a second Log
   out 7 s after the first holding until 10 s after the second, and 5/5 for Back.
+- 2026-11-12: Plan items 13, 14 and 15. Backups (`app/backup.py`): a `backup` compose service (the same image) snapshots
+  `/data/metabase.db` every night at `BACKUP_HOUR` (3, the container's time: UTC unless `TZ` is set) with SQLite's
+  backup API, from the library mounted read-only and opened with `mode=ro`; each copy is compacted (`VACUUM`) and
+  checked before it is named `metabase-YYYYMMDD-HHMM.db` in the `backups` volume, the newest `BACKUP_KEEP` (14) are
+  kept, and new originals are added to `files/` there (never pruned, checked against their SHA-256). A night the
+  machine was off or asleep is made up when it is back; a failure is tried again 30 minutes later. `--now` and
+  `--list`, and a `restore` service behind a compose profile (`docker compose run --rm restore <snapshot>|latest`):
+  it checks the snapshot, keeps the database it replaces as `.before-restore-<time>`, and copies back the originals
+  its documents use. Network: `scripts/portproxy.ps1` starts WSL and keeps it running (a hidden `wsl.exe --exec sleep
+  infinity`), reads its address and adds or updates the `0.0.0.0:8000` port proxy rule, starts IP Helper, and adds the
+  firewall rule if it is missing; running it again changes nothing, it logs to `C:\ProgramData\Chatbot\portproxy.log`,
+  `-DryRun`/`-WhatIf` only print, and without elevation it refuses to change anything. `scripts/install-portproxy-task.ps1`
+  copies it to an admin-only `C:\ProgramData\Chatbot` and registers the task "Chatbot portproxy" (as you, highest
+  privileges, at startup without a stored password and at logon; `-Interactive`, `-Remove`). Tests on GitHub:
+  `.github/workflows/tests.yml` (Python 3.13, `requirements.txt` plus pytest and pillow, `python -m pytest -q`; plain
+  `pytest` can't import the app, so the README now says `python -m pytest`). 207 tests pass, also in a fresh
+  python:3.13-slim as a non-root user with the network off. Staging: the backup service on the staging library (first
+  snapshot at start, `/data` read-only in it, 11 snapshots taken while qwen3.5 read and embedded an upload, all
+  checked, stopped in 0.3 s); a restore through the compose service brought back two deleted documents and their
+  originals, and qwen3.5 answered from them with page citations; a read-only snapshot of the live library came to 8.1 MB
+  from 97 MB (14 documents, 588 chunks, integrity ok, the live file untouched). The PowerShell scripts parse, their dry
+  runs and refusals were checked under a non-admin token, and the task has not been installed. Also: the stale "To
+  do" and "Left on the machine" notes above are brought up to date.
 
 ## To do
 
-- 2026-11-11: NVIDIA Container Toolkit is installed in `vostok`, Docker has been restarted, both models are
-  pulled into volume `chatbot_ollama`, and the stack is up. BUT Ollama runs on the CPU: it logs
-  "NVIDIA driver too old … compute=6.1 driver=560 required_driver=570 or newer". Update the Windows
-  NVIDIA driver to 570+ (580 series still supports Pascal), reboot, then `docker compose restart ollama`
-  and check that `docker compose exec ollama ollama ps` shows GPU.
-
-- Look at the new UI in a browser: it has never been checked visually, in light or dark mode, or on a phone.
-- Try a real scanned PDF end to end (not done yet: it spends tokens). Tests pass (6) in a throwaway container built from the new image.
-- Commit, if wanted.
+- Deploy the enhancement plan to the live container, which still runs 894b984: `docker compose up -d --build`
+  inside WSL `vostok` (this also starts the new `backup` service). On its first start the library gains the new
+  tables and columns and its 588 passages are embedded. Afterwards, check from the LAN address that the page,
+  uploads and deletes work (and logging in, if `APP_PASSWORD` is set).
+- Install the port proxy task once, from an elevated PowerShell (README, "Reach it from the LAN").
+- Try a real scanned manual through the live app. Scanned test PDFs have been read end to end on staging, by
+  minicpm-v4.6 and by Claude Haiku (see the log).
+- Push, when wanted.
+- Done: the Windows NVIDIA driver is 582.78 and Ollama runs on the GPU (GTX 1080 Ti). The UI has been checked in a
+  browser, light and dark, at phone widths (Playwright, see the log). Everything is committed.
 
 ## Left on the machine
 
-- Container `chatbot-chatbot-1` is stopped, not removed; the library is in volume `chatbot_metabase`.
-  Start it again with `docker compose up -d` inside WSL `vostok`.
-- Still open to the LAN, from an elevated prompt remove with:
+- Containers `chatbot-chatbot-1` (the 894b984 code) and `chatbot-ollama-1` are running inside WSL `vostok`,
+  with `restart: unless-stopped`; the library is in volume `chatbot_metabase`.
+- WSL is kept running by a `wsl -d vostok -- sleep infinity` started from a Claude Code session on 2026-11-11.
+  After a reboot, nothing starts WSL until the port proxy task (plan item 13) is installed.
+- Open to the LAN through the port proxy `0.0.0.0:8000` to WSL's address and the firewall rule "Chatbot 8000".
+  From an elevated prompt, remove with:
   `netsh interface portproxy delete v4tov4 listenport=8000 listenaddress=0.0.0.0`
   `netsh advfirewall firewall delete rule name="Chatbot 8000"`
 
@@ -291,8 +318,9 @@ Ordered by priority. Suggested start: 1 and 2, then 5. Item 12 is small and wort
 
 - [x] 12. A login. The app is open to the LAN on port 8000 with no password; anyone can delete
       documents or change the instructions. A single shared password would close that.
-- [ ] 13. Stable network address. The Windows portproxy points at the WSL IP, which can change on
+- [x] 13. Stable network address. The Windows portproxy points at the WSL IP, which can change on
       restart. Use WSL mirrored networking or a start-up script that re-points it.
-- [ ] 14. Backups. The library is one SQLite file in volume `chatbot_metabase`. Nightly copy.
-- [ ] 15. Run the tests on GitHub (Actions workflow on every push); today they run by hand.
+      (Start-up script; its scheduled task still has to be installed once, elevated.)
+- [x] 14. Backups. The library is one SQLite file in volume `chatbot_metabase`. Nightly copy.
+- [x] 15. Run the tests on GitHub (Actions workflow on every push); today they run by hand.
 - [x] 16. Usage log. Record tokens and model per request to see what Claude costs.

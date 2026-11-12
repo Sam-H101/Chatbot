@@ -43,6 +43,33 @@ services:
       - ollama
     restart: unless-stopped
 
+  # Nightly snapshot of the library and copies of its originals (app/backup.py), into the
+  # backups volume. Same image; the library is mounted read-only. See README, Backups.
+  backup:
+    build: .
+    command: ["python", "-m", "app.backup"]
+    volumes:
+      - metabase:/data:ro
+      - backups:/backups
+    environment:
+      - BACKUP_HOUR      # default 3, in the container's time: UTC unless TZ is set
+      - BACKUP_KEEP      # default 14 snapshots
+      - TZ               # e.g. America/New_York
+    restart: unless-stopped
+
+  # Not started by `up`: `docker compose run --rm restore <snapshot>` puts a snapshot back
+  # (stop the chatbot first). Without a name it lists them.
+  restore:
+    build: .
+    profiles: ["restore"]
+    entrypoint: ["python", "-m", "app.backup", "--restore"]
+    command: []
+    volumes:
+      - metabase:/data
+      - backups:/backups:ro
+    environment:
+      - TZ
+
   ollama:
     image: ollama/ollama
     volumes:
@@ -61,4 +88,5 @@ services:
 
 volumes:
   metabase:
+  backups:
   ollama:

@@ -27,7 +27,7 @@ The key stays in your browser's localStorage and goes along with each request. T
 
 Anyone who can reach the port can use the app. To ask for a password, put `APP_PASSWORD='<your password>'` in a `.env` file beside `docker-compose.yml` (git ignores it) and run `docker compose up -d` again; see **Login** below. Keep the single quotes: without them compose reads a `$` as the start of a variable and ` #` as the start of a comment, so `$ecret1` would become an empty password (no login at all) and `pa$word` would become `pa`. The log says at start whether a login is on (`docker compose logs chatbot`).
 
-The database is a single file, `/data/metabase.db`, kept in the `metabase` Docker volume. No database server is needed. The original uploaded files are kept beside it, in `/data/files`. Uploads are read in the background by one worker thread, which is why gunicorn runs a single worker process (see the Dockerfile). The thread starts with the app (`app/gunicorn_conf.py`), and its queue lives in the database.
+The database is a single file, `/data/metabase.db`, kept in the `metabase` Docker volume. No database server is needed. The original uploaded files are kept beside it, in `/data/files`. Uploads are read in the background by one worker thread, which is why gunicorn runs a single worker process (see the Dockerfile). The thread starts with the app (`app/gunicorn_conf.py`), and its queue lives in the database. `docker compose up` also starts a `backup` service that backs up both every night (see **Backups**). On Windows, where Docker runs inside WSL, see **Reach it from the LAN** for keeping port 8000 open to other machines across restarts.
 
 ## What it does
 
@@ -54,6 +54,7 @@ The database is a single file, `/data/metabase.db`, kept in the `metabase` Docke
 | Instructions | The **Instructions** button holds rules added to the system prompt of every question, for local models and Claude alike (for example how to handle units). Each can be switched on or off, and they are stored in the database, so they apply to everyone using the app |
 | Unit checks | Before passages go to the model, litre and gallon figures printed side by side are checked against each other (`app/units.py`). If they disagree, the litre figure is trusted and the gallon figure is recalculated; a quarts-printed-as-gallons misprint is shown as quarts. The stored document text is not changed. The same check runs at upload and re-read (`units.find`, which shares its code with the fix, over the stored chunks, as answers see them) and lists the suspected misprints on the document: a **N unit fixes** badge on its library card and in the table view's Units column opens the list, with the page (for PDFs, a link to that page of the original, page 1 included), the document's own text before the figures, what the document printed, what models read instead, and the kind (quarts printed as gallons, imperial gallons printed as U.S., or a pair that just disagrees). The first 500 findings are kept per document and all of them are counted, so a table whose figures all disagree can't swell the library listing; the list then says how many it shows. Documents indexed before this get their check once, from their stored text, when the app starts (no model calls), and so does every document whenever `app/units.py` changes, so the lists always match what answers get; documents read before page breaks were kept show no page. Pairs printed side by side in a table (`| 8.9 ℓ, 2.4 U.S.gal | 8.3 ℓ, 2.2 U.S.gal |`) are kept apart: a figure already paired with the one before it is not paired with the next cell's. API: `unit_fixes` (a count, `null` while unchecked) in `GET /api/documents`; `GET /api/documents/<id>/units` for the list (`findings`, and `total` counting them all) |
 | Table view | The **Table** button in the library opens every document in a sortable, filterable table (DataTables, served from `app/static/vendor`, so it works offline). Tick rows, or the header box to tick everything the current filter shows, then delete them all at once, re-read them, or **Ask about** them. The Units column shows each document's unit fixes |
+| Backups | A `backup` service (`app/backup.py`) takes a checked, compacted snapshot of the database every night with SQLite's backup API, from the library mounted read-only, keeps the newest `BACKUP_KEEP` (14), and adds new originals to a copy that is never pruned, so deleted documents stay recoverable. `docker compose run --rm restore <snapshot>` puts one back. See **Backups** below |
 | Login | Optional. Set `APP_PASSWORD` and everyone is asked for that one shared password (there are no user accounts); unset or empty, there is no login and nothing changes. Without a session, pages go to a small login page (`/login`) and come back after it, a bookmarked link to an original file too (a link to one of its pages keeps the page), and API calls get 401 `{"error": "Login required", "login": true}`, on which the page goes to the login page, which says the session has ended (say after **Log out** in another tab): a question or new instruction being sent then is back in its box after logging in (kept in that tab's sessionStorage), while an upload has to be chosen again. Logging in gives a signed session cookie (`docchat_session`, HttpOnly, SameSite=Lax) that lasts `SESSION_DAYS` (30) days from then; it is not renewed by use. **Log out** in the header ends it in that browser and forgets the Claude key typed into the page there; an answer being written is stopped first, and kept as far as it was shown. Where the header is short of room (500 px and narrower, and 821-910 px, beside the library) Log out is an exit icon and Instructions reads **Rules**. The cookie is signed with `SECRET_KEY`, or else with a random key made at the first request once the app runs with a password, and kept beside the database in `/data/secret_key` (mode 600), so restarts and rebuilds don't log anyone out. Changing `APP_PASSWORD` or `SECRET_KEY`, or deleting `/data/secret_key` and restarting, logs everyone out. After 5 wrong passwords from one address within 10 minutes, that address waits a minute after each further failure, the right password included (429 with `Retry-After`); wrong passwords are logged with the address. Behind Docker's published port (and the Windows port proxy), every client arrives from the same address, Docker's gateway, so in practice a minute's wait holds up everyone, and someone who keeps trying a wrong password once a minute keeps it going for as long as they like. Sessions already logged in carry on meanwhile, and restarting the app (`docker compose restart chatbot`) clears the count, which is kept in memory. Logged in, every API call that changes something (POST, PATCH, DELETE) must carry an `X-Requested-With` header, any value, or it gets 403: the page sends it, and a page on another site can't add it (that would need CORS, which the server never grants), so it can't use a logged-in browser to change anything here. Requests whose `Origin` names another site still get 403 too, login or not. Background jobs and the work done at start (resumed jobs, embeddings, unit checks) don't pass through the login. API clients log in once and keep the cookie: `curl -c jar --data-urlencode 'password=…' http://host:8000/login` (`--data-urlencode`, so a `+`, `&` or `%` in the password arrives as typed; `-d` sends it unencoded, and it fails as a wrong password), then for example `curl -b jar -H "X-Requested-With: curl" -F file=@manual.pdf http://host:8000/api/upload` |
 
 ## Keeping token use down
@@ -97,16 +98,75 @@ The database is a single file, `/data/metabase.db`, kept in the `metabase` Docke
 | `APP_PASSWORD` | (none: no login) | The shared password everyone is asked for (see Login). Put it in `.env` beside `docker-compose.yml`, which git ignores, in single quotes (`APP_PASSWORD='…'`), so compose keeps a `$` or ` #` in it as typed; compose passes it through. The log says at start whether a login is on |
 | `SECRET_KEY` | a random key kept in `secret_key` next to `DB_PATH` (`/data/secret_key`, mode 600) | Signs the session cookie; only used with `APP_PASSWORD`. Changing it logs everyone out |
 | `SESSION_DAYS` | `30` | Days a login lasts, counted from logging in |
+| `BACKUP_HOUR` | `3` | Hour of the nightly backup (0-23), in the backup service's time: UTC unless `TZ` is set. A mistyped value stops the service with a message in its log |
+| `BACKUP_KEEP` | `14` | Database snapshots kept; older ones are deleted. Originals are never deleted from the backup |
+| `BACKUP_DIR` | `/backups` | Where the backup service writes (the `backups` volume) |
+| `TZ` | (none: UTC) | Time zone of the backup service, say `America/New_York`: it sets when `BACKUP_HOUR` comes and the time in snapshot names |
 
 Requests turn on server-side refusal fallbacks (`fallbacks: "default"`). If Claude's safety filter declines a request, the API retries it on a fallback model instead of failing.
+
+## Backups
+
+The `backup` service in `docker-compose.yml` (the same image, running `python -m app.backup`) backs up the library every night at `BACKUP_HOUR` into the `backups` volume:
+
+- **The database:** a snapshot of `/data/metabase.db` made with SQLite's backup API, which reads it in one read transaction, so an upload or an answer being saved at that moment is either all in it or not at all (a file copy could catch it half written). The copy is compacted (`VACUUM`: the live file keeps the space deleted documents freed, and the live library's 97 MB came to 8 MB), checked (`PRAGMA integrity_check`), and only then named `metabase-YYYYMMDD-HHMM.db`. The newest `BACKUP_KEEP` (14) are kept; older ones are deleted, and other files in the volume are left alone.
+- **The originals:** each file in `/data/files` that the backup doesn't have yet is copied to `files/` in the volume, and checked against the SHA-256 in its name. Copies are only ever added, so the original of a deleted document stays recoverable. The volume grows by every distinct file ever uploaded; delete old ones by hand if you need the room.
+
+The service mounts the library read-only and opens the database read-only (`mode=ro`), so it can't change either. The hour is the container's, which is UTC unless you set `TZ`: for 3 a.m. in New York, put `TZ=America/New_York` in `.env`. The service looks at the clock every minute and backs up when no snapshot has been taken since the last `BACKUP_HOUR`: a night the machine was off or asleep is made up soon after it is back, and the first snapshot is taken as soon as the service first starts. A failed backup is logged and tried again 30 minutes later. `docker compose logs backup` shows each one.
+
+```bash
+docker compose exec backup python -m app.backup --now    # take one now
+docker compose exec backup python -m app.backup --list   # list the snapshots and originals
+docker compose cp backup:/backups/. ./backups            # copy them out of Docker, to keep elsewhere
+```
+
+The `backups` volume is on the same disk as the library (inside WSL's virtual disk on Windows), so it guards against mistakes and a damaged database, not against losing the disk. Copy it somewhere else now and then.
+
+To restore a snapshot:
+
+```bash
+docker compose stop chatbot                                 # the app keeps some of the library's state in memory
+docker compose run --rm restore                             # lists the snapshots
+docker compose run --rm restore metabase-20261112-0300.db   # or: latest
+docker compose start chatbot
+```
+
+The `restore` service isn't started by `up`; `docker compose run` starts it on its own. It checks the snapshot, puts it back as `/data/metabase.db`, keeps the database it replaces beside it as `metabase.db.before-restore-<time>` (delete that once you're happy), and copies back the originals the snapshot's documents use that `/data/files` lacks. Anything saved after the snapshot was taken (uploads, conversations, usage) is not in it. A snapshot from an older version of the app is brought up to date when the app starts, like any older library. The login's `/data/secret_key` is not backed up: restored onto a new machine, everyone logs in again.
+
+## Reach it from the LAN (Windows with WSL)
+
+When Docker runs inside WSL, other machines reach the app through a Windows port proxy (`0.0.0.0:8000` to WSL's address, port 8000) and an inbound firewall rule, **Chatbot 8000**. WSL gets a new address when it restarts, which leaves the proxy pointing nowhere. WSL's mirrored networking would make the proxy unnecessary, but it needs Windows 11 22H2 or later, and this machine has 21H2 (build 22000). Instead, `scripts/portproxy.ps1`:
+
+1. starts the WSL distro (`vostok`) if it isn't running, and keeps it running with a hidden `wsl.exe -d vostok --exec sleep infinity` (WSL stops a distro soon after its last window closes; Docker and the containers, all `restart: unless-stopped`, start with the distro);
+2. reads the distro's address (`hostname -I`, the first one);
+3. adds or updates the port proxy rule for `0.0.0.0:8000` if it points anywhere else;
+4. makes sure the IP Helper service, which carries the port proxy, is running, and that the firewall rule exists (it adds one for TCP 8000 if there is none, and leaves a disabled one disabled).
+
+Run again, it changes nothing. It logs what it did to `C:\ProgramData\Chatbot\portproxy.log`. Other port proxy rules are left alone.
+
+One-time setup, from an **elevated** PowerShell (Run as administrator) in the repo folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-portproxy-task.ps1
+```
+
+This copies `portproxy.ps1` to `C:\ProgramData\Chatbot`, a folder only administrators can change (the task runs the script with full rights), and registers the scheduled task **Chatbot portproxy**. The task runs it as you, with highest privileges, at startup (30 seconds after boot, whether anyone is logged on or not, with no password stored) and at logon. The install then runs the task once and shows its log. Run the install again after changing `portproxy.ps1`.
+
+- To see what it would do, without changing anything: `powershell -ExecutionPolicy Bypass -File .\scripts\portproxy.ps1 -DryRun` (or `-WhatIf`). This works without elevation; without elevation and without `-DryRun`, the script refuses to run. Reading WSL's address starts WSL if it isn't running, even in a dry run.
+- `wsl --shutdown` gives WSL a new address: afterwards, run `Start-ScheduledTask -TaskName 'Chatbot portproxy'`, or log off and on again.
+- If the log shows WSL failing to start in the startup run, Windows didn't let WSL start with nobody logged on: run the install again with `-Interactive`, which runs the task at logon only, in your session.
+- Both scripts take `-Distro` and `-Port`; `install-portproxy-task.ps1 -WhatIf` shows the task it would register.
+- To remove the task: `install-portproxy-task.ps1 -Remove`. It leaves the port proxy and firewall rules, and prints the `netsh` commands that remove them.
 
 ## Develop without Docker
 
 ```bash
-pip install -r requirements.txt pytest
+pip install -r requirements.txt pytest pillow
 DB_PATH=data/metabase.db flask --app app.main run --debug
-pytest
+python -m pytest     # python -m puts the repo on the path, so the tests can import the app
 ```
+
+GitHub Actions runs the same tests on every push and pull request (`.github/workflows/tests.yml`: Python 3.13, `requirements.txt` plus pytest and pillow, `python -m pytest -q`). The tests use fakes for Claude and Ollama, so they need no API key, GPU, Docker or network.
 
 ## Not done yet
 
@@ -114,4 +174,5 @@ pytest
 - Markdown in answers is shown as written (`**bold**`, `- items`), not rendered
 - Saved conversations have no length limit: Claude is sent the whole history with every question (cached, but it grows), while the local model gets only the latest exchanges that fit (see Auto)
 - The login is one shared password over plain HTTP: the password and the session cookie cross the network unencrypted, so someone who can watch the LAN's traffic can take them. HTTPS (a reverse proxy in front) would close that. A copied cookie works until it expires: **Log out** only removes it from that browser, while changing `APP_PASSWORD` ends every session
+- Backups stay on the machine they were made on (the `backups` volume), until you copy them elsewhere
 - Without `APP_PASSWORD`, anyone who can reach the port can see and change the documents. Only one thing is guarded then: a page on another site can't make a visitor's browser change anything here. Browsers name the sending page's origin on every POST, PATCH and DELETE, and requests naming another site get 403. Clients that send no origin, such as curl, are let through
