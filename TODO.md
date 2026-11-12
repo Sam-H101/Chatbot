@@ -222,6 +222,13 @@ Everything below is uncommitted in the working tree.
   Staging (qwen3.5, nothing spent on Claude): drafts 11/11, page link 4/4, stream stopped by Log out, reload and
   Stop kept exactly as shown (one 204 each), login page 6/6, curl flow with `pa$s #w+r&d`, `.env` quoting checked
   with `docker compose config`.
+- 2026-11-12: Second review fixes for item 12. A Log out whose POST got no answer (stopped, or the server
+  unreachable) left the page set as leaving, so a later 401 no longer sent it to the login page and the call just
+  hung; the page now goes there again after 10 seconds, or at once when Back brings it from the back/forward cache.
+  A three-digit instruction count left the last header button 3-5 px out at 320-324 and 351-355 px: the 350 px
+  tightening now starts at 360 px, and buttons lose another pixel each side at 330 px and below. 196 tests pass.
+  Staging (nothing spent on Claude): logout 9/9 plus 5/5 for Back, header fit at every width from 320 to 1000 px
+  plus 1099-1400 with 1, 12, 99, 100 and 999 instructions, with and without a login, phone and desktop: 0 overflows.
 
 ## To do
 

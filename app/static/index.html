@@ -331,14 +331,17 @@
     body.login header .wide, body.login header .long { display: none; }
     body.login header .narrow, body.login header .short { display: inline; }
   }
+  /* Less room between and inside on the narrowest phones, so the row fits from 320 px with up to a
+     three-digit instruction count (100 left the last button 3-5 px out at 320-324 and 351-355 px). */
   @media (max-width: 380px) { header { gap: 2px; padding-inline: 8px; } }
-  @media (max-width: 350px) { header button:not(.icon) { padding-inline: 6px; } }
+  @media (max-width: 360px) { header button:not(.icon) { padding-inline: 6px; } }
   @media (max-width: 340px) {
     header { padding: 10px 6px; gap: 2px; }
     header button:not(.icon) { padding: 5px 6px; }
     header button.icon { width: 30px; }
     #rulecount:not(:empty) { margin-left: 3px; padding: 2px 4px; }
   }
+  @media (max-width: 330px) { header button:not(.icon) { padding-inline: 5px; } }
 </style>
 </head>
 <body>
@@ -503,9 +506,13 @@ const OWN = { 'X-Requested-With': 'fetch' };
 const loginGone = (status, data) => status === 401 && data?.login === true;
 let asking = '';      // the question being sent, until its start event says the server kept it
 let leaving = false;  // on the way to the login page already (Log out, or a call before this one)
+// A page still here a while later (the server never answered, the browser stopped loading) or
+// back from the login page (Back) goes there again at the next call that finds the session ended.
+const leave = () => { leaving = true; setTimeout(() => { leaving = false; }, 10000); };
+addEventListener('pageshow', e => { if (e.persisted) leaving = false; });
 const toLogin = () => {
   if (!leaving) {
-    leaving = true;
+    leave();
     const question = [asking, $('question').value.trim()].filter(Boolean).join('\n\n');
     try { sessionStorage.setItem('draft', JSON.stringify({ question, rule: $('newrule').value.trim() })); } catch {}
     location.assign('/login?ended=1');
@@ -1940,7 +1947,7 @@ api('/api/session').then(s => { $('logout').hidden = !s.login; document.body.cla
 // (pagehide's would get 401, and the server would keep more than the page showed). The Claude key
 // typed here is forgotten, so whoever logs in next in this browser isn't using it.
 $('logoutform').addEventListener('submit', () => {
-  leaving = true;
+  leave();
   reportStop(live);
   stopAnswer();
   key.value = ''; store.set('claudeKey', '');
