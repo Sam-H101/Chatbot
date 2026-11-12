@@ -61,6 +61,9 @@ services:
   # (stop the chatbot first). Without a name it lists them.
   restore:
     build: .
+    # `up --build` skips a service behind a profile: build it at every run instead (cached,
+    # so quick), or it would keep the code of the first restore.
+    pull_policy: build
     profiles: ["restore"]
     entrypoint: ["python", "-m", "app.backup", "--restore"]
     command: []

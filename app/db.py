@@ -183,6 +183,24 @@ def connect():
     return con
 
 
+def lock_library(exclusive=False, wait=True):
+    """An flock on app.lock next to DB_PATH, held until the returned file is closed or the
+    process ends. The app holds it shared while it runs (gunicorn_conf.py); a restore takes
+    it exclusively without waiting (backup.py), so it can't replace the database under a
+    running app, which keeps some of it in memory: the schema it migrated, the vectors, the
+    job it is reading. BlockingIOError: someone else holds it (wait=False)."""
+    import fcntl  # Linux only, like gunicorn
+    folder = os.path.dirname(DB_PATH) or "."
+    os.makedirs(folder, exist_ok=True)
+    f = open(os.path.join(folder, "app.lock"), "a")
+    try:
+        fcntl.flock(f, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if wait else fcntl.LOCK_NB))
+    except BaseException:
+        f.close()
+        raise
+    return f
+
+
 def _migrate(con):
     con.executescript(SCHEMA)
     for table, columns in (("documents", COLUMNS), ("usage", USAGE_COLUMNS), ("chunks", CHUNK_COLUMNS)):

@@ -3691,6 +3691,32 @@ def test_a_restore_refuses_names_it_does_not_list_and_damaged_snapshots(client, 
     assert client.get("/api/documents").json[0]["filename"] == "lease.txt"
 
 
+def test_a_restore_refuses_while_the_app_is_running(client, tmp_path, monkeypatch):
+    """gunicorn's master holds the library's lock while the app runs (gunicorn_conf.py). A
+    restore under it would leave the app on the replaced library's schema, vectors and job
+    ids, so it refuses and changes nothing."""
+    import logging
+    import os
+    import types
+    from app import backup, db, gunicorn_conf
+    add(client)
+    dest = str(tmp_path / "b")
+    backup.snapshot(dest, keep=3, now=at(12))
+    monkeypatch.setattr(gunicorn_conf, "_lock", None)
+    gunicorn_conf.on_starting(types.SimpleNamespace(log=logging.getLogger("gunicorn")))
+    folder = os.path.dirname(db.DB_PATH)
+    before = sorted(os.listdir(folder))
+    try:
+        second = db.lock_library()                                                           # a second app shares it
+        second.close()
+        with pytest.raises(backup.BackupError, match=r"The app is running: stop it first \(docker compose stop chatbot\)"):
+            backup.restore("latest", dest)
+        assert sorted(os.listdir(folder)) == before                                          # nothing moved or left
+    finally:
+        gunicorn_conf._lock.close()
+    assert backup.restore("latest", dest)["documents"] == 1                                  # the app stopped: it works
+
+
 def test_the_backup_command_line(client, tmp_path):
     import os
     import subprocess
@@ -3712,8 +3738,14 @@ def test_the_backup_command_line(client, tmp_path):
     assert re.search(r"^  metabase-\d{8}-\d{4}\.db ", r.stdout, re.M)
     r = run("--restore")
     assert r.returncode == 2 and "Name the snapshot to restore" in r.stdout
+    running = db.lock_library()                                                              # the app, in another process
+    try:
+        r = run("--restore", "latest")
+    finally:
+        running.close()
+    assert r.returncode == 1 and "The app is running: stop it first" in r.stdout and "Traceback" not in r.stdout + r.stderr
     r = run("--restore", "latest")
-    assert r.returncode == 0 and "Restored metabase-" in r.stdout and "docker compose start chatbot" in r.stdout
+    assert r.returncode == 0 and "Restored metabase-" in r.stdout and "docker compose restart chatbot" in r.stdout
     r = run("--now", BACKUP_HOUR="25")
     assert r.returncode == 1 and "BACKUP_HOUR must be an hour from 0 to 23, not 25" in r.stderr
     r = run("--now", BACKUP_KEEP="none")

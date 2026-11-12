@@ -107,15 +107,26 @@ if (-not $elevated -and -not $dry) {
 
 Write-Log ("portproxy.ps1: distro '$Distro', ${ListenAddress}:$Port, firewall rule '$RuleName'" +
     $(if ($dry) { ' (dry run: nothing is changed)' } else { '' }))
+# A step that fails is logged and the others still run; the exit code is then 1, which the
+# scheduled task shows as its last result.
+$failed = $false
 
 # 1. Start WSL, and keep it running.
+$keeper = $null
 if (-not $NoKeepAlive) {
     $keep = @(Get-KeepAlive)
     if ($keep.Count -gt 0) {
         Write-Log "WSL is kept running already (wsl.exe process $($keep[0].ProcessId))"
     } elseif ($PSCmdlet.ShouldProcess("$wsl -d $Distro --exec sleep infinity", 'Start, hidden, to keep WSL running')) {
-        Start-Process -FilePath $wsl -ArgumentList @('-d', $Distro, '--exec', 'sleep', 'infinity') -WindowStyle Hidden
-        Write-Log "Started '$wsl -d $Distro --exec sleep infinity' to keep WSL running"
+        try {
+            $keeper = Start-Process -FilePath $wsl -ArgumentList @('-d', $Distro, '--exec', 'sleep', 'infinity') `
+                -WindowStyle Hidden -PassThru -ErrorAction Stop
+            $null = $keeper.Handle  # keeps its exit code readable after it ends
+            Write-Log "Started '$wsl -d $Distro --exec sleep infinity' to keep WSL running (process $($keeper.Id))"
+        } catch {
+            Write-Log "Could not start '$wsl -d $Distro --exec sleep infinity' to keep WSL running: $_"
+            $failed = $true
+        }
     }
 }
 
@@ -126,6 +137,10 @@ if (-not $ip) {
     exit 1
 }
 Write-Log "WSL distro '$Distro' is at $ip"
+if ($keeper -and $keeper.HasExited) {  # by now WSL has started, so sleep should be running
+    Write-Log "The wsl.exe keeping WSL running has ended (exit code $($keeper.ExitCode)): WSL may stop when idle"
+    $failed = $true
+}
 
 # 3. The port proxy rule.
 $want = "$ip/$Port"
@@ -152,10 +167,16 @@ if ($current -eq $want) {
 $svc = Get-Service -Name iphlpsvc -ErrorAction SilentlyContinue
 if (-not $svc) {
     Write-Log 'The IP Helper service (iphlpsvc) is missing: the port proxy will not work'
+    $failed = $true
 } elseif ($svc.Status -ne 'Running') {
     if ($PSCmdlet.ShouldProcess('IP Helper service (iphlpsvc), which carries the port proxy', 'Start')) {
-        Start-Service -Name iphlpsvc
-        Write-Log 'Started the IP Helper service (iphlpsvc)'
+        try {
+            Start-Service -Name iphlpsvc -ErrorAction Stop  # returns once it runs
+            Write-Log 'Started the IP Helper service (iphlpsvc)'
+        } catch {  # say it is disabled
+            Write-Log "Could not start the IP Helper service (iphlpsvc), so the port proxy will not work: $_"
+            $failed = $true
+        }
     }
 }
 
@@ -164,13 +185,22 @@ if ($rules.Count -eq 0) {
     # Profile Any, like the rule set up by hand before this script: the LAN may be classed Public.
     $cmd = "New-NetFirewallRule -DisplayName '$RuleName' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port -Profile Any"
     if ($PSCmdlet.ShouldProcess($cmd, 'Run')) {
-        New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
-            -Profile Any -ErrorAction Stop | Out-Null
-        Write-Log "Added firewall rule '$RuleName' (inbound TCP $Port)"
+        try {
+            New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
+                -Profile Any -ErrorAction Stop | Out-Null
+            Write-Log "Added firewall rule '$RuleName' (inbound TCP $Port)"
+        } catch {
+            Write-Log "Could not add firewall rule '$RuleName': $_"
+            $failed = $true
+        }
     }
 } elseif (-not ($rules | Where-Object { "$($_.Enabled)" -eq 'True' })) {
     Write-Log "Firewall rule '$RuleName' exists but is disabled: left as it is, so the LAN can't reach port $Port"
 } else {
     Write-Log "Firewall rule '$RuleName' is in place"
+}
+if ($failed) {
+    Write-Log 'Finished, but a step above failed'
+    exit 1
 }
 exit 0

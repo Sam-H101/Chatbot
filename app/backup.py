@@ -42,8 +42,9 @@ class BackupError(Exception):
 
 
 def settings():
-    """BACKUP_HOUR and BACKUP_KEEP, checked: a mistyped value stops the service with a message
-    rather than backing up at another hour or keeping nothing."""
+    """BACKUP_HOUR and BACKUP_KEEP, checked: a mistyped value ends the service with a message
+    (Docker then restarts it, again and again, until it is fixed) rather than backing up at
+    another hour or keeping nothing."""
     try:
         hour = int(os.environ.get("BACKUP_HOUR") or 3)
         keep = int(os.environ.get("BACKUP_KEEP") or 14)
@@ -269,11 +270,27 @@ def _referenced(path):
     return names
 
 
+def _lock_out_the_app():
+    """The library's lock (db.lock_library), taken exclusively: the app holds it while it
+    runs, and one starting meanwhile waits until it is closed. Returns it, to close when done
+    (None where files can't be locked: then only the README's "stop it first" keeps the app
+    away)."""
+    try:
+        return db.lock_library(exclusive=True, wait=False)
+    except BlockingIOError:
+        raise BackupError("The app is running: stop it first (docker compose stop chatbot). It keeps some of the"
+                          " library in memory, and would carry on as if the database it replaced were still"
+                          " there") from None
+    except OSError as e:
+        log.warning("Could not tell whether the app is running (%s): make sure it is stopped", e)
+        return None
+
+
 def restore(name, folder=None, now=None):
     """Put snapshot `name` ('latest': the newest) back as the library, and copy back the
     originals it uses that the library's files folder lacks. The database it replaces is
     kept beside it as <DB_PATH>.before-restore-<time> (with its journal, if it had one).
-    The app must be stopped first: it keeps the library's state in memory.
+    Refuses while the app runs (it keeps the library's state in memory).
     Returns {snapshot, documents, kept, files}."""
     folder = folder or BACKUP_DIR
     names = snapshots(folder)
@@ -287,29 +304,34 @@ def restore(name, folder=None, now=None):
     documents = _check(path)
     target = os.path.abspath(db.DB_PATH)
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=TMP, suffix=".db")
-    os.close(fd)
-    kept = None
+    lock = _lock_out_the_app()
     try:
-        with closing(_open_ro(path)) as src, closing(sqlite3.connect(tmp)) as out:
-            src.backup(out)
-        os.chmod(tmp, 0o644)
-        stamp = (now or datetime.datetime.now()).strftime("%Y%m%d-%H%M%S")
-        # A journal left by a crash goes with its database: beside the restored one, SQLite
-        # would take it for that one's and "roll it back" into it.
-        for suffix in ("", "-journal", "-wal", "-shm"):
-            if os.path.exists(target + suffix):
-                os.replace(target + suffix, f"{target}.before-restore-{stamp}{suffix}")
-                kept = kept or f"{target}.before-restore-{stamp}"
-        os.replace(tmp, target)
-    except BaseException:
-        for leftover in (tmp, tmp + "-journal"):
-            try:
-                os.remove(leftover)
-            except FileNotFoundError:
-                pass
-        raise
-    files = mirror_files(src=os.path.join(folder, "files"), dest=db.files_dir(), names=_referenced(target))
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=TMP, suffix=".db")
+        os.close(fd)
+        kept = None
+        try:
+            with closing(_open_ro(path)) as src, closing(sqlite3.connect(tmp)) as out:
+                src.backup(out)
+            os.chmod(tmp, 0o644)
+            stamp = (now or datetime.datetime.now()).strftime("%Y%m%d-%H%M%S")
+            # A journal left by a crash goes with its database: beside the restored one, SQLite
+            # would take it for that one's and "roll it back" into it.
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                if os.path.exists(target + suffix):
+                    os.replace(target + suffix, f"{target}.before-restore-{stamp}{suffix}")
+                    kept = kept or f"{target}.before-restore-{stamp}"
+            os.replace(tmp, target)
+        except BaseException:
+            for leftover in (tmp, tmp + "-journal"):
+                try:
+                    os.remove(leftover)
+                except FileNotFoundError:
+                    pass
+            raise
+        files = mirror_files(src=os.path.join(folder, "files"), dest=db.files_dir(), names=_referenced(target))
+    finally:
+        if lock:
+            lock.close()
     log.info("Restored %s (%s) to %s%s. %s copied back%s.", name, _count(documents or 0, "document"), target,
              f"; the database it replaced is kept as {kept}" if kept else "", _count(files["copied"], "original"),
              f"; {files['missing']} the library uses are in neither the backup nor the library: their documents"
@@ -374,7 +396,8 @@ def main(argv=None):
     try:
         if args.restore:
             restore(args.restore)
-            print("Start the app again: docker compose start chatbot")
+            # restart, not start: it also starts it afresh if a version from before the lock was left running
+            print("Start the app again: docker compose restart chatbot")
             return 0
         if args.now:
             return 1 if run_once(keep=keep)["files"]["failed"] else 0

@@ -256,13 +256,33 @@ Everything below is committed (as of 2026-11-12); nothing after 894b984 has been
   from 97 MB (14 documents, 588 chunks, integrity ok, the live file untouched). The PowerShell scripts parse, their dry
   runs and refusals were checked under a non-admin token, and the task has not been installed. Also: the stale "To
   do" and "Left on the machine" notes above are brought up to date.
+- 2026-11-12: Review fixes for items 13 and 14. A restore no longer swaps the database under a running app (which
+  kept the old library's vectors, schema and job ids in memory, so a question could get a deleted document's
+  passage): gunicorn's master holds a shared flock on `/data/app.lock` while the app runs, the restore takes it
+  exclusively or refuses with "stop it first", and an app starting meanwhile waits for it; it then says
+  `docker compose restart chatbot`, which is right even if an app without the lock was left running. The `restore`
+  service is built at every run (`pull_policy: build`): `up --build` skips it, so it kept the code of its first
+  build. The install script took over an existing `C:\ProgramData\Chatbot` only in name: an earlier owner or
+  explicit permissions survived, so a standard user who made the folder first could change the script the task
+  runs with full rights. Now Administrators take ownership (`takeown /A`), its permissions are reset to the three
+  entries, a script already there is replaced by a new file, a link in its place is refused, and the install stops
+  unless owner and permissions check out. portproxy.ps1 logged "Started" and exited 0 when IP Helper or the
+  keepalive failed to start; it now logs the failure, carries on, and exits 1 (a keepalive that ends at once counts
+  too). README: copy backups to another disk, not into the repo (`backups/` is now git-ignored); a mistyped
+  `BACKUP_HOUR` makes Docker restart the service, it doesn't stop it. "To do" notes that a deploy naming only
+  `chatbot` would never create `backup`. 208 tests pass, also in the CI mimic. Staging: a
+  restore refused while staging ran (nothing moved) and worked once it stopped; staging waited 12 s for a held lock;
+  after a code change `run restore` used the new code. The PowerShell checks ran on scratch folders and with mocked
+  service and process starts (nothing on the machine changed); the task is still not installed.
 
 ## To do
 
 - Deploy the enhancement plan to the live container, which still runs 894b984: `docker compose up -d --build`
-  inside WSL `vostok` (this also starts the new `backup` service). On its first start the library gains the new
-  tables and columns and its 588 passages are embedded. Afterwards, check from the LAN address that the page,
-  uploads and deletes work (and logging in, if `APP_PASSWORD` is set).
+  inside WSL `vostok` (this also starts the new `backup` service; naming services, as in `up -d --build chatbot`,
+  would leave it out: name `chatbot backup` then). On its first start the library gains the new tables and
+  columns and its 588 passages are embedded. Afterwards, check from the LAN address that the page, uploads and
+  deletes work (and logging in, if `APP_PASSWORD` is set), and that `docker compose ps backup` shows it up and
+  `docker compose logs backup` its first snapshot.
 - Install the port proxy task once, from an elevated PowerShell (README, "Reach it from the LAN").
 - Try a real scanned manual through the live app. Scanned test PDFs have been read end to end on staging, by
   minicpm-v4.6 and by Claude Haiku (see the log).

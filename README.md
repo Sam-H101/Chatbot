@@ -98,7 +98,7 @@ The database is a single file, `/data/metabase.db`, kept in the `metabase` Docke
 | `APP_PASSWORD` | (none: no login) | The shared password everyone is asked for (see Login). Put it in `.env` beside `docker-compose.yml`, which git ignores, in single quotes (`APP_PASSWORD='…'`), so compose keeps a `$` or ` #` in it as typed; compose passes it through. The log says at start whether a login is on |
 | `SECRET_KEY` | a random key kept in `secret_key` next to `DB_PATH` (`/data/secret_key`, mode 600) | Signs the session cookie; only used with `APP_PASSWORD`. Changing it logs everyone out |
 | `SESSION_DAYS` | `30` | Days a login lasts, counted from logging in |
-| `BACKUP_HOUR` | `3` | Hour of the nightly backup (0-23), in the backup service's time: UTC unless `TZ` is set. A mistyped value stops the service with a message in its log |
+| `BACKUP_HOUR` | `3` | Hour of the nightly backup (0-23), in the backup service's time: UTC unless `TZ` is set. With a mistyped value the service ends with a message in its log (`docker compose logs backup`), and Docker keeps restarting it until the value is fixed |
 | `BACKUP_KEEP` | `14` | Database snapshots kept; older ones are deleted. Originals are never deleted from the backup |
 | `BACKUP_DIR` | `/backups` | Where the backup service writes (the `backups` volume) |
 | `TZ` | (none: UTC) | Time zone of the backup service, say `America/New_York`: it sets when `BACKUP_HOUR` comes and the time in snapshot names |
@@ -117,10 +117,10 @@ The service mounts the library read-only and opens the database read-only (`mode
 ```bash
 docker compose exec backup python -m app.backup --now    # take one now
 docker compose exec backup python -m app.backup --list   # list the snapshots and originals
-docker compose cp backup:/backups/. ./backups            # copy them out of Docker, to keep elsewhere
+docker compose cp backup:/backups/. /mnt/d/chatbot-backups   # copy them out of Docker, to another disk
 ```
 
-The `backups` volume is on the same disk as the library (inside WSL's virtual disk on Windows), so it guards against mistakes and a damaged database, not against losing the disk. Copy it somewhere else now and then.
+The `backups` volume is on the same disk as the library (inside WSL's virtual disk on Windows), so it guards against mistakes and a damaged database, not against losing the disk. Copy it somewhere else now and then: another disk (`/mnt/d/...` is the D: drive from WSL), or a USB drive. Not into the repo folder: the copy holds every document's text, the conversations and the original files, and a `git add` could take them to GitHub (`.gitignore` covers a `backups/` folder there, but no other name).
 
 To restore a snapshot:
 
@@ -128,10 +128,10 @@ To restore a snapshot:
 docker compose stop chatbot                                 # the app keeps some of the library's state in memory
 docker compose run --rm restore                             # lists the snapshots
 docker compose run --rm restore metabase-20261112-0300.db   # or: latest
-docker compose start chatbot
+docker compose restart chatbot
 ```
 
-The `restore` service isn't started by `up`; `docker compose run` starts it on its own. It checks the snapshot, puts it back as `/data/metabase.db`, keeps the database it replaces beside it as `metabase.db.before-restore-<time>` (delete that once you're happy), and copies back the originals the snapshot's documents use that `/data/files` lacks. Anything saved after the snapshot was taken (uploads, conversations, usage) is not in it. A snapshot from an older version of the app is brought up to date when the app starts, like any older library. The login's `/data/secret_key` is not backed up: restored onto a new machine, everyone logs in again.
+The `restore` service isn't started by `up`; `docker compose run` builds it from the current code and starts it on its own. It refuses while the app is running: the app holds a lock on `/data/app.lock` for as long as it runs, and waits for a restore under way to finish before it starts. It checks the snapshot, puts it back as `/data/metabase.db`, keeps the database it replaces beside it as `metabase.db.before-restore-<time>` (delete that once you're happy), and copies back the originals the snapshot's documents use that `/data/files` lacks. Anything saved after the snapshot was taken (uploads, conversations, usage) is not in it. A snapshot from an older version of the app is brought up to date when the app starts, like any older library. The login's `/data/secret_key` is not backed up: restored onto a new machine, everyone logs in again.
 
 ## Reach it from the LAN (Windows with WSL)
 
@@ -142,7 +142,7 @@ When Docker runs inside WSL, other machines reach the app through a Windows port
 3. adds or updates the port proxy rule for `0.0.0.0:8000` if it points anywhere else;
 4. makes sure the IP Helper service, which carries the port proxy, is running, and that the firewall rule exists (it adds one for TCP 8000 if there is none, and leaves a disabled one disabled).
 
-Run again, it changes nothing. It logs what it did to `C:\ProgramData\Chatbot\portproxy.log`. Other port proxy rules are left alone.
+Run again, it changes nothing. It logs what it did to `C:\ProgramData\Chatbot\portproxy.log`. A step that fails (IP Helper won't start, say, or the keepalive ends at once) is logged, the other steps still run, and the script ends with exit code 1, which the task shows as its last result. Other port proxy rules are left alone.
 
 One-time setup, from an **elevated** PowerShell (Run as administrator) in the repo folder:
 
@@ -150,7 +150,7 @@ One-time setup, from an **elevated** PowerShell (Run as administrator) in the re
 powershell -ExecutionPolicy Bypass -File .\scripts\install-portproxy-task.ps1
 ```
 
-This copies `portproxy.ps1` to `C:\ProgramData\Chatbot`, a folder only administrators can change (the task runs the script with full rights), and registers the scheduled task **Chatbot portproxy**. The task runs it as you, with highest privileges, at startup (30 seconds after boot, whether anyone is logged on or not, with no password stored) and at logon. The install then runs the task once and shows its log. Run the install again after changing `portproxy.ps1`.
+This copies `portproxy.ps1` to `C:\ProgramData\Chatbot`, a folder only administrators can change (the task runs the script with full rights; any user may create folders in `C:\ProgramData`, so if this one is there already, Administrators take it over and its permissions are reset, and the install stops if it can't make sure of that), and registers the scheduled task **Chatbot portproxy**. The task runs it as you, with highest privileges, at startup (30 seconds after boot, whether anyone is logged on or not, with no password stored) and at logon. The install then runs the task once and shows its log. Run the install again after changing `portproxy.ps1`.
 
 - To see what it would do, without changing anything: `powershell -ExecutionPolicy Bypass -File .\scripts\portproxy.ps1 -DryRun` (or `-WhatIf`). This works without elevation; without elevation and without `-DryRun`, the script refuses to run. Reading WSL's address starts WSL if it isn't running, even in a dry run.
 - `wsl --shutdown` gives WSL a new address: afterwards, run `Start-ScheduledTask -TaskName 'Chatbot portproxy'`, or log off and on again.

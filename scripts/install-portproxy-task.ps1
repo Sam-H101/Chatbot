@@ -4,8 +4,10 @@
 
 .DESCRIPTION
     Copies portproxy.ps1 into %ProgramData%\Chatbot, where only administrators can change it (the
-    task runs it with full rights, so it must not run a copy anyone can edit), and registers the
-    task "Chatbot portproxy" to run that copy as you, with highest privileges:
+    task runs it with full rights, so it must not run a copy anyone can edit: if someone else made
+    that folder first, Administrators take it over and its permissions are reset, and the install
+    stops if that didn't work), and registers the task "Chatbot portproxy" to run that copy as
+    you, with highest privileges:
       - at startup (30 s after boot), whether you are logged on or not (no password is stored), and
       - at logon.
     Each run starts WSL if it isn't running and keeps it running (the Docker containers start
@@ -47,6 +49,46 @@ $target = Join-Path $dir 'portproxy.ps1'
 $log = Join-Path $dir 'portproxy.log'
 $source = Join-Path $PSScriptRoot 'portproxy.ps1'
 
+function Install-Copy([string]$Source, [string]$Dir, [string]$Target) {
+    # Copies $Source to $Target in a folder only Administrators and SYSTEM can change. Users may create
+    # folders in ProgramData, and whoever made this one (or a file in it) first would own it and could
+    # change it whatever its permissions say; so Administrators take it over first. SIDs, not names, so
+    # it works in any Windows language: Administrators S-1-5-32-544, SYSTEM S-1-5-18, Users S-1-5-32-545.
+    if ((Test-Path -LiteralPath $Dir) -and
+        ((Get-Item -LiteralPath $Dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "$Dir is a link, not a folder: delete it, then run this again"
+    }
+    New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+    & takeown.exe /F $Dir /A | Out-Null  # takeown can take it from anyone; icacls /setowner can't
+    if ($LASTEXITCODE -ne 0) { throw "takeown failed on $Dir (exit code $LASTEXITCODE)" }
+    & icacls.exe $Dir /reset /Q | Out-Null  # drops permissions set on it before
+    & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $Dir (exit code $LASTEXITCODE)" }
+    # A new file, which takes the folder's permissions (one already there keeps its own), owned by
+    # Administrators whatever this account's default owner for new files is.
+    if (Test-Path -LiteralPath $Target) {
+        & takeown.exe /F $Target /A | Out-Null  # its permissions may keep administrators from deleting it
+        & icacls.exe $Target /reset /Q | Out-Null
+        Remove-Item -LiteralPath $Target -Force
+    }
+    Copy-Item -LiteralPath $Source -Destination $Target
+    & takeown.exe /F $Target /A | Out-Null
+    # Check it took: no one else may own them, or have any right to change them.
+    $admins = 'S-1-5-32-544', 'S-1-5-18'
+    $write = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+    foreach ($path in $Dir, $Target) {
+        $acl = Get-Acl -LiteralPath $path
+        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        $others = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {
+                "$($_.AccessControlType)" -eq 'Allow' -and ([int64]$_.FileSystemRights -band $write) -and
+                $admins -notcontains $_.IdentityReference.Value } | ForEach-Object { $_.IdentityReference.Value })
+        if ($admins -notcontains $owner -or $others) {
+            throw ("$path is not locked down (owner $owner" + $(if ($others) { "; may be changed by $($others -join ', ')" }) +
+                '): the task was not registered')
+        }
+    }
+}
+
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $elevated = (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -82,14 +124,9 @@ if (-not (Test-Path $source)) {
 }
 
 # 1. The copy the task runs, in a folder only administrators (and SYSTEM) can change.
-if ($PSCmdlet.ShouldProcess("$dir (administrators may change it, users may read it)", 'Create and restrict')) {
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    # SIDs, not names, so it works in any Windows language: Administrators, SYSTEM, Users.
-    & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $dir (exit code $LASTEXITCODE)" }
-}
-if ($PSCmdlet.ShouldProcess("$source -> $target", 'Copy')) {
-    Copy-Item -Path $source -Destination $target -Force
+if ($PSCmdlet.ShouldProcess("$source -> $target (in $dir, owned by Administrators, which users may only read)",
+        'Restrict the folder and copy')) {
+    Install-Copy -Source $source -Dir $dir -Target $target
 }
 
 # 2. The task.
