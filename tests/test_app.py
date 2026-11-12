@@ -502,6 +502,9 @@ def local(client, monkeypatch):
 
     def fake_chat(model, messages, **kw):
         calls.append({"model": model, "messages": messages, **kw})
+        if "format" in kw and "topics" in kw["format"]["properties"]:  # notes on a section of a long document
+            return {"message": {"content": '{"topics": ["deposit"], "specifications": ["1800 euros"], "procedures": [],'
+                                           ' "warnings": []}'}, "prompt_eval_count": 500, "eval_count": 30}
         if "format" in kw:
             return {"message": {"content": '{"title": "Scan", "doc_type": "notes", '
                                            '"summary": "s", "keywords": ["k"]}'}, "prompt_eval_count": 900, "eval_count": 60}
@@ -685,7 +688,7 @@ def test_reread_replaces_a_document_in_place(local, monkeypatch):
     doc_id, before = job["doc_id"], local.get("/api/documents").json[0]
     assert before["title"] == "Scan" and before["model"] == "qwen3.5:9b"
 
-    def analyze(c, name, text, model=None, on_usage=None):
+    def analyze(c, name, text, model=None, on_usage=None, **hooks):
         on_usage("analyze", "claude", model, {"input": 100, "output": 10})
         return {"title": "Flat lease", "doc_type": "lease", "summary": "Re-read.", "keywords": ["deposit"]}, "full"
 
@@ -728,7 +731,7 @@ def test_a_reread_whose_analysis_fails_leaves_the_document_as_it_was(local, monk
     doc = lambda: {k: local.get("/api/documents").json[0][k] for k in fields}  # noqa: E731
     before, text = doc(), doc_text(doc_id)
 
-    def refused(c, name, text, model=None, on_usage=None):
+    def refused(c, name, text, model=None, on_usage=None, **hooks):
         raise llm.Refused("Claude declined this request")
 
     monkeypatch.setattr(llm, "analyze", refused)
@@ -1044,9 +1047,21 @@ CREATE TABLE usage (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL DEFAULT (da
     output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0, doc_id INTEGER);
 """
+# The schema of commit dc8b86a (jobs, usage.job_id), before unit checks were stored.
+SCHEMA_DC8B86A_EXTRA = """
+ALTER TABLE usage ADD COLUMN job_id INTEGER;
+CREATE TABLE jobs (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+    filename TEXT NOT NULL, sha256 TEXT NOT NULL, file_path TEXT NOT NULL, file_size INTEGER, mime TEXT,
+    model TEXT NOT NULL, options TEXT NOT NULL DEFAULT '{}', progress INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL DEFAULT '', error TEXT, estimate TEXT, result TEXT,
+    partial TEXT, doc_id INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')));
+"""
+OLD_SCHEMAS = {"894b984": SCHEMA_894B984, "cd8c125": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA,
+               "dc8b86a": SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA + SCHEMA_DC8B86A_EXTRA}
 
 
-@pytest.mark.parametrize("schema", [SCHEMA_894B984, SCHEMA_894B984 + SCHEMA_CD8C125_EXTRA], ids=["894b984", "cd8c125"])
+@pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())
 def test_library_from_before_kept_files_still_works(client, tmp_path, monkeypatch, schema):
     import sqlite3
     from app import db
@@ -1068,8 +1083,55 @@ def test_library_from_before_kept_files_still_works(client, tmp_path, monkeypatc
     job = add(client, "manual.pdf.txt", b"Change the hydraulic oil every 400 hours.")   # never a duplicate
     assert job["status"] == "done"
     assert client.get("/api/usage").json["total"]["calls"] == 1                         # the chat above
+    assert client.get("/api/documents/1/units").json["findings"] == []                   # checked when asked
     assert client.delete("/api/documents/1").status_code == 204
     assert [d["filename"] for d in client.get("/api/documents").json] == ["manual.pdf.txt"]
+
+
+@pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())
+def test_documents_from_before_unit_checks_get_one(client, tmp_path, monkeypatch, schema):
+    """The live library's documents have no unit check: the worker runs it once at start,
+    from their stored chunks (no model), and the list of one is worked out when asked."""
+    import sqlite3
+    import time
+    from app import db, jobs
+    path = tmp_path / "live.db"
+    con = sqlite3.connect(path)
+    con.executescript(schema)
+    kioti = "| Capacity | Transmission fluid | 38.0 ℓ |\n|---|---|---|\n| | | 40.1 U.S.gal. |"
+    con.execute("INSERT INTO documents (id, filename, char_count, title) VALUES (2, 'Chapter 6.pdf', ?, 'KIOTI')",
+                (len(kioti),))
+    con.execute("INSERT INTO chunks (id, doc_id, idx, text) VALUES (2, 2, 0, ?)", (kioti,))
+    con.execute("INSERT INTO chunks_fts (rowid, text) VALUES (2, ?)", (kioti,))
+    con.commit()
+    con.close()
+    monkeypatch.setattr(db, "DB_PATH", str(path))
+    assert [d["unit_fixes"] for d in client.get("/api/documents").json] == [None, None]   # not checked yet
+    r = client.get("/api/documents/2/units").json                                        # worked out when asked
+    assert r["has_file"] is False and r["pdf"] is False and [(f["page"], f["kind"], f["printed"]) for f in r["findings"]] == [
+        (None, "quarts-printed-as-gallons", "38.0 ℓ 40.1 U.S.gal.")]                    # no page breaks: no page
+    assert [d["unit_fixes"] for d in client.get("/api/documents").json] == [1, None]
+    monkeypatch.setattr(jobs, "BACKGROUND", True)                                         # the worker checks the rest
+    monkeypatch.setattr(jobs, "_thread", None)
+    try:
+        jobs.start()
+        for _ in range(100):
+            if client.get("/api/documents").json[1]["unit_fixes"] is not None:
+                break
+            time.sleep(0.05)
+    finally:
+        jobs.stop()
+        monkeypatch.setattr(jobs, "BACKGROUND", False)                                    # requests below mustn't restart it
+    assert [d["unit_fixes"] for d in client.get("/api/documents").json] == [1, 0]
+    assert jobs.check_units() == 0
+    client.post("/api/chat", json={"question": "transmission fluid capacity"}, headers=H)
+    assert "10.0 U.S.gal. (40.1 U.S. qt)" in client.seen["msg"]                          # answers corrected as listed
+    # A check made by another version of units.py is made again, so the list keeps matching the fix.
+    with db.connect() as con:
+        con.execute("""UPDATE documents SET unit_findings='{"version": "older", "findings": []}'""")
+    assert client.get("/api/documents/2/units").json["findings"][0]["printed"] == "38.0 ℓ 40.1 U.S.gal."
+    assert jobs.check_units() == 1 and jobs.check_units() == 0                             # the other one, at start
+    assert [d["unit_fixes"] for d in client.get("/api/documents").json] == [1, 0]
 
 
 def test_upload_keeps_the_original_file(client, tmp_path):
@@ -1504,29 +1566,257 @@ def test_ollama_gets_the_instructions_too(local):
 
 
 def test_analysis_limits_differ_per_backend(monkeypatch):
-    """Claude reads up to 500K characters for metadata; local models keep 40K."""
+    """One analysis call carries up to 500K characters to Claude, 40K to a local model.
+    A local model reads a 100K-character text in three sections instead of its start."""
     from types import SimpleNamespace
-    from app import llm, ollama
-    assert llm.ANALYZE_CHARS == 500_000 and ollama.ANALYZE_CHARS == 40_000
-    text = "word " * 20_000  # 100,000 characters
-    sent = {}
+    from app import llm, ollama, sections
+    assert llm.ANALYZE_CHARS == 500_000 and ollama.ANALYZE_CHARS == 40_000 and ollama.analyze_chars() == 40_000
+    text = "word " * 20_000  # 100,000 characters, one paragraph
+    sent = {"claude": [], "local": []}
 
     def create(**kw):
-        sent["claude"] = kw["messages"][0]["content"]
+        sent["claude"].append(kw["messages"][0]["content"])
         return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(
             type="text", text='{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}')])
 
     fake = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=create)))
     assert llm.analyze(fake, "big.txt", text, "claude-haiku-5-5")[1] == "full"
-    assert text in sent["claude"]
+    assert len(sent["claude"]) == 1 and text in sent["claude"][0]                       # one call, as before
 
     def local_chat(model, messages, **kw):
-        sent["local"] = messages[0]["content"]
-        return {"message": {"content": '{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}'}}
+        sent["local"].append((messages, kw))
+        notes = "topics" in kw["format"]["properties"]
+        return {"message": {"content": '{"topics": ["words"], "specifications": [], "procedures": [], "warnings": []}'
+                            if notes else '{"title": "t", "doc_type": "d", "summary": "s", "keywords": []}'}}
 
     monkeypatch.setattr(ollama, "_chat", local_chat)
-    assert ollama.analyze(None, "big.txt", text)[1] == "partial"
-    assert text[:40_000] in sent["local"] and text[:40_001] not in sent["local"]
+    assert ollama.analyze(None, "big.txt", text) == ({"title": "t", "doc_type": "d", "summary": "s", "keywords": []}, "full")
+    *parts, final = sent["local"]
+    assert [kw["format"] for _, kw in parts] == [sections.NOTES_SCHEMA] * 3 and final[1]["format"] == sections.META_SCHEMA
+    bodies = [re.search(r"<part>\n(.*)\n</part>", m[0]["content"], re.S).group(1) for m, _ in parts]
+    assert all(len(b) <= 40_000 for b in bodies) and " ".join(bodies).split() == text.split()   # every word, once
+    assert all(ollama.fits(m, ollama.REPLY_TOKENS) and kw["num_predict"] == ollama.REPLY_TOKENS for m, kw in sent["local"])
+    assert "## Part 3 of 3\nKey topics:\n- words" in final[0][0]["content"]
+
+
+def long_pdf(local, monkeypatch, pages=6, chars=1000, notes=None, ctx=None, reps=30):
+    """A `pages`-page PDF whose text layer says which page each is, and a local model that
+    analyzes `chars` characters per call: each page is a section of its own. `notes(n, kw)`
+    answers a section's notes call (n = its page; None: the fixture's answer). Records
+    (kind, stage, progress, total, messages, options) at each analysis call, the first
+    four of the job running then."""
+    import json
+    from app import db, extract, ollama
+    monkeypatch.setattr(ollama, "ANALYZE_CHARS", chars)
+    if ctx:
+        monkeypatch.setattr(ollama, "NUM_CTX", ctx)
+    texts = [f"Page {n} is about pump number {n}. " + "The pump needs oil. " * reps for n in range(1, pages + 1)]
+    monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [(t, None) for t in texts])
+    if not hasattr(local, "base_chat"):  # the fixture's fake, not an earlier long_pdf's
+        local.base_chat = ollama._chat
+    fake, seen = local.base_chat, []
+
+    def chat(model, messages, **kw):
+        if "format" in kw:
+            with db.connect() as con:
+                row = con.execute("SELECT stage, progress, total FROM jobs WHERE status='running'").fetchone()
+            body = messages[0]["content"]
+            notes_call = "topics" in kw["format"]["properties"]
+            kind = ("merge" if "Merge them" in body else "notes") if notes_call else "meta"
+            seen.append((kind, *(tuple(row) if row else (None, None, None)), messages, kw))
+            n = re.search(r"This is part \d+ of \d+ \(page (\d+)\)", body)
+            if notes and n:
+                got = notes(int(n.group(1)), kw)
+                if got is not None:
+                    return {"message": {"content": got if isinstance(got, str) else json.dumps(got)},
+                            "prompt_eval_count": 400, "eval_count": 30}
+        return fake(model, messages, **kw)
+
+    monkeypatch.setattr(ollama, "_chat", chat)
+    return blank_pdf(pages), seen
+
+
+def test_a_long_document_is_analyzed_section_by_section(local, monkeypatch):
+    """Text over one call's limit: the same model takes notes on each section (a page here),
+    then combines them into the metadata. The job shows each step, every call fits the
+    local context, and each call is in the usage log."""
+    from app import ollama
+    pdf, seen = long_pdf(local, monkeypatch, notes=lambda n, kw: {
+        "topics": [f"pump {n}"], "specifications": [f"oil {n} L"], "procedures": [], "warnings": []})
+    job = add(local, "manual.pdf", pdf, model="ollama:qwen3.5:9b")
+    assert job["status"] == "done" and job["result"]["analysis"] == "full" and job["result"]["title"] == "Scan"
+    assert [s[0] for s in seen] == ["notes"] * 6 + ["meta"]
+    assert [s[1:4] for s in seen[:2]] == [("Analyzing section 1 of 6 with qwen3.5:9b", 0, 6),
+                                          ("Analyzing section 2 of 6 with qwen3.5:9b", 1, 6)]
+    assert seen[-1][1:4] == ("Combining the notes of 6 sections with qwen3.5:9b", 6, 6)
+    third = seen[2][4][0]["content"]
+    assert "This is part 3 of 6 (page 3)" in third and "Page 3 is about" in third and "Page 4" not in third
+    final = seen[-1][4][0]["content"]
+    assert "read in 6 parts" in final and "Only" not in final
+    assert "## Part 1 of 6 (page 1)\nKey topics:\n- pump 1\nSpecifications and values:\n- oil 1 L" in final
+    assert all(ollama.fits(s[4], ollama.REPLY_TOKENS) for s in seen)
+    assert [r["kind"] for r in _usage_rows() if r["kind"].startswith("analyze")] == ["analyze-section"] * 6 + ["analyze"]
+    assert all(r["doc_id"] == job["doc_id"] for r in _usage_rows())
+    assert local.get("/api/documents").json[0]["analysis"] == "full"
+
+
+def test_sections_past_the_cap_are_sampled_evenly(local, monkeypatch):
+    from app import sections
+    monkeypatch.setattr(sections, "MAX_SECTIONS", 3)
+    pdf, seen = long_pdf(local, monkeypatch)
+    job = add(local, "manual.pdf", pdf, model="ollama:qwen3.5:9b")
+    assert job["result"]["analysis"] == "partial: 3 of 6 sections, 50% of the text"
+    read = [re.search(r"\(page (\d+)\)", s[4][0]["content"]).group(1) for s in seen if s[0] == "notes"]
+    assert read == ["1", "3", "6"]                                                       # first, middle, last
+    assert seen[0][1] == "Analyzing section 1 of 3 (a sample of 6) with qwen3.5:9b"
+    assert "Only 3 of its 6 parts were read" in seen[-1][4][0]["content"]
+    assert local.get("/api/documents").json[0]["analysis"] == "partial: 3 of 6 sections, 50% of the text"
+    assert sections.pick(61, 24)[:3] == [0, 3, 5] and sections.pick(61, 24)[-1] == 60 and len(set(sections.pick(61, 24))) == 24
+    assert sections.pick(5, 24) == [0, 1, 2, 3, 4] and sections.pick(9, 1) == [0]
+
+
+def test_notes_too_long_for_one_call_are_merged_first(local, monkeypatch):
+    """A small context: the sections' notes don't fit the final call together, so
+    neighbouring notes are merged first, as many to a call as fit."""
+    from app import ollama
+    long_note = {"topics": ["x" * 400], "specifications": [], "procedures": [], "warnings": []}
+    pdf, seen = long_pdf(local, monkeypatch, chars=40_000, ctx=3000, reps=43, notes=lambda n, kw: long_note)
+    assert ollama.analyze_chars() == 1500                                                 # (3000 - 2000) * 3 - 1500
+    job = add(local, "manual.pdf", pdf, model="ollama:qwen3.5:9b")
+    assert job["status"] == "done" and job["result"]["analysis"] == "full"
+    kinds = [s[0] for s in seen]
+    assert kinds.count("notes") == 6 and kinds.count("merge") == 2 and kinds[-1] == "meta"
+    final = seen[-1][4][0]["content"]
+    assert "## Parts 1-3 of 6 (pages 1-3)" in final and "## Parts 4-6 of 6 (pages 4-6)" in final
+    assert all(ollama.fits(s[4], ollama.REPLY_TOKENS) for s in seen)                   # every call within the context
+    assert [r["kind"] for r in _usage_rows()].count("analyze-merge") == 2
+
+
+def test_a_retry_keeps_the_notes_of_sections_already_analyzed(local, monkeypatch):
+    from app import jobs, ollama
+    broken = [True]
+
+    def notes(n, kw):
+        if n == 3 and broken[0]:
+            raise ollama.OllamaError("qwen3.5:9b: out of memory")
+        return None  # the fixture's notes
+
+    pdf, seen = long_pdf(local, monkeypatch, notes=notes)
+    r = upload(local, "manual.pdf", pdf, model="ollama:qwen3.5:9b")
+    job = job_of(local, r)
+    assert job["status"] == "failed" and "out of memory" in job["error"]
+    assert job["stage"] == "Failed" and local.get("/api/documents").json == []
+    broken[0] = False
+    local.post(f"/api/jobs/{job['id']}/retry")
+    jobs.drain()
+    assert job_of(local, r)["status"] == "done"
+    pages = [re.search(r"\(page (\d+)\)", s[4][0]["content"]).group(1) for s in seen if s[0] == "notes"]
+    assert pages == ["1", "2", "3", "3", "4", "5", "6"]                                  # 1 and 2 not asked again
+
+
+def test_a_section_whose_notes_are_unusable_is_left_out(local, monkeypatch):
+    from app import jobs
+    pdf, seen = long_pdf(local, monkeypatch, notes=lambda n, kw: '{"topics": ["cut off' if n == 2 else None)
+    job = add(local, "manual.pdf", pdf, model="ollama:qwen3.5:9b")
+    assert job["status"] == "done" and job["result"]["analysis"] == "partial: 5 of 6 sections, 83% of the text"
+    assert "Part 2 of 6" not in seen[-1][4][0]["content"]
+    # No section usable: the analysis fails, and the new upload is still added and searchable.
+    pdf, seen = long_pdf(local, monkeypatch, notes=lambda n, kw: "not json")
+    job = add(local, "other.pdf", pdf, model="ollama:qwen3.5:9b", on_duplicate="keep")
+    assert job["status"] == "done" and job["result"]["analysis"].startswith("none: Expecting value")
+    assert local.get("/api/search?q=pump").json
+    # A cancel between sections stops the job.
+    ids = []
+
+    def cancel_at_3(n, kw):
+        if n == 3:
+            local.post(f"/api/jobs/{ids[0]}/cancel")
+        return None
+
+    pdf, seen = long_pdf(local, monkeypatch, notes=cancel_at_3)
+    r = post(local, "third.pdf", pdf, model="ollama:qwen3.5:9b", on_duplicate="keep")
+    ids.append(r.json["job"]["id"])
+    jobs.drain()
+    assert job_of(local, r)["status"] == "cancelled" and len([s for s in seen if s[0] == "notes"]) == 3
+    assert len(local.get("/api/documents").json) == 2
+
+
+def test_claude_analyzes_a_long_document_section_by_section(monkeypatch):
+    from types import SimpleNamespace as NS
+    from app import llm, sections
+    monkeypatch.setattr(llm, "ANALYZE_CHARS", 1000)
+    calls = []
+
+    def create(**kw):
+        calls.append(kw)
+        schema = kw["output_config"]["format"]["schema"]
+        body = kw["messages"][0]["content"]
+        if schema is sections.NOTES_SCHEMA and "part 2 of" in body:
+            return NS(stop_reason="refusal", content=[], usage=None)
+        text = ('{"topics": ["t"], "specifications": [], "procedures": [], "warnings": []}' if schema is sections.NOTES_SCHEMA
+                else '{"title": "Manual", "doc_type": "manual", "summary": "s", "keywords": ["pump"]}')
+        return NS(stop_reason="end_turn", content=[NS(type="text", text=text)], usage=NS(
+            input_tokens=300, output_tokens=40, cache_read_input_tokens=0, cache_creation_input_tokens=0))
+
+    seen, steps = [], []
+    text = "\f".join(f"Page {n}. " + "Torque the bolts. " * 40 for n in range(1, 5))
+    meta, analysis = llm.analyze(NS(beta=NS(messages=NS(create=create))), "m.pdf", text, "claude-haiku-5-5",
+                                 on_usage=lambda *c: seen.append(c[0]), on_progress=lambda *s: steps.append(s))
+    assert meta["title"] == "Manual" and analysis == "partial: 3 of 4 sections, 75% of the text"   # part 2 refused
+    assert [c["max_tokens"] for c in calls] == [8000] * 4 + [2000]
+    assert seen == ["analyze-section", "analyze-section", "analyze-section", "analyze"]   # no usage on the refusal
+    assert steps[0] == ("Analyzing section 1 of 4", 0, 4) and steps[-1] == ("Combining the notes of 3 sections", 4, 4)
+
+
+def test_estimate_counts_one_call_per_section(client, monkeypatch):
+    from app import jobs, llm, sections
+    monkeypatch.setattr(llm, "ANALYZE_CHARS", 1000)
+    est = jobs.estimate("a.txt", b"x" * 3000, "claude-opus-5-5", False, "scanned")
+    assert est["sections"] == [3, 3]
+    assert est["input_tokens"] == 3 * (3000 // 3 // 4 + 400) + 3 * 1000 + 300 and est["output_tokens"] == 3 * 1000 + 500
+    monkeypatch.setattr(sections, "MAX_SECTIONS", 2)
+    assert jobs.estimate("a.txt", b"x" * 3000, "claude-opus-5-5", False, "scanned")["sections"] == [3, 2]
+    assert jobs.estimate("a.txt", b"x" * 900, "claude-opus-5-5", False, "scanned")["sections"] == [1, 1]
+
+
+def test_split_keeps_pages_whole_and_sections_even():
+    from app.sections import split
+    pages = [f"Page {n}. " + "a" * 290 for n in range(1, 8)]                               # 7 pages of 298 characters
+    parts = split("\f".join(pages), 1000)
+    assert [(a, b) for a, b, _ in parts] == [(1, 2), (3, 5), (6, 7)]                       # not 3 + 3 + 1
+    assert all(len(t) <= 1000 and "\f" not in t for _, _, t in parts)
+    assert "\n\n".join(t for _, _, t in parts) == "\n\n".join(pages)                    # nothing lost or repeated
+    parts = split("One.\n\nTwo " + "b " * 800, 600)                                       # no pages: paragraphs, then cuts
+    assert all(a is None and len(t) <= 600 for a, _, t in parts) and len(parts) == 3
+    assert split("\f \f", 100) == []
+
+
+def test_unit_misprints_are_listed_at_upload(local, monkeypatch):
+    """The unit check runs on the stored chunks, as the excerpts fix does, so the list is
+    what answers are corrected for. PDF findings carry their page."""
+    from app import extract, jobs
+    job = add(local, "spec.txt", "Transmission fluid 38.0 ℓ / 40.1 U.S.gal\n\nFuel 50 L (13.2 US gal)".encode())
+    assert job["result"]["unit_fixes"] == 1
+    doc = local.get("/api/documents").json[0]
+    assert doc["unit_fixes"] == 1 and "unit_findings" not in doc
+    r = local.get(f"/api/documents/{doc['id']}/units").json
+    assert r["filename"] == "spec.txt" and r["has_file"] and r["pdf"] is False
+    assert r["findings"] == [{"page": None, "kind": "quarts-printed-as-gallons", "printed": "38.0 ℓ / 40.1 U.S.gal",
+                              "corrected": "38.0 ℓ / 10.0 U.S.gal (40.1 U.S. qt)", "context": "Transmission fluid"}]
+    pages = ["Contents and safety.", "Capacity\nTransmission fluid\n38.0 \n40.1 U.S.gal.\nIMPORTANT"]
+    monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [(t, None) for t in pages])
+    job = add(local, "manual.pdf", blank_pdf(2), model="ollama:qwen3.5:9b")
+    r = local.get(f"/api/documents/{job['doc_id']}/units").json
+    assert r["pdf"] is True and [(f["page"], f["kind"], f["context"]) for f in r["findings"]] == [
+        (2, "quarts-printed-as-gallons", "Capacity Transmission fluid")]
+    local.post("/api/chat", json={"question": "transmission fluid capacity"})
+    assert "10.0 U.S.gal. (40.1 U.S. qt)" in local.calls[-1]["messages"][-1]["content"]  # the fix answers get
+    pages[1] = "Capacity\nTransmission fluid\n38.0 L\n10.0 U.S.gal."                      # a re-read finds none
+    local.post(f"/api/documents/{job['doc_id']}/reread", json={"model": "ollama:qwen3.5:9b"})
+    jobs.drain()
+    assert local.get(f"/api/documents/{job['doc_id']}/units").json["findings"] == []
+    assert [d["unit_fixes"] for d in local.get("/api/documents").json] == [0, 1]
+    assert local.get("/api/documents/9999/units").status_code == 404
 
 
 def test_too_large_upload_gets_a_json_error(client, monkeypatch):

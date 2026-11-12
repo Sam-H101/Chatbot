@@ -35,12 +35,14 @@ CREATE TABLE IF NOT EXISTS documents (
     doc_type    TEXT NOT NULL DEFAULT '',
     summary     TEXT NOT NULL DEFAULT '',
     keywords    TEXT NOT NULL DEFAULT '',
-    analysis    TEXT NOT NULL DEFAULT '',  -- 'full', 'partial' or 'none: <reason>'
+    analysis    TEXT NOT NULL DEFAULT '',  -- 'full', 'partial: <how much>' or 'none: <reason>'
+                                           -- ('partial' alone: the start only, before sections.py)
     model       TEXT NOT NULL DEFAULT '',  -- model that read the document, e.g. 'Claude Opus 5.5'
     sha256      TEXT,                      -- see COLUMNS below; older databases gain these on connect
     file_path   TEXT,
     file_size   INTEGER,
-    mime        TEXT
+    mime        TEXT,
+    unit_findings TEXT                     -- JSON: units.check() of its chunks; NULL until checked
 );
 CREATE TABLE IF NOT EXISTS usage (
     id                 INTEGER PRIMARY KEY,
@@ -69,13 +71,14 @@ CREATE TABLE IF NOT EXISTS jobs (           -- uploads and re-reads, worked thro
     mime       TEXT,
     model      TEXT NOT NULL,               -- the choice: 'auto', 'ollama:<model>' or 'claude:<model>'
     options    TEXT NOT NULL DEFAULT '{}',  -- JSON: on_duplicate, claude_pages, confirmed, ...
-    progress   INTEGER NOT NULL DEFAULT 0,  -- pages read so far
-    total      INTEGER NOT NULL DEFAULT 0,  -- pages to read; 0 while unknown or not a PDF
-    stage      TEXT NOT NULL DEFAULT '',    -- e.g. 'Reading page 40 of 312'
+    progress   INTEGER NOT NULL DEFAULT 0,  -- pages read so far, then sections analyzed (long documents)
+    total      INTEGER NOT NULL DEFAULT 0,  -- pages to read, then sections; 0 while unknown or not a PDF
+    stage      TEXT NOT NULL DEFAULT '',    -- e.g. 'Reading page 40 of 312', 'Analyzing section 3 of 12 with …'
     error      TEXT,
     estimate   TEXT,                        -- JSON: what reading with Claude should cost
     result     TEXT,                        -- JSON, once done: model, title, chunks, ...
-    partial    TEXT,                        -- JSON: pages a model already read, kept for a retry
+    partial    TEXT,                        -- JSON: pages a model already read, and notes on the sections
+                                            -- of a long document, kept for a retry
     doc_id     INTEGER,                     -- the document added (upload) or re-read (reread)
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -111,6 +114,7 @@ COLUMNS = {
     "file_path": "TEXT",   # stored original, relative to files_dir()
     "file_size": "INTEGER",
     "mime": "TEXT",
+    "unit_findings": "TEXT",  # litre/gallon misprints; checked at upload, older documents by jobs.check_units
 }
 USAGE_COLUMNS = {"job_id": "INTEGER"}  # usage rows from before jobs have none
 
@@ -144,9 +148,12 @@ def _migrate(con):
 
 
 def _doc(row):
-    """A documents row for the API: the stored file's location stays internal."""
+    """A documents row for the API: the stored file's location stays internal, and of the
+    unit check only the count shows (None: not checked yet); the list has its own route."""
     d = dict(row)
     d["has_file"] = bool(d.pop("file_path", None))
+    found = d.pop("unit_findings", None)
+    d["unit_fixes"] = None if found is None else len(json.loads(found)["findings"])
     return d
 
 
@@ -243,14 +250,19 @@ def _finish_job(con, job, doc_id):
     con.execute("UPDATE usage SET doc_id=? WHERE job_id=?", (doc_id, job_id))
 
 
+def _units(check):
+    return None if check is None else json.dumps(check, ensure_ascii=False)
+
+
 def add_document(filename, chunks, meta, analysis, model="", data=None, mime=None, sha=None, replace=False,
-                 size=None, job=None):
+                 size=None, job=None, units=None):
     """Index a document and return its id. Its original is `data`, stored here under
     files_dir(), or one already stored under its hash `sha` (by an upload job) with
     `size` bytes; with neither, the document has no kept file. replace=True first
     deletes the documents that hold the same file, in the same transaction. `job` =
     (job id, result dict) marks that job done in the same transaction too, the result
-    gaining doc_id and replaced; if the job was cancelled meanwhile, nothing is added."""
+    gaining doc_id and replaced; if the job was cancelled meanwhile, nothing is added.
+    `units`: its unit check (units.check); None leaves it to jobs.check_units."""
     if data is not None:
         sha, size = sha or file_hash(data), len(data)
     kept = sha is not None and size is not None
@@ -265,9 +277,10 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
                         job[1]["replaced"] = old
                 doc_id = con.execute(
                     "INSERT INTO documents (filename, char_count, title, doc_type, summary, keywords, analysis,"
-                    " model, sha256, file_path, file_size, mime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " model, sha256, file_path, file_size, mime, unit_findings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (filename, sum(len(c) for c in chunks), *_meta(meta), analysis, model,
-                     sha if kept else None, sha if kept else None, size if kept else None, mime if kept else None),
+                     sha if kept else None, sha if kept else None, size if kept else None, mime if kept else None,
+                     _units(units)),
                 ).lastrowid
                 con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords)"
                             " VALUES (?,?,?,?,?,?)", (doc_id, filename, *_meta(meta)))
@@ -283,9 +296,9 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
     return doc_id
 
 
-def replace_document(doc_id, chunks, meta, analysis, model, job=None):
-    """A re-read: new text, chunks, metadata and model for a document, keeping its id,
-    file and upload date. `job` as in add_document."""
+def replace_document(doc_id, chunks, meta, analysis, model, job=None, units=None):
+    """A re-read: new text, chunks, metadata, model and unit check for a document,
+    keeping its id, file and upload date. `job` and `units` as in add_document."""
     with connect() as con:
         row = con.execute("SELECT filename FROM documents WHERE id=?", (doc_id,)).fetchone()
         if not row:
@@ -293,7 +306,8 @@ def replace_document(doc_id, chunks, meta, analysis, model, job=None):
         con.execute("DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE doc_id=?)", (doc_id,))
         con.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
         con.execute("UPDATE documents SET char_count=?, title=?, doc_type=?, summary=?, keywords=?, analysis=?,"
-                    " model=? WHERE id=?", (sum(len(c) for c in chunks), *_meta(meta), analysis, model, doc_id))
+                    " model=?, unit_findings=? WHERE id=?",
+                    (sum(len(c) for c in chunks), *_meta(meta), analysis, model, _units(units), doc_id))
         con.execute("DELETE FROM docs_fts WHERE rowid=?", (doc_id,))
         con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords) VALUES (?,?,?,?,?,?)",
                     (doc_id, row["filename"], *_meta(meta)))
@@ -305,6 +319,45 @@ def replace_document(doc_id, chunks, meta, analysis, model, job=None):
 def list_documents():
     with connect() as con:
         return [_doc(r) for r in con.execute("SELECT * FROM documents ORDER BY id DESC")]
+
+
+# ---- unit checks: litre/gallon misprints found in a document (units.check) ----
+# Stored as {"version", "findings"}; a check made by another version of units.py is stale.
+
+_STALE = "(unit_findings IS NULL OR json_extract(unit_findings, '$.version') IS NOT ?)"
+
+
+def unit_findings(doc_id, version):
+    """A document's unit check: {id, filename, title, has_file, pdf, findings}, findings
+    None while it has no check from this `version`; None if there is no such document."""
+    with connect() as con:
+        row = con.execute(f"SELECT id, filename, title, file_path, mime, unit_findings, {_STALE} AS stale"
+                          " FROM documents WHERE id=?", (version, doc_id)).fetchone()
+    if not row:
+        return None
+    return {"id": row["id"], "filename": row["filename"], "title": row["title"], "has_file": bool(row["file_path"]),
+            "pdf": bool(row["file_path"]) and row["mime"] == "application/pdf",
+            "findings": None if row["stale"] else json.loads(row["unit_findings"])["findings"]}
+
+
+def unchecked_documents(version):
+    """Documents with no unit check from this version: indexed before checks were made,
+    or checked by an earlier units.py."""
+    with connect() as con:
+        return [r[0] for r in con.execute(f"SELECT id FROM documents WHERE {_STALE} ORDER BY id", (version,))]
+
+
+def chunk_texts(doc_id):
+    with connect() as con:
+        return [r[0] for r in con.execute("SELECT text FROM chunks WHERE doc_id=? ORDER BY idx", (doc_id,))]
+
+
+def set_unit_findings(doc_id, check):
+    """Store a unit check, unless the document has one from this version by now (say a
+    re-read just stored its own, for new chunks)."""
+    with connect() as con:
+        con.execute(f"UPDATE documents SET unit_findings=? WHERE id=? AND {_STALE}",
+                    (_units(check), doc_id, check["version"]))
 
 
 def delete_document(doc_id):

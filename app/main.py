@@ -399,6 +399,15 @@ def document_file(doc_id):
     return resp
 
 
+@app.get("/api/documents/<id:doc_id>/units")
+def document_units(doc_id):
+    """The litre/gallon misprints found in a document (units.check): what each printed pair
+    is corrected to before a model reads it. Documents listed by /api/documents give only
+    their count, unit_fixes."""
+    doc = jobs.unit_check(doc_id)
+    return jsonify(doc) if doc else (jsonify(error="Not found"), 404)
+
+
 @app.delete("/api/documents/<id:doc_id>")
 def delete(doc_id):
     deleted = db.delete_document(doc_id)

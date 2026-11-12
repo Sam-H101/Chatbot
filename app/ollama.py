@@ -6,8 +6,8 @@ import os
 import urllib.error
 import urllib.request
 
-from . import extract
-from .llm import META_SCHEMA, SYSTEM
+from . import extract, sections
+from .llm import SYSTEM
 
 URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
@@ -17,10 +17,12 @@ VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "minicpm-v4.6")
 # Context window per request. On an 11 GB card a 9B model leaves room for ~16K;
 # raise it on bigger GPUs. Ollama silently drops the oldest tokens past this.
 NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
-# Characters of a document sent for metadata extraction. 40,000 is about 11-13K tokens,
-# which fits NUM_CTX with room for the reply. Raise both together: past NUM_CTX Ollama
-# silently cuts the text instead of failing. Longer documents are marked "partial".
+# Characters of a document one analysis call sends. 40,000 is about 11-13K tokens, which
+# fits NUM_CTX with room for the reply. Longer documents are analyzed section by section
+# (sections.py). Past NUM_CTX Ollama would silently cut the text, so a smaller NUM_CTX
+# also makes the sections smaller (analyze_chars); raise both together.
 ANALYZE_CHARS = int(os.environ.get("OLLAMA_ANALYZE_CHARS", "40000"))
+REPLY_TOKENS = 2000  # context kept free for an analysis reply, and the most it may write
 KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "600"))
 
@@ -40,10 +42,12 @@ class OllamaUnavailable(OllamaError):
     """Ollama could not be reached at all."""
 
 
-def _chat(model, messages, think=None, temperature=None, **extra):
+def _chat(model, messages, think=None, temperature=None, num_predict=None, **extra):
     options = {"num_ctx": NUM_CTX}
     if temperature is not None:
         options["temperature"] = temperature
+    if num_predict is not None:  # the most tokens the reply may have
+        options["num_predict"] = num_predict
     body = {"model": model, "messages": messages, "stream": False,
             "keep_alive": KEEP_ALIVE, "options": options, **extra}
     if think is not None:  # only sent to models that support thinking
@@ -88,18 +92,25 @@ def _usage(r):
             "cache_read": 0, "cache_write": 0}
 
 
-def analyze(_client, filename, text, model=MODEL, on_usage=None):
-    """Return (metadata dict, 'full' | 'partial'). Same contract as llm.analyze."""
-    excerpt = text[:ANALYZE_CHARS]
-    r = _chat(model, [{
-        "role": "user",
-        "content": f"Extract metadata for the document below.\n\nFile name: {filename}\n\n"
-                   f"<document>\n{excerpt}\n</document>",
-    }], think=False, temperature=0, format=META_SCHEMA)
-    if on_usage:
-        on_usage("analyze", "ollama", model, _usage(r))
-    meta = json.loads(r["message"]["content"])
-    return meta, "full" if len(text) <= ANALYZE_CHARS else "partial"
+def analyze_chars():
+    """Characters of document text (or notes) one analysis call carries: ANALYZE_CHARS,
+    or fewer when NUM_CTX can't hold that many next to the prompt and the reply."""
+    return max(1000, min(ANALYZE_CHARS, (NUM_CTX - REPLY_TOKENS) * 3 - sections.PROMPT_CHARS))
+
+
+def analyze(_client, filename, text, model=MODEL, on_usage=None, **hooks):
+    """Same contract as llm.analyze. Every call fits the context window: sections.py
+    keeps the text in each within analyze_chars(), and the reply within REPLY_TOKENS."""
+    def ask(prompt, schema, kind):
+        messages = [{"role": "user", "content": prompt}]
+        if not fits(messages, REPLY_TOKENS):  # only with a NUM_CTX too small for any analysis
+            raise OllamaError(f"{model}: OLLAMA_NUM_CTX={NUM_CTX} is too small for an analysis prompt")
+        r = _chat(model, messages, think=False, temperature=0, num_predict=REPLY_TOKENS, format=schema)
+        if on_usage:
+            on_usage(kind, "ollama", model, _usage(r))
+        return json.loads(r["message"]["content"])
+
+    return sections.analyze(ask, filename, text, analyze_chars(), **hooks)
 
 
 def transcribe_pdf(data, on_usage=None, done=None, on_page=None):

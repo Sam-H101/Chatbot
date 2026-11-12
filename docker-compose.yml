@@ -13,6 +13,7 @@ services:
       - OLLAMA_VISION_MODEL
       - OLLAMA_NUM_CTX
       - OLLAMA_ANALYZE_CHARS
+      - ANALYZE_MAX_SECTIONS
       # Claude backend only. Optional: set a key here instead of typing it into the page.
       - ANTHROPIC_API_KEY
       - CLAUDE_MODEL

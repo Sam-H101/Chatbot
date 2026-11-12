@@ -7,15 +7,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 
-from . import extract, units
+from . import extract, sections, units
+from .sections import META_SCHEMA
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
-# Characters of a document sent to Claude for metadata extraction (about 125-170K
-# tokens at the default, well inside Claude's context). The full text is always stored
-# and searchable; this only bounds the cost of the analysis call. Longer documents are
-# analyzed from their start and marked "partial". Local models have their own,
-# smaller limit (OLLAMA_ANALYZE_CHARS in ollama.py).
+# Characters of a document one analysis call sends to Claude (about 125-170K tokens at
+# the default, well inside Claude's context). Longer documents are analyzed section by
+# section, each section this long at most, and the sections' notes combined (sections.py).
+# Local models have their own, smaller limit (OLLAMA_ANALYZE_CHARS in ollama.py).
 ANALYZE_CHARS = int(os.environ.get("CLAUDE_ANALYZE_CHARS", "500000"))
 PDF_CONCURRENCY = int(os.environ.get("PDF_CONCURRENCY", "4"))
 TRANSCRIBE_PROMPT = (
@@ -95,20 +95,6 @@ SYSTEM = os.environ.get("SYSTEM_PROMPT") or (
     "Be concise."
 )
 
-META_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "title": {"type": "string"},
-        "doc_type": {"type": "string", "description": "e.g. invoice, contract, paper, notes, code"},
-        "summary": {"type": "string", "description": "2-3 sentences"},
-        "keywords": {"type": "array", "items": {"type": "string"},
-                     "description": "5-12 search terms: topics, names, entities"},
-    },
-    "required": ["title", "doc_type", "summary", "keywords"],
-    "additionalProperties": False,
-}
-
-
 def system_prompt(rules=()):
     """SYSTEM plus the operator's instructions. Changes only when the rules change,
     so the prompt cache still hits between questions."""
@@ -133,22 +119,23 @@ def _text(response):
     return "".join(b.text for b in response.content if b.type == "text")
 
 
-def analyze(client, filename, text, model=MODEL, on_usage=None):
-    """Return (metadata dict, 'full' | 'partial')."""
-    excerpt = text[:ANALYZE_CHARS]
-    response = client.beta.messages.create(
-        model=model,
-        max_tokens=2000,
-        output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": META_SCHEMA}},
-        messages=[{
-            "role": "user",
-            "content": f"Extract metadata for the document below.\n\nFile name: {filename}\n\n"
-                       f"<document>\n{excerpt}\n</document>",
-        }],
-        **_fallback(model),
-    )
-    _report(on_usage, "analyze", model, response)
-    return json.loads(_text(response)), "full" if len(text) <= ANALYZE_CHARS else "partial"
+def analyze(client, filename, text, model=MODEL, on_usage=None, **hooks):
+    """Return (metadata dict, 'full' | 'partial: ...'): one call, or section by section
+    for text longer than ANALYZE_CHARS. `hooks` are those of sections.analyze."""
+    def ask(prompt, schema, kind):
+        response = client.beta.messages.create(
+            model=model,
+            max_tokens=2000 if schema is META_SCHEMA else 8000,  # a section's notes run longer
+            output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": prompt}],
+            **_fallback(model),
+        )
+        _report(on_usage, kind, model, response)
+        if response.stop_reason == "max_tokens":
+            raise ValueError("the reply was cut off at its max_tokens")
+        return json.loads(_text(response))
+
+    return sections.analyze(ask, filename, text, ANALYZE_CHARS, skip=(ValueError, Refused), **hooks)
 
 
 def transcribe_pdf(client, batches, model=MODEL, on_usage=None, on_batch=None):
@@ -240,8 +227,9 @@ def _transcribe(client, model, pages, total, pdf_bytes, on_usage=None):
 def build_user_message(question, hits):
     if not hits:
         return question
-    # units.fix corrects litre/gallon misprints so the model doesn't repeat them.
-    parts = [f'<excerpt file="{h["filename"]}" part="{h["idx"]}">\n{units.fix(extract.plain(h["text"]))}\n</excerpt>'
+    # units.fix corrects litre/gallon misprints so the model doesn't repeat them. It reads the
+    # stored chunk, as the unit check at upload did (units.scan), so both find the same ones.
+    parts = [f'<excerpt file="{h["filename"]}" part="{h["idx"]}">\n{extract.plain(units.fix(h["text"]))}\n</excerpt>'
              for h in hits]
     return "<excerpts>\n" + "\n".join(parts) + "\n</excerpts>\n\n" + question
 

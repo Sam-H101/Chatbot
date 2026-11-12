@@ -11,7 +11,7 @@ import time
 import anthropic
 import pypdfium2
 
-from . import db, extract, llm, ollama
+from . import db, extract, llm, ollama, sections, units
 
 log = logging.getLogger(__name__)
 
@@ -38,8 +38,9 @@ CLAUDE_PDF_PAGES = _pages_mode(os.environ.get("CLAUDE_PDF_PAGES"))
 # the user to confirm it.
 CONFIRM_COST_USD = float(os.environ.get("CONFIRM_COST_USD") or "1.00")
 # Rough sizes behind an estimate: tokens per page Claude reads (image plus text) and
-# writes, and the metadata reply. The metadata call's input is about 4 characters a token.
-PAGE_INPUT_TOKENS, PAGE_OUTPUT_TOKENS, ANALYSIS_OUTPUT_TOKENS = 2000, 600, 500
+# writes, the metadata reply, and the notes on each section of a long document. Analysis
+# input is about 4 characters a token.
+PAGE_INPUT_TOKENS, PAGE_OUTPUT_TOKENS, ANALYSIS_OUTPUT_TOKENS, NOTES_OUTPUT_TOKENS = 2000, 600, 500, 1000
 # Tests turn the thread off and run the queue in their own thread with drain().
 BACKGROUND = True
 
@@ -206,7 +207,33 @@ def stop(timeout=10):
         _thread = None
 
 
+def check_units(doc_id=None):
+    """Run the unit check (units.check) on documents with none from this version of
+    units.py: indexed before it ran at upload, or checked by an earlier units.py. Or on
+    just `doc_id`. Quick: it reads their stored chunks, no model. Returns how many
+    documents it checked."""
+    ids = db.unchecked_documents(units.VERSION) if doc_id is None else [doc_id]
+    for i in ids:
+        db.set_unit_findings(i, units.check(db.chunk_texts(i)))
+    return len(ids)
+
+
+def unit_check(doc_id):
+    """A document's unit check for the API (db.unit_findings), made now if it has none
+    from this version yet (the start-up check hasn't got to it). None: no such document."""
+    doc = db.unit_findings(doc_id, units.VERSION)
+    if doc and doc["findings"] is None:
+        check_units(doc_id)
+        doc = db.unit_findings(doc_id, units.VERSION)
+    return doc
+
+
 def _loop():
+    try:  # once per start, before any job: older documents get their unit check
+        if n := check_units():
+            log.info("Checked units in %d document(s) with no check from this version of units.py", n)
+    except Exception:
+        log.exception("Could not check units in older documents")
     while not _stop.is_set():
         _wake.clear()  # before looking, so a job queued meanwhile still wakes the wait below
         try:
@@ -249,11 +276,19 @@ class _Progress:
 
     def pages(self, reader):
         """Pages this reader finished in an earlier attempt: {number: text}."""
-        return {int(n): t for n, t in self.partial.get(reader, {}).items()}
+        return {int(n): t for n, t in self.kept(reader).items()}
 
-    def keep(self, reader, pages, text, done, total):
-        self.partial.setdefault(reader, {}).update({str(n): t for n, t in pages.items()})
-        self._write({"partial": self.partial, "stage": text, "progress": done, "total": total})
+    def kept(self, key):
+        """What an earlier attempt kept under `key`: a reader's pages, or a model's notes on
+        the sections of a long document ({section key: notes})."""
+        return dict(self.partial.get(key, {}))
+
+    def keep(self, key, items, text=None, done=None, total=None):
+        self.partial.setdefault(key, {}).update({str(n): t for n, t in items.items()})
+        fields = {"partial": self.partial}
+        if text is not None:
+            fields.update(stage=text, progress=done, total=total)
+        self._write(fields)
 
     def _write(self, fields):
         self.last = time.monotonic()
@@ -277,14 +312,15 @@ def _process(job):
         text, meta, analysis, who, note = _read(job, opts, data, progress, on_usage)
         progress.stage("Saving")
         chunks = extract.chunk_text(text)
+        check = units.check(chunks)  # the litre/gallon misprints that answers will be corrected for
         result = {**used(who, note), "title": meta.get("title") or job["filename"],
-                  "chunks": len(chunks), "analysis": analysis, "replaced": []}
+                  "chunks": len(chunks), "analysis": analysis, "replaced": [], "unit_fixes": len(check["findings"])}
         if job["kind"] == "reread":
-            db.replace_document(job["doc_id"], chunks, meta, analysis, label(*who), job=(job_id, result))
+            db.replace_document(job["doc_id"], chunks, meta, analysis, label(*who), units=check, job=(job_id, result))
         else:
             db.add_document(job["filename"], chunks, meta, analysis, label(*who), sha=job["sha256"],
                             size=job["file_size"], mime=job["mime"], replace=opts.get("on_duplicate") == "replace",
-                            job=(job_id, result))
+                            units=check, job=(job_id, result))
         status = "done"
     except AwaitConfirmation:
         status = "awaiting_confirmation"
@@ -355,12 +391,23 @@ def _read(job, opts, data, progress, on_usage):
     return with_claude(llm.MODEL, text)
 
 
+def _analysis_calls(chars):
+    """(input, output) tokens of each call that analyzes `chars` characters with Claude:
+    one, or for a long text one per section read plus one combining their notes."""
+    n, read = sections.plan(chars, llm.ANALYZE_CHARS)
+    if n == 1:
+        return [(chars // 4 + 100, ANALYSIS_OUTPUT_TOKENS)]
+    return [(chars // n // 4 + 400, NOTES_OUTPUT_TOKENS)] * read + [
+        (read * NOTES_OUTPUT_TOKENS + 300, ANALYSIS_OUTPUT_TOKENS)]
+
+
 def estimate(name, data, model, is_pdf, mode, text=None):
     """What reading a file with Claude `model` should cost: pages, pages Claude reads,
     tokens and USD, from about 2,000 input and 600 output tokens per page Claude reads
-    plus the metadata call. With `text` (read already), just the metadata call. Each
-    call is priced on its own, as the API bills it. A model missing from llm.PRICES is
-    priced like the dearest one there (and marked), so the confirmation still works."""
+    plus the analysis (one call, or for a long text one per section and one more). With
+    `text` (read already), just the analysis. Each call is priced on its own, as the API
+    bills it. A model missing from llm.PRICES is priced like the dearest one there (and
+    marked), so the confirmation still works."""
     pages = read = 0
     if text is not None:
         chars, is_pdf = len(extract.plain(text)), False
@@ -372,15 +419,17 @@ def estimate(name, data, model, is_pdf, mode, text=None):
     else:
         chars = len(extract.extract_text(name, data))
     price = model if model in llm.PRICES else max(llm.PRICES, key=lambda m: llm.PRICES[m][1])
-    analysis_in = min(chars, llm.ANALYZE_CHARS) // 4 + 100
-    cost = llm.cost(price, {"input": analysis_in, "output": ANALYSIS_OUTPUT_TOKENS})
+    calls = _analysis_calls(chars)
+    cost = sum(llm.cost(price, {"input": i, "output": o}) for i, o in calls)
     for start in range(0, read, extract.PDF_PAGES_PER_CALL):
         n = min(extract.PDF_PAGES_PER_CALL, read - start)
         cost += llm.cost(price, {"input": n * PAGE_INPUT_TOKENS, "output": n * PAGE_OUTPUT_TOKENS})
     return {"model": model, "model_label": llm.label(model), "mode": mode if is_pdf else None,
-            "pages": pages, "claude_pages": read, "input_tokens": read * PAGE_INPUT_TOKENS + analysis_in,
-            "output_tokens": read * PAGE_OUTPUT_TOKENS + ANALYSIS_OUTPUT_TOKENS, "cost_usd": round(cost, 6),
-            "priced": model in llm.PRICES, "confirm_at": CONFIRM_COST_USD}
+            "pages": pages, "claude_pages": read,
+            "input_tokens": read * PAGE_INPUT_TOKENS + sum(i for i, _ in calls),
+            "output_tokens": read * PAGE_OUTPUT_TOKENS + sum(o for _, o in calls), "cost_usd": round(cost, 6),
+            "sections": list(sections.plan(chars, llm.ANALYZE_CHARS)), "priced": model in llm.PRICES,
+            "confirm_at": CONFIRM_COST_USD}
 
 
 def _check_cost(job, opts, data, model, is_pdf, mode, progress, text=None):
@@ -423,12 +472,18 @@ def _analyze(backend, model, client, job, text, progress, on_usage):
     after its retries) leave a new upload without metadata, its text still searchable.
     A job that replaces documents, a re-read or an upload told to replace its copies,
     fails instead: they keep their metadata, and a retry finds its pages kept."""
-    name = job["filename"]
-    progress.stage(f"Analyzing with {label(backend, model)}")
+    name, who = job["filename"], label(backend, model)
+    progress.stage(f"Analyzing with {who}")
+    # A long document is analyzed section by section (sections.py): each step shows in the
+    # job, and each section's notes are kept with it, so a retry doesn't ask for them again.
+    notes = f"notes:{backend}:{model}"
+    hooks = {"on_usage": on_usage, "kept": progress.kept(notes),
+             "on_progress": lambda stage, done, total: progress.stage(f"{stage} with {who}", done, total),
+             "on_notes": lambda key, got: progress.keep(notes, {key: got})}
     try:
         if backend == "ollama":
-            return ollama.analyze(None, name, extract.plain(text), model, on_usage=on_usage)
-        return llm.analyze(client, name, extract.plain(text), model, on_usage=on_usage)
+            return ollama.analyze(None, name, text, model, **hooks)
+        return llm.analyze(client, name, text, model, **hooks)
     except (anthropic.AuthenticationError, llm.MissingKey, ollama.OllamaError, Cancelled):
         raise
     except Exception as e:

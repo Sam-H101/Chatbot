@@ -81,6 +81,22 @@ Everything below is uncommitted in the working tree.
   wait still, "its one page", a jobs badge on the phone ☰, and the phone header no longer overflows at 320/390px
   with an instruction count. 94 tests pass. Staging: restart mid-read resumed with no request; Auto on a scan with a
   broken local chat model made 3 minicpm reads and one Haiku analysis ($0.0001); 25/25 browser checks.
+- 2026-11-12: Plan items 3 and 4. Long documents are analyzed section by section (`app/sections.py`): text over one
+  call's limit (`CLAUDE_ANALYZE_CHARS`; `OLLAMA_ANALYZE_CHARS`, kept within `OLLAMA_NUM_CTX`) is split at page breaks,
+  else paragraphs, into sections of about equal size; the same model takes notes on each (topics, values, procedures,
+  warnings), merges notes too long for one local call, and turns them into the metadata in the usual format. At most
+  `ANALYZE_MAX_SECTIONS` (24) are read; past that it samples evenly and the analysis says so (`partial: 24 of 61
+  sections, 39% of the text`). Job rows show "Analyzing section 3 of 12 with …" with a bar, each call is in the usage
+  log (`analyze-section`, `analyze-merge`), notes are kept for a retry, and the Claude estimate counts the sections.
+  Unit checks: `units.find()` lists what `fix()` corrects (same code), run at upload and re-read over the stored chunks
+  and kept on the document (`unit_findings`, tagged with a hash of units.py, so a changed check runs again); a
+  **N unit fixes** badge on cards and in the table opens the list (page links for PDFs). The worker checks older
+  documents at start, from their chunks. Fixed on the way: `fix()` paired a gallon figure with the next table cell's
+  litres, so Chapter 9's correct "8.9 ℓ, 2.4 U.S.gal | 8.3 ℓ" reached models as 2.2 gal plus a misprint note.
+  114 tests pass. Staging on a copy of the live library: all 14 checked at start, 4 quarts misprints listed (chapters
+  4, 5, 6-1, 6-2), chapter 9 not flagged; a 98K-character manual in 3 sections by qwen3.5:9b (88 s, prompts at most
+  9.3K tokens); Haiku in 2 sections plus the final call ($0.0018, estimated $0.0020); sampling with a cap of 2 and a
+  re-read cancelled mid-analysis; 39/39 browser checks (light, dark, 390px).
 
 ## To do
 
@@ -113,9 +129,9 @@ Ordered by priority. Suggested start: 1 and 2, then 5. Item 12 is small and wort
       results with the keyword search.
 - [ ] 2. Page-numbered citations. Chunks don't record their page, so answers cite only a filename.
       Store the page range per chunk, show "manual.pdf, p. 142", click to see the excerpt.
-- [ ] 3. Full analysis of long documents. Text over the character limit gets a "partial" analysis.
+- [x] 3. Full analysis of long documents. Text over the character limit gets a "partial" analysis.
       Summarise section by section, then combine, so local models cover the whole document.
-- [ ] 4. Unit checks at upload. `app/units.py` fixes litre/gallon misprints silently at question
+- [x] 4. Unit checks at upload. `app/units.py` fixes litre/gallon misprints silently at question
       time. Run it at upload too and list the suspected misprints on the document.
 
 ### Phase 2: Uploads
