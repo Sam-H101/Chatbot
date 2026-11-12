@@ -67,6 +67,20 @@ Everything below is uncommitted in the working tree.
   longer logs a traceback; "Read with" no longer wraps on phones. 81 tests pass. Staging: qwen3.5 + minicpm
   (progress, cancel mid-read, restart mid-read resumed without re-reading pages), Claude Haiku on 2 small PDFs
   ($0.0007; only the scanned page sent), a 60-page Opus job held at $1.35 and cancelled; UI in light, dark, 390px.
+- 2026-11-12: Review fixes for items 5, 7 and 8. A re-read (or an upload replacing its duplicates) whose analysis
+  fails now fails instead of wiping the document's title, summary and keywords; Retry redoes only the analysis. When
+  only Auto's local analysis fails, Claude analyzes the locally read text instead of reading the pages again (and
+  the estimate covers just that). Browser keys: dropped for jobs that won't run, and a job insert that rolls back
+  can no longer leave its key to the next job given the same id (another user's key could have been spent).
+  The worker starts at boot (`app/gunicorn_conf.py`), so interrupted jobs resume without a page load. Unreadable
+  files (damaged PDF/DOCX, not text, empty) get a 400 before queueing again. POSTs naming another site's origin get
+  403. Also: a confirmation covers the amount shown; models missing from `PRICES` are estimated at the dearest
+  price; a mistyped `CLAUDE_PDF_PAGES` falls back to `scanned`; non-object JSON bodies get 400, not 500; `\f` in
+  text files is no page break; Retry counts the pages of the reader it starts with, counted in SQL; compose passes
+  `MIN_PAGE_CHARS`, `TOP_K` and the `PDF_*` settings. UI: no orphan row when a poll beats the 202, queued rows
+  wait still, "its one page", a jobs badge on the phone ☰, and the phone header no longer overflows at 320/390px
+  with an instruction count. 94 tests pass. Staging: restart mid-read resumed with no request; Auto on a scan with a
+  broken local chat model made 3 minicpm reads and one Haiku analysis ($0.0001); 25/25 browser checks.
 
 ## To do
 

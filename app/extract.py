@@ -30,21 +30,42 @@ class Unsupported(ValueError):
 
 
 def extract_text(filename, data):
-    """Local extraction. PDFs are normally read by a model instead (see jobs.py)."""
+    """Local extraction. PDFs are normally read by a model instead (see jobs.py). Only
+    PDFs have pages: a form feed in other text (a printout, ^L in code) is a line break."""
     name = filename.lower()
     if name.endswith(".pdf"):
         return join_pages(pdf_texts(data))
     if name.endswith(".docx"):
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            root = ElementTree.fromstring(z.read("word/document.xml"))
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                root = ElementTree.fromstring(z.read("word/document.xml"))
+        except (zipfile.BadZipFile, KeyError, ElementTree.ParseError):
+            raise Unsupported("Could not open this DOCX file: it is damaged or not a Word document") from None
         ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-        return "\n".join(
+        text = "\n".join(
             "".join(t.text or "" for t in p.iter(ns + "t")) for p in root.iter(ns + "p")
         )
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        raise Unsupported("Unsupported file: expected PDF, DOCX or UTF-8 text") from None
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise Unsupported("Unsupported file: expected PDF, DOCX or UTF-8 text") from None
+    return text.replace(PAGE_BREAK, "\n")
+
+
+def check(filename, data):
+    """Raise Unsupported for a file that can never be read, before it is queued: a PDF
+    that doesn't open or has no pages, a damaged DOCX, text that isn't UTF-8, or no text
+    at all. Quick: a PDF is only opened, as its pages may need a model."""
+    if filename.lower().endswith(".pdf"):
+        try:
+            pages = page_count(data)
+        except pypdfium2.PdfiumError as e:
+            raise Unsupported(f"Could not open this PDF: {e}") from None
+        if not pages:
+            raise Unsupported("This PDF has no pages")
+    elif not extract_text(filename, data).strip():  # all whitespace: chunk_text would find nothing
+        raise Unsupported("No text found in file")
 
 
 def join_pages(pages):

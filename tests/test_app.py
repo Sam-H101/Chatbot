@@ -715,6 +715,285 @@ def test_deleting_a_document_cancels_its_reread(local):
     assert job["status"] == "cancelled" and job["stage"] == "The document was deleted" and job["doc_id"] is None
 
 
+def test_a_reread_whose_analysis_fails_leaves_the_document_as_it_was(local, monkeypatch):
+    """A re-read replaces a document's metadata. If its analysis fails (a refusal, an API
+    still overloaded after its retries, a local reply that isn't JSON), the job fails and
+    the document keeps its title, summary and keywords. The pages read are kept, so Retry
+    only redoes the analysis. The same goes for an upload told to replace its copies."""
+    from app import jobs, llm, ollama
+    calls = []
+    monkeypatch.setattr(llm, "client_for", lambda key: claude_reader(calls))
+    doc_id = add(local, "pump.pdf", mixed_pdf("TS"))["doc_id"]                          # read locally: "Scan"
+    fields = ("title", "doc_type", "summary", "keywords", "analysis", "model")
+    doc = lambda: {k: local.get("/api/documents").json[0][k] for k in fields}  # noqa: E731
+    before, text = doc(), doc_text(doc_id)
+
+    def refused(c, name, text, model=None, on_usage=None):
+        raise llm.Refused("Claude declined this request")
+
+    monkeypatch.setattr(llm, "analyze", refused)
+    r = local.post(f"/api/documents/{doc_id}/reread", json={"model": "claude:claude-haiku-5-5"}, headers=H)
+    jobs.drain()
+    job = job_of(local, r)
+    assert job["status"] == "failed" and job["error"] == (
+        "Could not analyze pump.pdf: Claude declined this request. The library was left as it was")
+    assert doc() == before and doc_text(doc_id) == text and local.get("/api/documents?q=notes").json
+    assert [c["pages"] for c in calls] == [[2]] and job["pages_kept"] == 1
+    monkeypatch.setattr(llm, "analyze", lambda c, name, text, model=None, **kw: (
+        {"title": "Pump manual", "doc_type": "manual", "summary": "Re-read.", "keywords": ["seal"]}, "full"))
+    local.post(f"/api/jobs/{job['id']}/retry", headers=H)
+    jobs.drain()
+    assert job_of(local, r)["status"] == "done" and doc()["title"] == "Pump manual"
+    assert [c["pages"] for c in calls] == [[2]]                                          # page 2 not read again
+    # A local model whose reply isn't JSON.
+    fake = ollama._chat
+
+    def half_json(model, messages, **kw):
+        if "format" in kw:
+            return {"message": {"content": '{"title": "Sca'}, "prompt_eval_count": 1, "eval_count": 1}
+        return fake(model, messages, **kw)
+
+    monkeypatch.setattr(ollama, "_chat", half_json)
+    before = doc()
+    r = local.post(f"/api/documents/{doc_id}/reread", json={"model": "ollama:qwen3.5:9b"})
+    jobs.drain()
+    job = job_of(local, r)
+    assert job["status"] == "failed" and job["error"].startswith("Could not analyze pump.pdf: Unterminated string")
+    assert doc() == before and local.get("/api/documents?q=seal").json[0]["id"] == doc_id
+    # Replacing a duplicate: the copy in the library stays.
+    job = add(local, "pump (1).pdf", mixed_pdf("TS"), on_duplicate="replace")
+    assert job["status"] == "failed" and "The library was left as it was" in job["error"]
+    assert [d["id"] for d in local.get("/api/documents").json] == [doc_id] and doc() == before
+    # A new upload is still added, without metadata, so its text is searchable.
+    job = add(local, "notes.txt", b"Grease the bearings monthly.")
+    assert job["status"] == "done" and job["result"]["analysis"].startswith("none: Unterminated string")
+
+
+def test_when_only_the_local_analysis_fails_claude_just_analyzes(local, monkeypatch):
+    """Auto on a scan: the vision model read the pages, then the local analysis failed.
+    Claude analyzes the text read here instead of reading (and billing) the pages again,
+    and the estimate covers just that call. Only a failed local reading has Claude read."""
+    from app import jobs, llm, ollama
+    monkeypatch.setattr(jobs, "CONFIRM_COST_USD", 0)                                      # every Claude job asks
+    calls, fake = [], ollama._chat
+    monkeypatch.setattr(llm, "client_for", lambda key: claude_reader(calls))
+
+    def analysis_down(model, messages, **kw):
+        if "format" in kw:
+            raise ollama.OllamaError(f"{model}: out of memory")
+        return fake(model, messages, **kw)
+
+    monkeypatch.setattr(ollama, "_chat", analysis_down)
+    r = upload(local, "scan.pdf", mixed_pdf("TSS"))
+    job = job_of(local, r)
+    est = job["estimate"]
+    assert job["status"] == "awaiting_confirmation" and job["options"]["fallback"] == "analyze"
+    assert (est["model"], est["mode"], est["claude_pages"]) == (llm.MODEL, None, 0)       # just the analysis
+    local.post(f"/api/jobs/{job['id']}/confirm", headers=H)
+    jobs.drain()
+    job = job_of(local, r)
+    assert job["status"] == "done" and calls == [] and job["result"]["model"] == f"claude:{llm.MODEL}"
+    assert "local model failed" in job["result"]["switched"] and job["options"]["confirmed"] == est["cost_usd"]
+    assert len([c for c in local.calls if c["messages"][-1].get("images")]) == 2          # each scan read once
+    text = doc_text(job["doc_id"])
+    assert "Page 1 has" in text and text.count("The deposit is 1800 euros.") == 2
+
+    def vision_down(model, messages, **kw):  # the vision model fails: Claude reads the scanned pages
+        if messages[-1].get("images"):
+            raise ollama.OllamaError(f"{model}: out of memory")
+        return fake(model, messages, **kw)
+
+    monkeypatch.setattr(ollama, "_chat", vision_down)
+    r = upload(local, "other.pdf", mixed_pdf("TSST"))
+    job = job_of(local, r)
+    assert job["options"]["fallback"] == "read" and job["estimate"]["claude_pages"] == 2
+    local.post(f"/api/jobs/{job['id']}/confirm", headers=H)
+    jobs.drain()
+    assert job_of(local, r)["status"] == "done" and [c["pages"] for c in calls] == [[2, 3]]
+
+
+def test_a_confirmation_covers_the_amount_confirmed(client, monkeypatch):
+    """A retry that would cost more than the user agreed to asks again."""
+    from app import db, jobs, llm
+    monkeypatch.setattr(jobs, "CONFIRM_COST_USD", 0)
+    calls, broken = [], [True]
+    monkeypatch.setattr(llm, "client_for", lambda key: claude_reader(calls, fail=lambda pages: broken[0]))
+    r = upload(client, "scan.pdf", blank_pdf(3), model="claude:claude-haiku-5-5")
+    job_id = r.json["job"]["id"]
+    client.post(f"/api/jobs/{job_id}/confirm", headers=H)
+    jobs.drain()
+    assert job_of(client, r)["status"] == "failed"
+    broken[0] = False
+    client.post(f"/api/jobs/{job_id}/retry", headers=H)
+    jobs.drain()
+    assert job_of(client, r)["status"] == "done"                                         # same cost: no new question
+    r = upload(client, "scan2.pdf", blank_pdf(2), model="claude:claude-haiku-5-5")
+    job = job_of(client, r)
+    db.update_job(job["id"], when=("awaiting_confirmation",), status="queued",
+                  options={**job["options"], "confirmed": job["estimate"]["cost_usd"] / 2})
+    jobs.drain()
+    assert job_of(client, r)["status"] == "awaiting_confirmation"                        # half of it: asks again
+
+
+def test_browser_keys_are_dropped_for_jobs_that_will_not_run(local, monkeypatch):
+    """The browser's key is held only while its job can still run. A job whose insert
+    rolled back leaves no key: SQLite gives its id to the next job, which must not spend
+    another user's key."""
+    from app import db, jobs
+    r = post(local, "a.txt", b"Rent note A.")
+    a = r.json["job"]["id"]
+    assert jobs._keys == {a: "k"}
+    local.post(f"/api/jobs/{a}/cancel")                                                   # cancelled while queued
+    assert jobs._keys == {}
+    store = db._store
+
+    def disk_full(sha, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(db, "_store", disk_full)
+    r = local.post("/api/upload", data={"file": (io.BytesIO(b"User A's note."), "a.txt")},
+                   headers={"X-API-Key": "sk-user-a"})
+    assert r.status_code == 500 and jobs._keys == {}
+    monkeypatch.setattr(db, "_store", store)
+    r = local.post("/api/upload", data={"file": (io.BytesIO(b"User B's note."), "b.txt")})   # no key
+    assert r.status_code == 202 and r.json["job"]["id"] not in jobs._keys
+    # Confirm on a job that isn't waiting leaves its key alone; a deleted document's re-read drops it.
+    r = post(local, "c.txt", b"Rent note C.", model="claude:claude-haiku-5-5")
+    c = r.json["job"]["id"]
+    assert local.post(f"/api/jobs/{c}/confirm").status_code == 409 and jobs._keys[c] == "k"
+    jobs.drain()
+    doc_id = job_of(local, r)["doc_id"]
+    r = local.post(f"/api/documents/{doc_id}/reread", json={"model": "claude:claude-haiku-5-5"}, headers=H)
+    assert jobs._keys == {r.json["job"]["id"]: "k"}
+    local.delete(f"/api/documents/{doc_id}")
+    assert jobs._keys == {}
+
+
+def test_json_bodies_that_are_not_objects_get_a_400(client):
+    doc_id = add(client)["doc_id"]
+    for path in (f"/api/documents/{doc_id}/reread", "/api/documents/delete", "/api/chat", "/api/instructions"):
+        r = client.post(path, data="[1]", content_type="application/json", headers=H)
+        assert r.status_code == 400 and r.json["error"] == "Expected a JSON object", path
+    r = client.post(f"/api/documents/{doc_id}/reread", json={"model": 5}, headers=H)
+    assert r.status_code == 400 and r.json["error"] == "Unknown model choice: 5"
+    assert client.post(f"/api/documents/{doc_id}/reread", json={"claude_pages": ["all"]}, headers=H).status_code == 400
+    assert client.post("/api/chat", json={"question": 5}, headers=H).status_code == 400
+    assert [j["kind"] for j in client.get("/api/jobs").json] == ["upload"]               # nothing queued
+
+
+def test_a_mistyped_claude_pdf_pages_setting_falls_back_to_scanned(local, monkeypatch):
+    from app import jobs
+    assert jobs._pages_mode(None) == jobs._pages_mode("") == "scanned" and jobs._pages_mode(" All ") == "all"
+    monkeypatch.setattr(jobs, "CLAUDE_PDF_PAGES", jobs._pages_mode("every"))
+    assert jobs.CLAUDE_PDF_PAGES == "scanned"
+    r = post(local, model="ollama:qwen3.5:9b")
+    assert r.status_code == 202 and r.json["job"]["options"]["claude_pages"] == "scanned"
+
+
+def test_retry_counts_the_pages_of_the_reader_it_starts_with(local, monkeypatch):
+    """Auto read 3 pages locally, then Claude read 20 before a batch failed. A retry
+    starts with the local model again, so it keeps 3 pages (Claude's 20 only if it has
+    to switch again). The job list counts them without loading the page texts."""
+    from app import llm, ollama
+    fake, seen = ollama._chat, []
+
+    def vision_stops(model, messages, **kw):
+        if messages[-1].get("images"):
+            seen.append(model)
+            if len(seen) > 3:
+                raise ollama.OllamaUnavailable("Could not reach Ollama")
+        return fake(model, messages, **kw)
+
+    monkeypatch.setattr(ollama, "_chat", vision_stops)
+    monkeypatch.setattr(llm, "PDF_CONCURRENCY", 1)
+    calls = []
+    monkeypatch.setattr(llm, "client_for", lambda key: claude_reader(calls, fail=lambda pages: pages[0] >= 21))
+    r = upload(local, "scan.pdf", blank_pdf(25))
+    job = job_of(local, r)
+    assert job["status"] == "failed" and job["pages_kept"] == 3
+    (listed,) = local.get("/api/jobs").json
+    assert listed["pages_kept"] == 3 and "partial" not in listed and "kept" not in listed
+
+
+def test_files_that_can_never_be_read_are_refused_before_they_are_queued(client, tmp_path):
+    import zipfile
+    docx = io.BytesIO()
+    with zipfile.ZipFile(docx, "w") as z:
+        z.writestr("word/other.xml", "<x/>")
+    for name, body, error in [
+        ("empty.txt", b"", "No text found in file"),
+        ("blank.txt", b"  \n\f ", "No text found in file"),
+        ("picture.png", b"\x89PNG\r\n\x1a\n\x00\xff", "Unsupported file: expected PDF, DOCX or UTF-8 text"),
+        ("broken.pdf", b"%PDF-1.4 not really", "Could not open this PDF: "),
+        ("none.pdf", blank_pdf(0), "Could not open this PDF: "),                         # PDFium won't load 0 pages
+        ("broken.docx", b"PK not a zip", "Could not open this DOCX file"),
+        ("odd.docx", docx.getvalue(), "Could not open this DOCX file"),
+    ]:
+        r = post(client, name, body)
+        assert r.status_code == 400 and r.json["error"].startswith(error), (name, r.json)
+    assert client.get("/api/jobs").json == [] and not (tmp_path / "files").exists()
+
+
+def test_a_form_feed_in_a_text_file_is_not_a_page_break(client):
+    """Only PDFs have pages: a form feed in a text file (a printout, ^L in code) must not
+    give it page numbers later."""
+    job = add(client, "notes.txt", b"Bench grinder notes.\n\nGap under 3 mm.\fSecond part after a form feed.")
+    text = doc_text(job["doc_id"])
+    assert "\f" not in text and "Gap under 3 mm.\nSecond part" in text
+
+
+def test_a_model_without_a_list_price_still_needs_a_confirmation(client, monkeypatch):
+    """A Claude model missing from llm.PRICES would cost $0 by the table and never ask:
+    it is estimated at the dearest listed price instead, and marked as such."""
+    from app import jobs, llm
+    monkeypatch.setattr(jobs, "CONFIRM_COST_USD", 1.00)
+    monkeypatch.setattr(llm, "MODELS", [*llm.MODELS, ("claude-sonnet-5-6", "claude-sonnet-5-6")])
+    pdf = blank_pdf(60)
+    est = jobs.estimate("scan.pdf", pdf, "claude-sonnet-5-6", True, "scanned")
+    dearest = jobs.estimate("scan.pdf", pdf, "claude-fable-5-2", True, "scanned")
+    assert est["priced"] is False and dearest["priced"] is True and est["cost_usd"] == dearest["cost_usd"] > 1
+    r = upload(client, "scan.pdf", pdf, model="claude:claude-sonnet-5-6")
+    assert job_of(client, r)["status"] == "awaiting_confirmation"
+
+
+def test_posts_from_other_sites_are_refused(client, monkeypatch):
+    """A page elsewhere can make a browser send simple POSTs here (a form, or a text
+    body): to start a job waiting for its cost, or to delete documents."""
+    from app import jobs
+    monkeypatch.setattr(jobs, "CONFIRM_COST_USD", 0)
+    r = upload(client, model="claude:claude-haiku-5-5")
+    job_id = r.json["job"]["id"]
+    evil = {"Origin": "http://evil.example", **H}
+    assert client.post(f"/api/jobs/{job_id}/confirm", headers=evil).status_code == 403
+    assert job_of(client, r)["status"] == "awaiting_confirmation"
+    assert client.post("/api/documents/delete", data='{"ids": [1]}', content_type="text/plain",
+                       headers={"Origin": "null"}).status_code == 403
+    assert post(client, "x.txt", b"Rent.").status_code == 202                             # no Origin: curl, scripts
+    assert client.post("/api/documents/delete", json={"ids": []}, headers={"Origin": "http://localhost"}).status_code == 200
+    assert client.get("/api/jobs", headers={"Origin": "http://evil.example"}).status_code == 200  # reading is fine
+    assert client.post(f"/api/jobs/{job_id}/confirm", headers={"Origin": "http://localhost", **H}).status_code == 200
+
+
+def test_gunicorn_starts_the_job_worker_at_boot(local, monkeypatch):
+    """After a restart, jobs it cut off carry on without waiting for a page load."""
+    import time
+    from types import SimpleNamespace
+    from app import db, gunicorn_conf, jobs
+    job_id = db.add_job("upload", "lease.txt", db.file_hash(LEASE), "auto", {}, data=LEASE)
+    db.claim_next_job()                                                                    # running when it stopped
+    monkeypatch.setattr(jobs, "BACKGROUND", True)
+    monkeypatch.setattr(jobs, "_thread", None)
+    try:
+        gunicorn_conf.post_worker_init(SimpleNamespace(log=None))                          # no request at all
+        for _ in range(200):
+            if db.job_status(job_id) == "done":
+                break
+            time.sleep(0.05)
+        assert db.job_status(job_id) == "done"
+    finally:
+        jobs.stop()
+
+
 def test_old_database_gains_model_column(tmp_path, monkeypatch):
     import sqlite3
     from app import db
@@ -1041,7 +1320,7 @@ def test_a_failed_usage_write_does_not_fail_the_request(client, monkeypatch):
     """Usage logging is best effort: a busy database must not throw away a paid answer,
     report a stored upload as failed, or hide why a read failed."""
     import sqlite3
-    from app import db
+    from app import db, jobs
 
     def locked(*a, **kw):
         raise sqlite3.OperationalError("database is locked")
@@ -1051,7 +1330,8 @@ def test_a_failed_usage_write_does_not_fail_the_request(client, monkeypatch):
     assert r.status_code == 200 and r.json["answer"] == "42"
     job = add(client)
     assert job["status"] == "done" and [d["id"] for d in client.get("/api/documents").json] == [job["doc_id"]]
-    job = add(client, "blank.txt", b"   ")
+    monkeypatch.setattr(jobs, "PDF_EXTRACTOR", "local")                                  # a scan: no text layer
+    job = add(client, "blank.pdf", blank_pdf(1))
     assert job["status"] == "failed" and job["error"] == "No text found in file"
 
 

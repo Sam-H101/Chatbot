@@ -356,7 +356,7 @@ def delete_documents(ids):
 
 # ---- jobs: uploads and re-reads waiting for, or in, the background worker ----
 
-_JSON = ("options", "estimate", "result", "partial")
+_JSON = ("options", "estimate", "result", "partial", "kept")
 
 
 def _job(row):
@@ -400,9 +400,12 @@ def get_job(job_id):
 
 def list_jobs(hours=1):
     """Jobs still to finish, failed ones (until dismissed), and any others that changed
-    in the last `hours`; newest first. Partial pages only for failed jobs (a count for a retry)."""
+    in the last `hours`; newest first. The page polls this, so a failed job's kept pages
+    are counted here, per reader ("kept": {reader: pages}), rather than loaded."""
     cols = "id, kind, status, filename, sha256, file_size, mime, model, options, progress, total, stage, " \
-           "error, estimate, result, doc_id, created_at, updated_at, CASE WHEN status='failed' THEN partial END AS partial"
+           "error, estimate, result, doc_id, created_at, updated_at, CASE WHEN status='failed' THEN " \
+           "(SELECT json_group_object(r.key, (SELECT count(*) FROM json_each(r.value))) FROM json_each(partial) AS r)" \
+           " END AS kept"
     marks = ",".join("?" * len(HOLDING_JOBS))
     with connect() as con:
         return [_job(r) for r in con.execute(

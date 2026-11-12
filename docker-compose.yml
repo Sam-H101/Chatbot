@@ -21,7 +21,14 @@ services:
       - CLAUDE_PDF_PAGES
       - CONFIRM_COST_USD
       - SYSTEM_PROMPT
+      - TOP_K
       - PDF_EXTRACTOR
+      # Which PDF pages count as scanned (read by a model, and paid for with Claude), and
+      # how Claude's reading is split up.
+      - MIN_PAGE_CHARS
+      - PDF_PAGES_PER_CALL
+      - PDF_CONCURRENCY
+      - PDF_MAX_BATCH_MB
       - MAX_UPLOAD_MB
     depends_on:
       - ollama

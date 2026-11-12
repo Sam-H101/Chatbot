@@ -96,7 +96,11 @@
   main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   header { display: flex; align-items: center; gap: 8px; padding: 12px 20px; border-bottom: 1px solid var(--line); }
   header .grow { flex: 1; }
-  #menu { display: none; }
+  #menu { display: none; position: relative; }
+  /* On a phone the upload list is in the closed drawer: the ☰ button counts jobs under way or waiting for you. */
+  #jobcount:not(:empty) { position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: 999px; font: 600 11px/18px var(--mono); background: var(--accent); color: var(--accent-ink); }
+  #jobcount.alert { background: var(--bad); color: var(--paper); }
   #keydot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); display: inline-block; margin-right: 6px; }
   #keydot.set { background: var(--ok); }
   #settings { position: absolute; right: 20px; top: 58px; width: min(340px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; box-shadow: 0 12px 40px #0003; z-index: 5; display: grid; gap: 8px; }
@@ -211,8 +215,14 @@
     header button.icon { flex: none; width: 32px; height: 32px; }
     header button:not(.icon) { padding: 5px 8px; font-size: 12.5px; }
   }
-  @media (max-width: 380px) { header .wide { display: none; } header .narrow { display: inline; } }
-  @media (max-width: 340px) { header button:not(.icon) { padding: 5px 6px; } }
+  /* Short labels, so the row still fits with the instruction count on the Instructions button. */
+  @media (max-width: 420px) { header .wide { display: none; } header .narrow { display: inline; } }
+  @media (max-width: 340px) {
+    header { padding: 10px 8px; }
+    header button:not(.icon) { padding: 5px 6px; }
+    header button.icon { width: 30px; }
+    #rulecount:not(:empty) { margin-left: 3px; padding: 2px 4px; }
+  }
 </style>
 </head>
 <body>
@@ -232,7 +242,7 @@
 </aside>
 <main>
   <header>
-    <button class="icon" id="menu" type="button" aria-label="Show library">☰</button>
+    <button class="icon" id="menu" type="button" aria-label="Show library">☰<span id="jobcount"></span></button>
     <span class="label">Conversation</span>
     <span class="grow"></span>
     <button id="newchat" type="button" title="Start a new conversation">New<span class="wide"> chat</span></button>
@@ -771,6 +781,22 @@ function jobRow(id) {
 function dropRow(row) {
   row.remove();
   for (const [id, r] of jobRows) if (r === row) { jobRows.delete(id); gone.add(id); }
+  syncBadge();
+}
+
+// The ☰ badge: rows under way, and rows waiting for you (failed, a cost or a duplicate to
+// decide), which turn it red. It shows only on phones, where the list is in the drawer.
+function syncBadge() {
+  let busy = 0, waiting = 0;
+  for (const r of $('queue').children) {
+    if (r.classList.contains('bad') || r.classList.contains('dup')) waiting++;
+    else if (r.job ? ACTIVE.has(r.job.status) : !r.spin.hidden) busy++;
+  }
+  const n = busy + waiting, badge = $('jobcount');
+  badge.textContent = n || '';
+  badge.classList.toggle('alert', waiting > 0);
+  $('menu').setAttribute('aria-label', 'Show library' + (n ? `: ${busy} upload${busy === 1 ? '' : 's'} under way`
+    + (waiting ? `, ${waiting} waiting for you` : '') : ''));
 }
 
 // What a row shows. bar: null (none), 'wait' (moving) or 0..1; buttons: [[label, tip, onclick]];
@@ -796,15 +822,17 @@ function paint(row, { name, state, cls = '', spin = false, bar = null, lines = [
   [...row.acts.children].forEach((b, i) => b.onclick = buttons[i][2]);
   row.x.hidden = !x;
   if (x) { row.x.title = x[0]; row.x.setAttribute('aria-label', x[0]); row.x.onclick = x[1]; }
+  syncBadge();
 }
 
 function estimateText(e) {
   if (!e) return '';
-  const cost = `about ${fmtTok(e.input_tokens)} input and ${fmtTok(e.output_tokens)} output tokens, est. ${fmtUsd(e.cost_usd)}`;
+  const unpriced = e.priced === false ? ' (this model has no list price in app/llm.py: priced like the dearest one)' : '';
+  const cost = `about ${fmtTok(e.input_tokens)} input and ${fmtTok(e.output_tokens)} output tokens, est. ${fmtUsd(e.cost_usd)}${unpriced}`;
   if (e.mode == null) return `${e.model_label} analyzes the text: ${cost}`;
   if (!e.claude_pages) return `No scanned pages, so ${e.model_label} only analyzes the text layer: ${cost}`;
-  const which = e.claude_pages === e.pages ? `all ${e.pages} page${e.pages > 1 ? 's' : ''}`
-    : `${e.claude_pages} of ${e.pages} pages (the scanned ones)`;
+  const which = e.claude_pages < e.pages ? `${e.claude_pages} of ${e.pages} pages (the scanned one${e.claude_pages > 1 ? 's' : ''})`
+    : e.pages > 1 ? `all ${e.pages} pages` : 'its one page';
   return `${e.model_label} reads ${which}: ${cost}`;
 }
 
@@ -821,8 +849,8 @@ async function jobAction(row, id, what) {
     if (r?.job) showJob(row, r.job);
   } catch (err) {
     if (err.status === 401) { $('settings').hidden = false; key.focus(); }
-    row.note = err.message;
-    if (row.job) showJob(row, row.job);
+    if (err.data?.job) showJob(row, err.data.job);  // say it finished meanwhile: the row shows that
+    else { row.note = err.message; if (row.job) showJob(row, row.job); }
   }
   startPolling(0);
 }
@@ -835,9 +863,11 @@ function showJob(row, j) {
   const switched = j.options?.switched ? `Switched to Claude: ${j.options.switched}` : '';
   if (j.status === 'cancelled') { dropRow(row); return; }
   if (j.status === 'queued' || j.status === 'running') {
-    const reading = j.status === 'running' && j.total > 0 && j.progress < j.total;
-    paint(row, { name, state: j.status === 'queued' ? 'Queued' : 'Working', spin: true,
-      bar: reading ? j.progress / j.total : 'wait', lines: [[j.stage], [switched], [est]],
+    // Only the job being read moves: a bar while its pages are counted (never quite empty
+    // once started), a moving one otherwise. A queued job waits still.
+    const running = j.status === 'running', reading = running && j.total > 0 && j.progress < j.total;
+    paint(row, { name, state: running ? 'Working' : 'Queued', spin: running,
+      bar: !running ? null : reading ? Math.max(j.progress / j.total, 0.03) : 'wait', lines: [[j.stage], [switched], [est]],
       x: ['Cancel this job', null] });
     row.x.onclick = sure(row.x, act('cancel'));
   } else if (j.status === 'awaiting_confirmation') {
@@ -929,6 +959,9 @@ async function uploadOne(f, onDuplicate = '', row = null) {
     if (limit && f.size > limit * 1024 * 1024)
       throw new Error(`${(f.size / 1048576).toFixed(0)} MB is over the ${limit} MB upload limit`);
     const r = await send('/api/upload', body, uploading);
+    // A poll that ran between the job's commit and this answer has given it a row of its own.
+    const other = jobRows.get(r.job.id);
+    if (other && other !== row) other.remove();
     jobRows.set(r.job.id, row);
     showJob(row, r.job);
     startPolling();

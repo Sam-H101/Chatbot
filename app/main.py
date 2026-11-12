@@ -2,6 +2,7 @@
 import mimetypes
 import os
 import re
+from urllib.parse import urlsplit
 
 import anthropic
 from flask import Flask, jsonify, request, send_file, send_from_directory
@@ -62,8 +63,31 @@ def _keep_key(job_id):
     jobs.remember_key(job_id, _key())
 
 
+def _add_job(*args, **kw):
+    """db.add_job, the browser's key kept for the job before the worker can see it. The
+    caller holds files_lock: if the job is never committed, its key goes before another
+    job can be given the same id."""
+    try:
+        return db.add_job(*args, on_insert=_keep_key, **kw)
+    except BaseException:
+        jobs.prune_keys()
+        raise
+
+
+def _body():
+    """The request's JSON object, or {} when it sent none. Anything else is a 400."""
+    body = request.get_json(force=True, silent=True)
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise BadChoice("Expected a JSON object")
+    return body
+
+
 def _choice(raw):
     """'auto' | 'ollama:<model>' | 'claude:<model>' -> (backend, model or None)."""
+    if raw is not None and not isinstance(raw, str):
+        raise BadChoice(f"Unknown model choice: {raw!r}")
     raw = (raw or "").strip() or ("auto" if BACKEND == "ollama" else f"claude:{llm.MODEL}")
     if raw == "auto":
         return "auto", None
@@ -113,11 +137,13 @@ def _run(choice, fn, fits_local=True):
 
 
 def _job_out(j):
-    """A job for the API: no stored path, no page texts (a count of kept pages instead)."""
+    """A job for the API: no stored path and no page texts, but how many pages a retry
+    keeps: those of the reader it starts with (db.list_jobs counts them per reader)."""
     partial = j.pop("partial", None) or {}
+    kept = j.pop("kept", None) or {reader: len(pages) for reader, pages in partial.items()}
     j.pop("file_path", None)
     j["model_label"] = jobs.choice_label(j["model"])
-    j["pages_kept"] = sum(len(p) for p in partial.values())
+    j["pages_kept"] = kept.get(jobs.first_reader(j), 0)
     return j
 
 
@@ -138,6 +164,11 @@ def _too_large(e):
 
 @app.errorhandler(BadChoice)
 def _bad_choice(e):
+    return jsonify(error=str(e)), 400
+
+
+@app.errorhandler(extract.Unsupported)
+def _unsupported(e):
     return jsonify(error=str(e)), 400
 
 
@@ -177,8 +208,22 @@ def _ollama_error(e):
 
 
 @app.before_request
+def _same_origin():
+    """A page on another site can make a browser send simple POSTs here (a form, or a
+    fetch with a text body), say to start a job waiting for its cost to be confirmed, or
+    to delete documents. Browsers name the sending page's origin on every POST; it must
+    be this server. Clients without one (curl, scripts) are not browsers and pass."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    origin = request.headers.get("Origin")
+    if origin is not None and urlsplit(origin).netloc != request.host:
+        return jsonify(error="Requests from other sites are not accepted"), 403
+    return None
+
+
+@app.before_request
 def _start_worker():
-    jobs.start()  # once per process; queued jobs carry on after a restart
+    jobs.start()  # once per process (gunicorn starts it at boot); queued jobs carry on after a restart
 
 
 @app.get("/")
@@ -233,6 +278,7 @@ def upload():
         raise BadChoice("on_duplicate must be 'replace' or 'keep'")
     options = {"on_duplicate": on_duplicate, "claude_pages": _claude_pages(request.form.get("claude_pages"))}
     data = f.read()
+    extract.check(name, data)  # a file that can never be read gets its 400 now, not a failed job later
     sha = db.file_hash(data)
     with db.files_lock:  # check and queue together: two uploads of one file can't both pass
         dups, reading = db.find_duplicates(sha), db.active_jobs(sha=sha)
@@ -245,8 +291,8 @@ def upload():
             return jsonify(error=f"{name} is already in the library", duplicate={
                 "id": d["id"], "filename": d["filename"], "title": d["title"], "created_at": d["uploaded_at"],
                 "model": d["model"], "copies": len(dups)}), 409
-        job_id = db.add_job("upload", name, sha, model, options, data=data, on_insert=_keep_key,
-                            mime=mimetypes.guess_type(name)[0] or f.mimetype or "application/octet-stream")
+        job_id = _add_job("upload", name, sha, model, options, data=data,
+                          mime=mimetypes.guess_type(name)[0] or f.mimetype or "application/octet-stream")
     jobs.wake()
     return jsonify(job=_job_out(db.get_job(job_id))), 202
 
@@ -255,7 +301,7 @@ def upload():
 def reread(doc_id):
     """Queue a new reading of a document's kept original, with any model: when done it
     replaces the document's text, metadata and model in place (same id)."""
-    body = request.get_json(silent=True) or {}
+    body = _body()
     model = _job_choice(body.get("model"))
     options = {"claude_pages": _claude_pages(body.get("claude_pages"))}
     with db.files_lock:  # a delete can't slip in between the checks and the job
@@ -266,8 +312,8 @@ def reread(doc_id):
             return jsonify(error="No original file is kept for this document, so it can't be re-read"), 409
         if db.active_jobs(doc_id=doc_id):
             return jsonify(error=f"{f['filename']} is already being re-read"), 409
-        job_id = db.add_job("reread", f["filename"], f["sha256"], model, options, size=f["size"],
-                            mime=f["mime"], doc_id=doc_id, on_insert=_keep_key)
+        job_id = _add_job("reread", f["filename"], f["sha256"], model, options, size=f["size"],
+                          mime=f["mime"], doc_id=doc_id)
     jobs.wake()
     return jsonify(job=_job_out(db.get_job(job_id))), 202
 
@@ -289,6 +335,7 @@ def job_cancel(job_id):
     """Cancel a job that hasn't finished (a running one stops after its current page),
     or dismiss a failed one."""
     j = db.cancel_job(job_id)
+    jobs.prune_keys()  # a job that won't run again needs no key
     if not j:
         return jsonify(error="Not found"), 404
     if j["status"] == "done":
@@ -296,18 +343,25 @@ def job_cancel(job_id):
     return jsonify(job=_job_out(j))
 
 
+# Confirm and Retry check the job's state, keep the key and queue the job under files_lock:
+# a waiting or failed job only moves on through the routes, which all hold it, so the
+# check still holds when the job is queued, and no other job's key is touched.
+
 @app.post("/api/jobs/<id:job_id>/confirm")
 def job_confirm(job_id):
     """Start a job that waits for its estimated Claude cost to be confirmed."""
-    j = db.get_job(job_id)
-    if not j:
-        return jsonify(error="Not found"), 404
-    if j["status"] == "awaiting_confirmation" and not _has_key():  # it waits only to spend on Claude
-        raise MissingKey()
-    _keep_key(job_id)  # before it is queued
-    if not db.update_job(job_id, when=("awaiting_confirmation",), status="queued", stage="Waiting to start",
-                         options={**j["options"], "confirmed": True}):
-        return jsonify(error="This job is not waiting for a confirmation"), 409
+    with db.files_lock:
+        j = db.get_job(job_id)
+        if not j:
+            return jsonify(error="Not found"), 404
+        if j["status"] != "awaiting_confirmation":
+            return jsonify(error="This job is not waiting for a confirmation"), 409
+        if not _has_key():  # it waits only to spend on Claude
+            raise MissingKey()
+        _keep_key(job_id)  # before it is queued
+        # The amount confirmed: a retry that would cost more asks again (jobs._check_cost).
+        db.update_job(job_id, when=("awaiting_confirmation",), status="queued", stage="Waiting to start",
+                      options={**j["options"], "confirmed": (j["estimate"] or {}).get("cost_usd", 0)})
     jobs.wake()
     return jsonify(job=_job_out(db.get_job(job_id)))
 
@@ -316,20 +370,20 @@ def job_confirm(job_id):
 def job_retry(job_id):
     """Queue a failed job again. Pages a model already read are kept and not paid for
     twice; Auto tries the local model first again."""
-    j = db.get_job(job_id)
-    if not j:
-        return jsonify(error="Not found"), 404
-    if j["status"] != "failed":
-        return jsonify(error="Only a failed job can be retried"), 409
-    if not os.path.isfile(os.path.join(db.files_dir(), os.path.basename(j["file_path"]))):
-        return jsonify(error="The original file is no longer stored; upload it again"), 409
-    if j["model"].startswith("claude:") and not _has_key():
-        raise MissingKey()
-    options = {k: v for k, v in j["options"].items() if k not in ("fallback", "switched")}
-    _keep_key(job_id)  # before it is queued
-    if not db.update_job(job_id, when=("failed",), status="queued", stage="Waiting to start", error=None,
-                         options=options):
-        return jsonify(error="Only a failed job can be retried"), 409
+    with db.files_lock:
+        j = db.get_job(job_id)
+        if not j:
+            return jsonify(error="Not found"), 404
+        if j["status"] != "failed":
+            return jsonify(error="Only a failed job can be retried"), 409
+        if not os.path.isfile(os.path.join(db.files_dir(), os.path.basename(j["file_path"]))):
+            return jsonify(error="The original file is no longer stored; upload it again"), 409
+        if j["model"].startswith("claude:") and not _has_key():
+            raise MissingKey()
+        options = {k: v for k, v in j["options"].items() if k not in ("fallback", "switched")}
+        _keep_key(job_id)  # before it is queued
+        db.update_job(job_id, when=("failed",), status="queued", stage="Waiting to start", error=None,
+                      options=options)
     jobs.wake()
     return jsonify(job=_job_out(db.get_job(job_id)))
 
@@ -347,15 +401,19 @@ def document_file(doc_id):
 
 @app.delete("/api/documents/<id:doc_id>")
 def delete(doc_id):
-    return ("", 204) if db.delete_document(doc_id) else (jsonify(error="Not found"), 404)
+    deleted = db.delete_document(doc_id)
+    jobs.prune_keys()  # its re-read, if any, was cancelled
+    return ("", 204) if deleted else (jsonify(error="Not found"), 404)
 
 
 @app.post("/api/documents/delete")
 def delete_many():
-    ids = (request.get_json(force=True) or {}).get("ids")
+    ids = _body().get("ids")
     if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
         return jsonify(error="Expected {\"ids\": [1, 2, ...]}"), 400
-    return jsonify(deleted=db.delete_documents(ids))
+    deleted = db.delete_documents(ids)
+    jobs.prune_keys()
+    return jsonify(deleted=deleted)
 
 
 @app.get("/api/usage")
@@ -391,7 +449,7 @@ def _rule_text(body):
 
 @app.post("/api/instructions")
 def add_instruction():
-    body = request.get_json(force=True) or {}
+    body = _body()
     text = _rule_text(body)
     if text is None:
         raise BadChoice("Instruction text can't be empty")
@@ -401,7 +459,7 @@ def add_instruction():
 
 @app.patch("/api/instructions/<id:rule_id>")
 def edit_instruction(rule_id):
-    body = request.get_json(force=True) or {}
+    body = _body()
     enabled = body.get("enabled")
     if enabled is not None and not isinstance(enabled, bool):
         raise BadChoice("enabled must be true or false")
@@ -417,8 +475,9 @@ def delete_instruction(rule_id):
 
 @app.post("/api/chat")
 def chat():
-    body = request.get_json(force=True)
-    question = (body.get("question") or "").strip()
+    body = _body()
+    question = body.get("question")
+    question = question.strip() if isinstance(question, str) else ""
     if not question:
         return jsonify(error="Empty question"), 400
     choice = _choice(body.get("model"))
