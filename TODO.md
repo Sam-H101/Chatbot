@@ -1,6 +1,6 @@
 # Where this stopped (2026-11-10)
 
-Everything below is committed (as of 2026-11-12); nothing after 894b984 has been pushed yet.
+Everything below is committed (as of 2026-11-12, the Documents view included); nothing after 894b984 has been pushed yet.
 
 ## Done
 
@@ -355,12 +355,51 @@ Everything below is committed (as of 2026-11-12); nothing after 894b984 has been
   the edited vendor and due date; one receipt read by Claude Haiku 5.5 through an image block (2 calls, $0.0005).
   The current page still works with it all (light and dark, 1400 and 390 px, no console errors). Not done here: the
   page's CSP on `/` (it needs the page split into files first, the frontend's first step)
+- 2026-11-12: Documents and folders overhaul: nested folders, a Documents view (grid/list, detail, selection, drag and
+  drop), ask about a folder, uploads into folders, photo uploads read by the vision model, auto-filing with
+  suggestions, key details, thumbnails, and markdown upload with a sanitized preview. Split index.html into app.css,
+  app.js, docs.js and md.js; removed DataTables and jQuery. The page: a Chat | Documents switch (the folder button on
+  phones), both views kept alive (an answer keeps streaming, with a dot on Chat), places in the URL hash (reload, Back
+  and Forward; on a phone every level is a step back), the left column 288 px with the Add box (uploads go where
+  Documents is; auto-file box for Unfiled), the queue and a folder tree (counts, Ask, menus, arrow keys, F2, Delete,
+  A, Shift+N), Chats as a drawer in Documents. Documents: All documents, Library, Unfiled and folders, breadcrumbs,
+  cards (thumbnails or typed icons, key details, due dates, unit fixes, suggestion chips, "Not analyzed") or a list
+  whose columns follow the width, natural sort with empty values last, search here or everywhere (instant, then the
+  server's matches and passages), filters as chips, totals per currency, selection (box, Ctrl/Shift-click, Ctrl+A,
+  Select on phones) with Ask, Move, Re-read, Delete (two clicks) and New folder from these, a move picker, drag and
+  drop of documents and folders and of files onto folders, Undo after every move, ghost cards while uploads are
+  read, re-read strips, the suggestions strip and first-run tip. Detail (column, overlay or page): previews (PDF page
+  1, photo with its read text, Markdown formatted or plain, text), title and key details edited in place, folder
+  line, suggestion banner with Dismiss, summary, keywords, copies, actions. Folder dialogs (new, rename, delete with
+  move-up default or a ticked delete-everything checked by the server's count). Scope: chip with folders, a tree
+  dialog, "Only in Receipts (folder)", the folder empty state, Show in Documents from a source. `md.js` builds DOM
+  only (no innerHTML), links http(s)/mailto only, images as chips, 6 levels and 200 KB at most. `GET /` sends a CSP
+  (own scripts only, no inline). 244 tests pass (1 new for the page's files, CSP and static caching; the login test
+  now uses `/static/app.js`). Staging (fresh library, real models), Playwright: a layout sweep at every width from
+  320 to 1600 px (4 px steps light, 40 px dark), both views, with and without Log out: no sideways scroll, header and
+  Documents' parts fit (short header labels now at 821-850 px, 821-880 with a login). First run (no folders): empty
+  state, ghost cards, the tip, tree and listing keys, and 3 Unfiled documents filed into a new "Manuals" in 5 taps on
+  a phone: 14 checks pass. Seed: a 3-page manual into Tractor/Manuals, a receipt photo (minicpm-v4.6) auto-filed
+  into Receipts with its key details, a water bill auto-filed into Household/Bills, Markdown and text files. Flows:
+  94 checks pass at 1440/1024/1600 (light and dark) and 390/320 (touch, dark): folders, include subfolders, PDF
+  preview "Page 1 of 3", title edit, list sort, Ctrl/Shift-click and Ctrl+A, search with passages and Search
+  everywhere, suggestion chip and Undo, picker and Undo, name clash inline, drag and drop of a card and a folder (a
+  folder into its own subfolder refused), F2 rename, delete dialog both modes, Markdown preview (a 140 KB hostile file
+  renders in 12 ms with no img, no script, no non-http link, 6 nested quotes at most, no request to example.com), a
+  receipt's vendor edited and kept by a re-read, filters and sort by amount, reload and a deleted folder's hash, Ask
+  about Tractor answered from the manual, then a PDF dropped onto the Manuals tile (ghost card, real card) was cited
+  by the next question without changing the scope, switching to Documents while an answer streamed (dot, answer
+  finished), the scope dialog, Show in Documents, the medium overlay, and on a phone Back from detail to folder to
+  Library to Chat, select mode with the bottom bar, the picker and menu as sheets, the Add sheet with Take a photo,
+  and the detail's five-button bar fitting at 320 px and hiding while a field has focus. Found and fixed on the way:
+  the list's sticky header sat over the first row (a scrolling wrapper), the Markdown nesting cap allowed 7 levels,
+  the phone-only Uploads box and scope toggle showed on desktop, the Add box overflowed with the model picker
 
 ## To do
 
-- The Documents view (frontend) on the folders API: folder tree, grid and list, detail panel with key details and
-  previews (a sanitized Markdown preview), selection and bulk moves, ask about a folder, uploads into a folder, and
-  the page's CSP on `/` once the page is split into files. Not deployed yet: the backend works with today's page.
+- Deploy the documents and folders overhaul (the backend commit a964259 and the Documents view after it) to the live
+  app. Neither is deployed yet. The live library's 14 documents will show in Library as Unfiled with typed icons
+  (they have no kept originals, so no thumbnails); the first-run tip and "New folder from these" file them.
 - Install the port proxy task once, from an elevated PowerShell (README, "Reach it from the LAN").
 - Decide the backup time zone: nightly backups run at 03:00 UTC (10 or 11 p.m. Eastern) unless `TZ` is set in `.env`
   (e.g. `TZ=America/New_York`, then `docker compose up -d backup`).

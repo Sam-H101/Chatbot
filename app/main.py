@@ -43,6 +43,10 @@ INLINE_TYPES = {"application/pdf", "text/plain", "image/jpeg", "image/png", "ima
 # Inline photos and text get a sandbox besides nosniff: nothing in them can run or load. Not
 # PDFs, whose viewer it breaks.
 SANDBOX_CSP = "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"
+# The page itself (GET /): its own scripts only (no inline script or handlers), no images or
+# connections to other sites, so even a fault in the Markdown preview can't run or fetch anything.
+PAGE_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'")
 # What the file picker offers (GET /api/models). The server takes any UTF-8 text file too.
 UPLOAD_EXTS = (".pdf", ".docx", ".txt", ".md", ".markdown", ".csv", ".json", ".html", ".xml", ".log", ".py", ".js",
                ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif")
@@ -272,7 +276,11 @@ auth.setup(app)
 
 @app.get("/")
 def index():
-    return send_from_directory(app.static_folder, "index.html")
+    """The page: markup only, its script and styles in /static (app.css, md.js, app.js, docs.js),
+    so the CSP can refuse inline script, and images and connections to other sites."""
+    resp = send_from_directory(app.static_folder, "index.html")
+    resp.headers["Content-Security-Policy"] = PAGE_CSP
+    return resp
 
 
 @app.get("/api/models")

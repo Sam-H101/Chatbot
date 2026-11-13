@@ -3305,6 +3305,33 @@ def next_of(r):
     return parse_qs(loc.query).get("next", ["/"])[0]
 
 
+def test_the_page_loads_its_own_files_only(client):
+    """The page is markup only: its styles and scripts are files of its own, loaded in order
+    (md.js, app.js, docs.js), with no inline script or handlers, so its CSP can refuse inline
+    script, other sites' scripts and images, and connections elsewhere."""
+    import pathlib
+    r = client.get("/")
+    csp = r.headers["Content-Security-Policy"]
+    for part in ("default-src 'self'", "script-src 'self'", "img-src 'self' data:", "connect-src 'self'",
+                 "object-src 'none'", "base-uri 'none'", "frame-ancestors 'self'", "form-action 'self'"):
+        assert part in csp
+    assert "unsafe-inline" not in csp.split("script-src")[1].split(";")[0] and "unsafe-eval" not in csp
+    page = r.get_data(as_text=True)
+    scripts = re.findall(r"<script\b([^>]*)>", page)
+    assert [re.search(r'src="([^"]+)"', s).group(1) for s in scripts] == ["static/md.js", "static/app.js", "static/docs.js"]
+    assert all("defer" in s for s in scripts)                                                    # all run before start()
+    assert not re.search(r"\son[a-z]+\s*=", page, re.I) and "javascript:" not in page          # no inline handlers
+    assert 'href="static/app.css"' in page and "vendor/" not in page and "<style" not in page
+    static = pathlib.Path(__file__).parent.parent / "app" / "static"
+    assert not (static / "vendor").exists()                                                     # jQuery and DataTables gone
+    assert "innerHTML" not in (static / "md.js").read_text(encoding="utf-8")                    # the preview builds DOM only
+    for name in ("md.js", "app.js", "docs.js", "app.css"):
+        f = client.get(f"/static/{name}")
+        assert f.status_code == 200 and f.headers["Cache-Control"] == "no-cache" and f.headers.get("ETag")
+        assert client.get(f"/static/{name}", headers={"If-None-Match": f.headers["ETag"]}).status_code == 304
+        f.close()
+
+
 def test_without_a_password_there_is_no_login(client, tmp_path):
     r = client.get("/")
     assert r.status_code == 200 and "Set-Cookie" not in r.headers
@@ -3328,7 +3355,7 @@ def test_a_password_guards_every_page_and_api_call(guarded):
         assert r.status_code == 401 and r.json["error"] == "Login required"
     r = guarded.get("/")
     assert r.status_code == 302 and r.headers["Location"] == "/login"
-    for path in ("/static/index.html", "/static/vendor/jquery.min.js", "/favicon.ico", "/?q=1"):
+    for path in ("/static/index.html", "/static/app.js", "/favicon.ico", "/?q=1"):
         assert next_of(guarded.get(path)) == path
     # A browser opening an API link (an original file, from a bookmark) goes to the login page and back.
     assert next_of(guarded.get("/api/documents/1/file", headers={"Sec-Fetch-Mode": "navigate"})) == "/api/documents/1/file"
