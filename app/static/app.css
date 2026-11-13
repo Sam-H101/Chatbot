@@ -120,7 +120,8 @@ button.chip:hover:not(:disabled) { border-color: var(--accent); color: var(--acc
 .hit { font-size: 13px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); display: grid; gap: 4px; }
 .hit .meta { font: 11px/1.4 var(--mono); color: var(--soft); overflow-wrap: anywhere; }
 .hit .meta b { color: var(--ink); font: 600 13px/1.3 var(--sans); }
-.hit .snip { overflow-wrap: anywhere; }
+/* A passage: plain text that wraps (a long word too), at most five lines. */
+.hit .snip { overflow-wrap: anywhere; white-space: normal; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; line-clamp: 5; overflow: hidden; }
 .hit .hacts { display: flex; flex-wrap: wrap; gap: 6px 14px; }
 mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0; box-shadow: 0 0 0 1px var(--mark); }  /* no padding: it would split "B oil er" */
 

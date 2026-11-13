@@ -1288,7 +1288,10 @@ function hitsBlock(hits) {
     const d = lib.docs.get(h.doc_id), card = el('div', 'hit'), meta = el('div', 'meta');
     meta.append(el('b', '', docTitle(d)), ` · ${h.page_start ? pagesText(pageSpan(h.page_start, h.page_end)) : `part ${h.idx + 1}`}`);
     const snip = el('div', 'snip');
-    h.snippet.split(/\[([^\]]*)\]/).forEach((part, i) => snip.append(i % 2 ? el('mark', '', part) : part));  // the API marks matches as [word]
+    // The API's snippet_parts alternate plain text and matches (odd places): text nodes only. An
+    // older server marks matches inside `snippet` as [word]; a "[" of the text itself isn't one.
+    const parts = Array.isArray(h.snippet_parts) ? h.snippet_parts : String(h.snippet || '').split(/\[([^[\]]*)\]/);
+    parts.forEach((part, i) => { if (part) snip.append(i % 2 ? el('mark', '', String(part)) : String(part)); });
     const acts = el('div', 'hacts');
     if (d.has_file && d.kind === 'pdf' && h.page_start) {
       acts.append(Object.assign(el('a', 'open', `Open page ${h.page_start} ↗`), { href: `/api/documents/${d.id}/file#page=${h.page_start}`, target: '_blank', rel: 'noopener' }));
