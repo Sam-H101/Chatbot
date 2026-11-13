@@ -361,6 +361,10 @@ function syncInto() {
   $('staynote').textContent = f ? `Uploads here stay in ${f.name}` : '';
   $('staynote').title = f ? `Uploads here stay in ${f.name}` : '';
   $('avtitle').textContent = `Add to ${f ? f.name : 'Unfiled'}`;
+  // A phone's Add bar says where files go, as the Add box does on wider screens.
+  $('addintoname').textContent = $('intoname').textContent;
+  $('addinto').title = f ? `Files added here go to ${pathText(f.id)}` : `Files added here go to Unfiled${t.auto_file ? ', or a matching folder' : ''}`;
+  $('addfab').setAttribute('aria-label', `Add to ${f ? f.name : 'Unfiled'}`);
 }
 $('autoFile').checked = autoFileOn();
 $('autoFile').onchange = e => { store.set('autoFile', e.target.checked ? '1' : '0'); syncInto(); };
@@ -655,9 +659,11 @@ function countText() {
   if (!lib.loaded) return '';
   if (p.type === 'all') return plural(lib.docs.size, 'document');
   if (p.type === 'unfiled') return `Unfiled: ${plural(unfiledIds().length, 'document')}`;
-  if (p.type === 'root') {
-    const n = lib.kids.get('root').length;
-    return n ? `${plural(lib.docs.size, 'document')} in ${plural(n, 'folder')} and Unfiled` : plural(lib.docs.size, 'document');
+  if (p.type === 'root') {  // "14 documents in 3 folders", "and Unfiled" only when it holds some
+    const n = lib.kids.get('root').length, un = unfiledIds().length, docs = plural(lib.docs.size, 'document');
+    if (!n) return docs;
+    if (un === lib.docs.size) return `${docs} · ${plural(n, 'folder')}`;  // none filed yet (or none at all)
+    return `${docs} in ${plural(n, 'folder')}${un ? ' and Unfiled' : ''}`;
   }
   const f = lib.folders.get(p.id);
   if (!f) return '';
@@ -2589,13 +2595,16 @@ function renderPanel() {
   if (d.has_file) file.append(' · ', Object.assign(el('a', 'open', 'Open ↗'), { href: `/api/documents/${d.id}/file`, target: '_blank', rel: 'noopener', title: 'Open the original in a new tab' }));
   const fl = el('div', 'folderline');
   fl.append(icon('folder'));
-  if (isUnfiled(d)) fl.append(btn('Unfiled', () => openPlace({ type: 'unfiled' }), { cls: 'open' }));
+  if (isUnfiled(d)) fl.append(btn('Unfiled', () => openPlace({ type: 'unfiled' }, { focus: true }), { cls: 'open', title: 'Open Unfiled' }));
   else {
     const f = lib.folders.get(d.folder_id), chain = [];
     for (let c = f, n = 0; c && n < 64; c = lib.folders.get(c.parent_id), n++) chain.unshift(c);
-    chain.forEach((c, k) => { if (k) fl.append(el('span', 'sep', '›')); fl.append(btn(c.name, () => openPlace({ type: 'folder', id: c.id }), { cls: 'open', title: pathText(c.id) })); });
+    chain.forEach((c, k) => { if (k) fl.append(el('span', 'sep', '›')); fl.append(btn(c.name, () => openPlace({ type: 'folder', id: c.id }, { focus: true }), { cls: 'open', title: `Open ${pathText(c.id)}` })); });
   }
-  fl.append(btn('Move…', () => moveDialog([d.id]), { cls: 'mv' }));
+  // Changes which folder it is in (the actions' Move… does the same): not a second "Move…".
+  const change = btn('Change…', () => moveDialog([d.id]), { cls: 'mv', title: 'Move it to another folder', aria: `Change the folder: ${pathText(isUnfiled(d) ? null : d.folder_id)}` });
+  change.dataset.keep = 'change';
+  fl.append(change);
   tsec.append(title, terr, saved, actions(d, 'top'), file, fl);
   if (d.filed_by === 'auto' && !isUnfiled(d)) {
     const a = el('div', 'autonote');

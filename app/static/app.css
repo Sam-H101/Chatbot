@@ -10,6 +10,9 @@
   --over: color-mix(in srgb, var(--accent) 10%, var(--card));
   --thumb-bg: color-mix(in srgb, var(--ink) 5%, var(--card));
   --shadow: 0 12px 40px #0003;
+  /* Accent-coloured text on accent-tinted fills (badges, the chosen scope, selected rows): drawn
+     toward the ink, so it stays above 4.5:1 there in both themes (5.2:1 or more). */
+  --accent-text: color-mix(in srgb, var(--accent) 70%, var(--ink));
   --hover: var(--card);  /* rows under the pointer: tree, table, conversations, the move picker */
   --menu: var(--card);
   color-scheme: light;
@@ -148,7 +151,7 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0; 
 .trow:has(.more[aria-expanded="true"]) .tbtn { display: grid; }
 /* In Chat: the folders questions are limited to. */
 .tnode.inscope > .trow { background: var(--sel); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); }
-.tnode.inscope > .trow .tname { color: var(--accent); font-weight: 600; }
+.tnode.inscope > .trow .tname { color: var(--accent-text); font-weight: 600; }
 .tnode.inscope > .trow .tbtn.ask { display: grid; color: var(--accent); }
 .tnode[aria-selected="true"] > .trow { background: var(--sel); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); }
 .tnode[aria-selected="true"] > .trow::before { content: ""; position: absolute; left: -1px; top: 5px; bottom: 5px; width: 3px; border-radius: 3px; background: var(--accent); }
@@ -259,12 +262,12 @@ form#ask { padding: 12px 20px 18px; }
 .scopechip.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--paper)); }
 .scopechip button { border: 0; background: none; border-radius: 999px; padding: 4px 10px; font: 12px/1.2 var(--mono); color: var(--ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scopechip button svg.ic { width: 13px; height: 13px; margin-right: 4px; vertical-align: -2px; }
-.scopechip.on #scopebtn { color: var(--accent); font-weight: 600; padding-right: 3px; }
+.scopechip.on #scopebtn { color: var(--accent-text); font-weight: 600; padding-right: 3px; }
 .scopechip.gone { border-color: var(--bad); background: var(--paper); }
 .scopechip.gone #scopebtn { color: var(--bad); }
 .scopechip.pulse { animation: pulse .6s ease-out; }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 60%, transparent); } 100% { box-shadow: 0 0 0 10px transparent; } }
-#scopeclear { flex: none; padding: 4px 9px 4px 6px; color: var(--soft); overflow: visible; }
+#scopeclear { flex: none; padding: 4px 9px 4px 6px; color: color-mix(in srgb, var(--soft) 70%, var(--ink)); overflow: visible; }  /* 4.5:1 on the tinted chip */
 .turn.user .scoped { font-size: 12px; color: var(--soft); max-width: 85%; overflow-wrap: anywhere; text-align: right; }
 
 /* ---- documents view ---- */
@@ -351,13 +354,9 @@ dialog.menu [role^="menuitem"] > svg.ic { margin: 0; }
 .tile .tpath { font: 11px/1.3 var(--mono); color: var(--soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile .tcount { font: 11px/1 var(--mono); color: var(--soft); flex: none; }
 .tile .more, .dcard .more, .dtable .more { border: 0; background: none; width: 30px; height: 30px; padding: 0; display: grid; place-items: center; border-radius: 50%; color: var(--soft); flex: none; }
+/* ⋯ keeps its place after the count, shown on hover and focus: the count never hides behind it. */
 .tile .more { visibility: hidden; }
 .tile:hover .more, .tile:focus-within .more, .tile:focus .more, .tile .more[aria-expanded="true"] { visibility: visible; }
-/* With a mouse, ⋯ shows over the count instead of keeping a blank space after it. */
-@media (pointer: fine) and (min-width: 821px) {
-  .tile { padding-right: 12px; }
-  .tile .more { position: absolute; right: 7px; top: 50%; transform: translateY(-50%); background: var(--card); }
-}
 .tile .chev { color: var(--soft); display: none; }
 .tile.allrow { display: none; }
 .tile.match { height: auto; min-height: 52px; padding-block: 6px; }
@@ -515,7 +514,7 @@ tr.frow .ntext b { font-weight: 600; }
 .dnone { padding: 18px 2px; display: grid; gap: 10px; justify-items: start; }
 .dnone .row { display: flex; flex-wrap: wrap; gap: 8px; }
 
-#addfab { display: none; }
+#addbar { display: none; }
 #dbulk { display: none; }
 #dropzone { position: absolute; inset: 8px; border: 2px dashed var(--accent); border-radius: 16px; background: color-mix(in srgb, var(--over) 88%, transparent);
             display: grid; place-items: center; z-index: 8; pointer-events: none; text-align: center; padding: 16px; }
@@ -648,7 +647,7 @@ label.ck.danger { color: var(--bad); }
 .fsec { display: grid; gap: 8px; }
 .fsec .chips { gap: 6px; }
 .fsec .chip { font-size: 12px; padding: 6px 10px; }
-.fsec .chip[aria-pressed="true"] { border-color: var(--accent); background: var(--sel); color: var(--accent); font-weight: 600; }
+.fsec .chip[aria-pressed="true"] { border-color: var(--accent); background: var(--sel); color: var(--accent-text); font-weight: 600; }
 .daterow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .daterow label { display: flex; gap: 6px; align-items: center; font-size: 13px; }
 .daterow input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
@@ -722,7 +721,7 @@ label.ck.danger { color: var(--bad); }
 .utable tfoot td { font-weight: 600; border-bottom: 0; }
 .utable td small { color: var(--soft); }
 button.ubadge { font: 600 11px/1.2 var(--mono); padding: 2px 7px; border-radius: 999px; border: 1px solid var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent); white-space: nowrap; }
+  background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent-text); white-space: nowrap; }
 button.ubadge:hover:not(:disabled) { background: var(--accent); color: var(--accent-ink); }
 .finding { display: grid; gap: 5px; padding: 10px 12px; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 4px 12px 12px 4px; background: var(--paper); }
 .finding .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
@@ -839,7 +838,6 @@ body.hasbar #toast { bottom: 100px; }
   #dselall { min-height: 44px; }
   #dselbar .bulk { display: none; }
   #dlist { padding: 4px 16px 0; }
-  #dmain { padding-bottom: 88px; }
   .tiles { grid-template-columns: minmax(0, 1fr); gap: 6px; }
   .tile { height: 56px; padding: 0 0 0 14px; }
   .tile .tname { font: 600 16px/1.3 var(--serif); }
@@ -848,12 +846,17 @@ body.hasbar #toast { bottom: 100px; }
   .tile.allrow { display: flex; }
   .tile.allrow::after { content: ""; width: 44px; flex: none; }  /* where the folders' ⋯ is: the counts line up */
   .dcard .more { opacity: 1; }
-  #addfab { display: inline-flex; align-items: center; gap: 6px; position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); height: 52px;
-            padding: 0 22px 0 18px; border-radius: 999px; background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 16px; z-index: 7; box-shadow: var(--shadow); }
-  #addfab svg.ic { width: 20px; height: 20px; }
-  body.hasbar #addfab, body.panelopen #addfab { display: none; }
-  #dbulk:not([hidden]) { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); position: fixed; left: 0; right: 0; bottom: 0; z-index: 9;
-            min-height: 64px; padding: 4px 4px env(safe-area-inset-bottom); background: var(--card); border-top: 1px solid var(--line); box-shadow: 0 -6px 20px #0002; gap: 2px; }
+  /* Add, and the selection's actions, in a bar of their own under the listing (a row of #docsview, not
+     floating): nothing in the listing is ever under them, whatever the scroll. */
+  #docsview { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+  #addbar { display: flex; grid-row: 2; grid-column: 1; align-items: center; gap: 12px; min-width: 0;
+            padding: 8px 16px calc(8px + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--line); }
+  #addbar .into { flex: 1; min-width: 0; }
+  #addfab { display: inline-flex; align-items: center; gap: 6px; height: 44px; padding: 0 20px 0 16px; font-size: 15px; flex: none; }
+  #addfab svg.ic { width: 18px; height: 18px; }
+  body.hasbar #addbar, body.panelopen #addbar { display: none; }
+  #dbulk:not([hidden]) { display: grid; grid-row: 2; grid-column: 1; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr);
+            min-height: 64px; padding: 4px 4px env(safe-area-inset-bottom); background: var(--card); border-top: 1px solid var(--line); gap: 2px; }
   #dbulk button { flex-direction: column; justify-content: center; gap: 2px; border: 0; background: none; border-radius: 10px; font-size: 11.5px; padding: 6px 2px; min-height: 56px; }
   #dbulk button svg.ic { width: 20px; height: 20px; margin: 0; }
   #dbulk button.sure { background: var(--bad); color: var(--accent-ink); }
@@ -892,6 +895,9 @@ body.hasbar #toast { bottom: 100px; }
   button.chip.src { padding: 7px 9px; }
   .scopechip button { padding-block: 7px; }
   button.ubadge, button.sug { padding: 5px 9px; margin: 2px 0; }
+  /* 45 px to touch, the pill as it was: the hit area reaches into the space above and below */
+  button.ubadge { position: relative; }
+  button.ubadge::after { content: ""; position: absolute; inset: -11px -3px; }  /* from inside its border: 23 + 22 */
   .trow { height: 44px; }
   .trow .tbtn { display: grid; width: 36px; height: 36px; }
   .cbox { opacity: 1; }
@@ -926,10 +932,9 @@ body.hasbar #toast { bottom: 100px; }
   .folderline button.open { margin-inline: 0; padding-inline: 2px; }  /* no wider than the line */
 }
 @media (pointer: coarse) and (min-width: 821px) { .tile .more { visibility: visible; } .dcard .more { opacity: 1; } }
-@media (max-width: 360px) {  /* Ask as its icon, so a short place name isn't cut */
-  #daskfolder .short { display: none; }
-  #daskfolder { width: 44px; padding: 0; justify-content: center; }
-  #daskfolder > svg.ic { margin: 0; }
+@media (max-width: 360px) {  /* Ask keeps its word ("Ask", "Ask all"); the title beside it wraps to two lines */
+  #daskfolder { padding-inline: 11px; }
+  #daskfolder > svg.ic { margin-right: 5px; }
 }
 @media (pointer: coarse) {
   /* iOS zooms the page into any field under 16 px when it gets focus */

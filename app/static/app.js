@@ -157,11 +157,16 @@ for (const [box, input] of Object.values(PAGE_BOXES)) {
   };
 }
 
+// A phone shows the chosen model in a short box: Auto's label is short there, in full in its title.
+const narrowPicks = matchMedia('(max-width: 480px)');
 function fillPicker(sel) {
   const want = sel.value || store.get(PICKERS[sel.id]) || MODELS.default || 'auto';
   sel.replaceChildren();
   const local = MODELS.auto.local || 'local model';
-  sel.append(new Option(claudeReady() ? 'Auto (local, Claude if needed)' : 'Auto (local)', 'auto'));
+  const auto = claudeReady() ? 'Auto (local, Claude if needed)' : 'Auto (local)';
+  const opt = new Option(narrowPicks.matches && claudeReady() ? 'Auto (local + Claude)' : auto, 'auto');
+  opt.title = auto;
+  sel.append(opt);
   sel.title = claudeReady()
     ? `Auto uses ${local} and switches to ${MODELS.auto.claude} when Ollama fails or the prompt is too long for it.`
     : `Auto uses ${local}. Add a Claude API key to let it switch to Claude when needed.`;
@@ -175,6 +180,7 @@ function fillPicker(sel) {
   sel.value = [...sel.options].some(o => o.value === want) ? want : 'auto';
 }
 const fillPickers = () => { Object.keys(PICKERS).forEach(id => fillPicker($(id))); syncPageBoxes(); showKey(); };
+narrowPicks.addEventListener('change', fillPickers);
 // "Read with Auto (local)": what the file drop overlay says will read a file.
 const readerText = () => $('docModel').selectedOptions[0]?.textContent || 'Auto (local)';
 
@@ -799,7 +805,7 @@ function showScope() {
   const on = !scopeAll(), b = $('scopebtn'), text = scopeText(), one = !scopeGone && scope.folders.length === 1 && !scope.docs.length;
   $('scopechip').classList.toggle('on', on);
   $('scopechip').classList.toggle('gone', !!scopeGone);
-  $('question').placeholder = one ? `Ask about ${folderName(scope.folders[0])}…` : 'Ask about your documents…';
+  fitPlaceholder();
   b.replaceChildren();
   if (one) b.append(icon('folder'));
   b.append(text);
@@ -808,6 +814,20 @@ function showScope() {
   $('scopeclear').hidden = !on && !scopeGone;
   if ($('log').querySelector('[data-empty]')) emptyState();
 }
+// The question box's hint, the longest that fits on its one line: "Ask about Tractor…" or "Ask
+// about your documents…", else "Ask a question…" (a phone at 320 px). Measured, as fonts differ.
+let measure = null;
+function fitPlaceholder() {
+  const q = $('question'), one = !scopeGone && scope.folders.length === 1 && !scope.docs.length;
+  const options = [one ? `Ask about ${folderName(scope.folders[0])}…` : 'Ask about your documents…', 'Ask a question…'];
+  const s = getComputedStyle(q), room = q.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight);
+  if (room > 0) {  // the Chat view is hidden meanwhile: decided when it shows (the box's size changes)
+    measure ||= document.createElement('canvas').getContext('2d');
+    measure.font = `${s.fontStyle} ${s.fontWeight} ${s.fontSize} ${s.fontFamily}`;
+  }
+  q.placeholder = room > 0 ? options.find(t => measure.measureText(t).width <= room) || options[options.length - 1] : options[0];
+}
+new ResizeObserver(() => fitPlaceholder()).observe($('question'));
 function pulseScope() {
   const chip = $('scopechip');
   chip.classList.remove('pulse');
@@ -1118,9 +1138,9 @@ function emptyState() {
   box.dataset.empty = '1';
   const f = !scopeGone && scope.folders.length === 1 && !scope.docs.length ? scope.folders[0] : null;
   if (f != null) {
-    const n = folderTotal(f);
+    const n = folderTotal(f), sub = lib.kids.get(f)?.length > 0;  // "and its subfolders" only when it has some
     box.append(el('h2', '', `Ask ${folderName(f)} anything.`),
-      el('div', 'muted', `${n == null ? 'The documents' : plural(n, 'document')} in this folder and its subfolders. Documents added later are included.`));
+      el('div', 'muted', `${n == null ? 'The documents' : plural(n, 'document')} in this folder${sub ? ' and its subfolders' : ''}. Documents added later are included.`));
   } else {
     const hint = el('div', 'muted');
     hint.append(el('span', 'wide', 'Add files on the left, or drop them here.'),
