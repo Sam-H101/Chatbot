@@ -457,10 +457,40 @@ Everything below is committed (as of 2026-11-12, the Documents view included); n
   box (pops the keyboard); a few light-theme labels are just under 4.5:1 contrast; 320 px truncations; wording nits
   ("and Unfiled" when it is empty, "and its subfolders" when there are none), Back focusing the first folder, two
   Move buttons in the detail panel.
+- 2026-11-13: Fixed those follow-ups (e5e7ed4..21fd80d) and deployed them. Search passages come from `snippet_parts`
+  (SQLite marks matches with U+FDD0/U+FDD1, never text), as plain text without Markdown or HTML, so a "[" in a passage
+  no longer breaks the highlight; caption labels like `<Power flow diagram>` are kept. Document types: every analysis
+  type is tidied into sentence case, takes the library's existing spelling when it is the same type (case, punctuation,
+  word order and plurals aside), and the analysis prompt lists the library's types for spelling only (a log stays a log,
+  checked with qwen3.5:9b). A type typed in the page is kept as typed. New PDFs join words pdfium split at a line-end
+  hyphen (`hy\x02draulic`). The page shows one type spelling everywhere, with filter chips grouped ignoring case; card
+  icons show the file kind (PDF) instead of a clipped type; the date always shows on cards and phone rows; focus stays
+  put after sorting, opening a detail (heading on tablets, Back on phones), opening an empty folder, Back, and Ask about
+  this folder on touch screens; the side panel follows the arrow keys at 1280 px and up; folder tiles keep their count;
+  on phones the floating "+ Add" became a bottom bar that reserves its own height (the spec still describes the floating
+  button); clearing the scope chip on a phone focuses the chip, not the question box; light-theme accent text is at least
+  5.9:1; at 320 px the placeholder, model picker and Ask labels fit; the wording nits are fixed and the detail's folder
+  line reads "Tractor · Change…". 259 tests pass. Reviewed by three independent passes (code, every item re-measured on a
+  copy of the live library at six widths in both themes, a regression sweep with real uploads); one fix round. Deployed
+  after backing up the library to `/data/metabase-before-uxfix-20261113.db` (integrity ok); `chatbot-backup:before-uxfix`
+  is the backup image that was running, but the chatbot image that was running had already been dropped from the image
+  store (test builds retag `chatbot-chatbot:latest`), so `chatbot-chatbot:before-uxfix` is 97b6e3c rebuilt (same code).
+  Live checks (read-only, every non-GET aborted) at 1600/1280/768/390/320 in both themes: all items fixed, no console
+  errors. The near-duplicate type merge was NOT applied (waiting for the owner's OK). Ollama had lost the GPU between
+  09:41 and 18:27 UTC ("CUDA driver version is insufficient", every local call on the CPU, which is what made the earlier
+  answer take 2.5 minutes); recreating the ollama container brought it back (qwen3.5:9b 100% GPU).
 
 ## To do
 
-- Fix the UX follow-ups from the 2026-11-13 read-only pass (see the log), then redeploy.
+- Decide on merging the live library's six near-duplicate types into three, through the app's own edit (it marks the
+  type as the user's): docs 2-4 and 6-14 ("Technical Manual / Service Guide", "Service Manual / Technical Guide",
+  "service manual", "manual") to "Service manual", 15 "Owner's Manual" to "Owner's manual", 1 "Wiring Diagram and
+  Electric System" to "Wiring diagram". The old values are in `/data/metabase-before-uxfix-20261113.db`.
+- Decide on joining the live library's split words: the 14 manuals' indexed text still has about 809 line-end hyphen
+  marks (`hy\x02draulic`), so a search misses those spots. Fixing it rewrites their chunks and search index once (the
+  originals weren't kept, so they can't be re-read); or upload the manuals again.
+- Check now and then that Ollama still has the GPU (`docker compose exec ollama ollama ps` shows "100% GPU"); if a
+  model shows "100% CPU", `docker compose up -d --no-deps --force-recreate ollama` brought it back on 2026-11-13.
 - Install the port proxy task once, from an elevated PowerShell (README, "Reach it from the LAN").
 - Decide the backup time zone: nightly backups run at 03:00 UTC (10 or 11 p.m. Eastern) unless `TZ` is set in `.env`
   (e.g. `TZ=America/New_York`, then `docker compose up -d backup`).
@@ -472,13 +502,15 @@ Everything below is committed (as of 2026-11-12, the Documents view included); n
 - Once the new version has proven itself, delete the pre-deploy copies: `/data/metabase-before-enhancements-20261112.db`
   in the volume (97 MB) and `~/chatbot-predeploy/` in WSL.
 - Push, when wanted (no commit carries an AI attribution trailer; those were reworded before anything was pushed).
-- Done: the enhancement plan and the documents and folders overhaul are deployed (see the log). The Windows NVIDIA driver is 582.78 and Ollama runs on the GPU
+- Done: the enhancement plan, the documents and folders overhaul and its UX follow-ups are deployed (see the log). The Windows NVIDIA driver is 582.78 and Ollama runs on the GPU
   (GTX 1080 Ti). The UI has been checked in a browser, light and dark, at phone widths (Playwright, see the log).
   Everything is committed.
 
 ## Left on the machine
 
-- Containers `chatbot-chatbot-1` (the documents and folders overhaul, deployed 2026-11-13), `chatbot-backup-1` and `chatbot-ollama-1`
+- A way back from the UX follow-up fixes: `chatbot-chatbot:before-uxfix` (97b6e3c rebuilt) and `chatbot-backup:before-uxfix`
+  (use them in the rollback command below); the library from just before is `/data/metabase-before-uxfix-20261113.db`.
+- Containers `chatbot-chatbot-1` (the UX follow-up fixes, 21fd80d, deployed 2026-11-13), `chatbot-backup-1` and `chatbot-ollama-1`
   are running inside WSL `vostok`, with `restart: unless-stopped`; the library is in volume `chatbot_metabase`, the
   nightly snapshots in `chatbot_backups`.
 - A way back from the folders overhaul: the previous version is tagged `chatbot-chatbot:before-folders` (use it in the
