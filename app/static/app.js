@@ -838,16 +838,18 @@ function rescope(old, now) {  // "Replace" gave a chosen document a new id: ques
 }
 
 // Ask about these from now on: from a folder, a card, the selection, the detail. Back in Chat,
-// with the composer focused (fine pointers) and the chip pulsing once.
+// with the composer focused (fine pointers; on a phone or touch screen the Chat/Documents toggle)
+// and the chip pulsing once.
 function askAbout(next) {
   setScope(next);
   for (const d of document.querySelectorAll('dialog[open]')) d.close();
-  showView('chat', { focus: false });
-  if (!coarse.matches && !isS.matches) $('question').focus();
+  showView('chat');
   pulseScope();
 }
-
-$('scopeclear').onclick = () => { setScope({}); $('question').focus(); };
+// After the chip changed what questions search: the question box, or on a phone or touch screen the
+// chip itself, so the on-screen keyboard doesn't pop up unasked.
+const focusAsk = () => (coarse.matches || isS.matches ? $('scopebtn') : $('question')).focus();
+$('scopeclear').onclick = () => { setScope({}); focusAsk(); };
 
 // ---- an answer's sources: the passages it was given, by document ----
 const MATCH = { keywords: 'found by keywords', meaning: 'found by meaning', both: 'found by keywords and by meaning',

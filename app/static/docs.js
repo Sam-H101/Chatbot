@@ -274,15 +274,21 @@ function showView(mode, { focus = true } = {}) {
   }
   if (focus) focusView();
 }
+// Into Documents: the listing (else, in an empty place, its heading). Into Chat: the question box on
+// fine pointers; on a phone or a touch screen the Chat/Documents toggle, so the on-screen keyboard
+// doesn't pop up unasked.
 function focusView() {
-  if (view.mode === 'docs') { if (!focusList()) $('dtitle').focus({ preventScroll: true }); return; }
-  if (isS.matches || coarse.matches) $('docsbtn').offsetParent ? $('docsbtn').focus() : $('question').focus();
-  else $('question').focus();
+  if (view.mode === 'docs') { focusPlace(); return; }
+  if (!isS.matches && !coarse.matches) $('question').focus();
+  else ($('docsbtn').offsetParent ? $('docsbtn') : $('tochat')).focus();
 }
+const focusPlace = () => { if (!focusList()) $('dtitle').focus({ preventScroll: true }); };
 
-function openPlace(p, { focus = false } = {}) {
+// from: the item to focus there (the folder just left, when going up).
+function openPlace(p, { focus = false, from = null } = {}) {
   const same = view.mode === 'docs' && samePlace(p, view.place);
   if (!same) resetPlaceState();
+  if (from) view.focusKey = from;
   const wasChat = view.mode !== 'docs';
   view.place = p;
   view.doc = null;
@@ -292,8 +298,21 @@ function openPlace(p, { focus = false } = {}) {
   setMode('docs');
   render();
   announce(countText());
-  if (focus || wasChat) focusList();
+  if (focus || wasChat) focusPlace();
 }
+// Up a level (Back, Backspace, Alt+↑, a breadcrumb): focus on the folder the way came through.
+function goTo(p) {
+  let from = null;
+  if (view.place.type === 'all') from = 'pall';
+  else if (view.place.type === 'folder') {
+    for (let f = lib.folders.get(view.place.id), n = 0; f && n < 64; f = lib.folders.get(f.parent_id), n++) {
+      const up = f.parent_id != null && lib.folders.has(f.parent_id) ? { type: 'folder', id: f.parent_id } : { type: 'root' };
+      if (samePlace(up, p)) { from = 'f' + f.id; break; }
+    }
+  }
+  openPlace(p, { focus: true, from });
+}
+const goUp = () => { if (view.place.type !== 'root') goTo(parentPlace(view.place)); };
 
 // Documents at a document: its folder (Unfiled if none) with its detail open. From job rows'
 // Show and the sources dialog's Show in Documents.
@@ -668,7 +687,7 @@ function renderHead(L) {
     const chain = [];
     if (p.type === 'folder') for (let f = lib.folders.get(lib.folders.get(p.id)?.parent_id), n = 0; f && n < 64; f = lib.folders.get(f.parent_id), n++) chain.unshift(f);
     const crumb = (label, place, drop) => {
-      const li = el('li'), b = btn(label, () => openPlace(place));
+      const li = el('li'), b = btn(label, () => goTo(place));  // the crumbs are drawn anew: focus goes to the listing
       b.dataset.drop = drop;
       b.title = label;
       li.append(b);
@@ -680,7 +699,7 @@ function renderHead(L) {
     if (chain.length > keep + (S ? 1 : 0)) {  // the middle folds into "…"
       const hidden = chain.slice(S ? 0 : 1, chain.length - (S ? 1 : 2));
       shown = S ? chain.slice(-1) : [chain[0], ...chain.slice(-2)];
-      const li = el('li'), more = btn('…', () => openMenu({ anchor: more, title: 'Folders above', items: hidden.map((f, i) => ({ label: f.name, icon: 'folder', indent: i, onclick: () => openPlace({ type: 'folder', id: f.id }) })) }), { aria: 'More folders above', title: hidden.map(f => f.name).join(' › ') });
+      const li = el('li'), more = btn('…', () => openMenu({ anchor: more, title: 'Folders above', items: hidden.map((f, i) => ({ label: f.name, icon: 'folder', indent: i, onclick: () => goTo({ type: 'folder', id: f.id }) })) }), { aria: 'More folders above', title: hidden.map(f => f.name).join(' › ') });
       li.append(more);
       const at = S ? 0 : 1;
       shown.forEach((f, i) => { if (i === at) items.push(li); items.push(crumb(f.name, { type: 'folder', id: f.id }, 'f' + f.id)); });
@@ -717,7 +736,7 @@ function renderHead(L) {
   $('dflatbox').hidden = !sub;
   $('dflat').checked = view.flat;
 }
-$('dback').onclick = () => openPlace(parentPlace(view.place), { focus: true });
+$('dback').onclick = goUp;
 $('daskfolder').onclick = () => askPlace(placeKey(view.place));
 $('dmenu').onclick = () => {
   const p = view.place;
@@ -1054,8 +1073,10 @@ function ghostRows() {
 
 function renderList(L) {
   const box = $('dlist'), active = box.contains(document.activeElement) ? document.activeElement.closest('[data-nav]')?.dataset.nav : null;
+  const sortFocus = box.contains(document.activeElement) ? document.activeElement.dataset.sort : null;  // a list header just clicked
   const p = view.place, S = isS.matches;
-  if (active) view.focusKey = active;
+  if (active && box.dataset.place === placeKey(p)) view.focusKey = active;  // not an item of the place just left
+  box.dataset.place = placeKey(p);
   box.classList.toggle('anysel', sel.ids.size > 0);
   box.classList.toggle('selmode', sel.ids.size > 0 || view.selecting || S && coarse.matches);
   if (!lib.loaded) { box.replaceChildren(lib.error ? loadError() : skeleton()); return; }
@@ -1108,6 +1129,7 @@ function renderList(L) {
   const keep = items.find(x => x.dataset.nav === view.focusKey) || items[0];
   for (const x of items) x.tabIndex = x === keep ? 0 : -1;
   if (active && keep && keep.dataset.nav === active) keep.focus({ preventScroll: true });
+  if (sortFocus) box.querySelector(`th button[data-sort="${sortFocus}"]`)?.focus({ preventScroll: true });
   setTimeout(() => { for (const id of [...freshDocs]) if (box.querySelector(`[data-nav="d${id}"]`)) freshDocs.delete(id); }, 1600);
 }
 const navItems = () => [...$('dlist').querySelectorAll('[data-nav]')];
@@ -1172,6 +1194,7 @@ function docTable(docs, ghosts, L, folders) {
     if (k === 'folder') th.textContent = label;
     else {
       const b = btn(label, () => setSort(k, k === sk && !rel ? (sdir === 'asc' ? 'desc' : 'asc') : k === 'name' || k === 'type' ? 'asc' : 'desc'));
+      b.dataset.sort = k;  // focus stays on it when the table is drawn again
       if (k === sk && !rel) { th.setAttribute('aria-sort', sdir === 'asc' ? 'ascending' : 'descending'); b.append(` ${sdir === 'asc' ? '▲' : '▼'}`); }
       th.append(b);
     }
@@ -1536,7 +1559,7 @@ $('dlist').addEventListener('keydown', e => {
   if (e.key === 'ArrowRight' && !list) next = items[i + 1];
   else if (e.key === 'ArrowLeft' && !list) next = items[i - 1];
   else if (e.key === 'ArrowDown') next = list ? items[i + 1] : vertical(item, items, 1);
-  else if (e.key === 'ArrowUp' && e.altKey) openPlace(parentPlace(view.place), { focus: true });
+  else if (e.key === 'ArrowUp' && e.altKey) goUp();
   else if (e.key === 'ArrowUp') next = list ? items[i - 1] : vertical(item, items, -1);
   else if (e.key === 'Home') next = items[0];
   else if (e.key === 'End') next = items[items.length - 1];
@@ -1559,16 +1582,28 @@ $('dlist').addEventListener('keydown', e => {
     }
   } else if ((e.key === 'F10' && e.shiftKey) || e.key === 'ContextMenu') { if (key[0] !== 'g' && key !== 'pall') itemMenu(key, item.querySelector('.more')); }
   else if (e.key === 'F2') { if (folder != null) renameFolder(folder); else if (doc != null) openDoc(doc, { title: true }); }
-  else if (e.key === 'Backspace') { if (view.place.type !== 'root') openPlace(parentPlace(view.place), { focus: true }); }
+  else if (e.key === 'Backspace') goUp();
   else done = false;
   if (next) {
     for (const x of items) x.tabIndex = x === next ? 0 : -1;
     view.focusKey = next.dataset.nav;
     next.focus();
     if (e.shiftKey && next.dataset.nav[0] === 'd') selectRange(+next.dataset.nav.slice(1));
+    followPanel(next);
   }
   if (done) e.preventDefault();
 });
+// With the detail column open (L), it shows the document the arrow keys moved to, once they pause;
+// focus stays in the listing so the keys keep browsing.
+let followTimer = null;
+function followPanel(item) {
+  clearTimeout(followTimer);
+  const key = item.dataset.nav;
+  if (view.doc == null || !isL.matches || key[0] !== 'd') return;
+  followTimer = setTimeout(() => {
+    if (view.doc != null && isL.matches && document.activeElement?.dataset?.nav === key) openDoc(+key.slice(1), { follow: true });
+  }, 150);
+}
 // "/" searches: only from inside Documents and not while typing (WCAG 2.1.4).
 document.addEventListener('keydown', e => {
   if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || view.mode !== 'docs') return;
@@ -1741,7 +1776,7 @@ async function deleteDocs(ids) {
   toast(`Deleted ${what}`);
   announce(`Deleted ${what}`);
   view.focusKey = nextId != null ? 'd' + nextId : null;
-  focusList();
+  focusPlace();
   lib.load();
 }
 function moveDialog(ids, anchor) {
@@ -1824,7 +1859,7 @@ $('menusheet').addEventListener('close', () => {
   if (s.anchor?.isConnected) {
     const host = s.anchor.closest('[data-nav], .tnode');
     (s.anchor.tabIndex < 0 && host ? host : s.anchor).focus({ preventScroll: true });
-  } else focusList();
+  } else focusPlace();
 });
 $('menusheet').addEventListener('keydown', e => {
   const items = [...$('menusheet').querySelectorAll('[role^="menuitem"]:not(:disabled)')], i = items.indexOf(document.activeElement);
@@ -1912,7 +1947,7 @@ function openDialog(d) {
       if (document.querySelector('dialog[open]')) return;
       const a = document.activeElement;
       if (a && a !== document.body && a.isConnected && !d.contains(a)) return;
-      if (opener?.isConnected && opener !== document.body) opener.focus({ preventScroll: true }); else focusList();
+      if (opener?.isConnected && opener !== document.body) opener.focus({ preventScroll: true }); else focusPlace();
     });
   }, { once: true });
 }
@@ -2455,18 +2490,20 @@ async function loadExtra(d) {
   } catch (err) { if (err.status === 404) lib.load(); }
 }
 
-function openDoc(id, { title = false } = {}) {
+// follow: the open panel showing the item the arrow keys moved to (on L): focus and the selection's
+// anchor stay where they are.
+function openDoc(id, { title = false, follow = false } = {}) {
   if (!lib.docs.has(id)) return;
-  const was = view.doc != null;
+  const was = view.doc != null, inPanel = was && $('docpanel').contains(document.activeElement);
   view.doc = id;
-  sel.anchor = id;
+  if (!follow) sel.anchor = id;
   const push = !was && !isL.matches;
   nav(hashFor(view.place, id), push ? 'push' : 'replace', push || history.state?.detail ? { detail: true } : {});
   renderPanel();
   markCurrent();
   syncSelection();
   if (title) $('docpanel').querySelector('.titlein')?.focus();
-  else if (!isL.matches) $('docpanel').querySelector(isS.matches ? '.dphead .back' : '.dphead h2')?.focus();
+  else if (!isL.matches && !follow && !inPanel) panelHome()?.focus();  // Previous and Next keep it
 }
 function closeDoc() {
   if (view.doc == null) return;
@@ -2494,7 +2531,10 @@ function renderPanel() {
   if (!d) { p.hidden = true; p.replaceChildren(); panelFor = null; previewNode = null; previewKey = ''; return; }
   p.hidden = false;
   if (panelFor === d.id && panelTyping()) { panelStale = true; return; }
-  const focusField = p.contains(document.activeElement) ? document.activeElement.dataset.field : null;
+  // Whatever had focus in the panel has it again once the panel is drawn anew (its details arriving,
+  // a job finishing): fields by data-field, the heading, Back and the buttons by data-keep.
+  const a = p.contains(document.activeElement) ? document.activeElement : null;
+  const focusField = a?.dataset.field, focusKeep = a?.dataset.keep;
   const scrollTop = panelFor === d.id ? p.querySelector('.dpbody')?.scrollTop || 0 : 0;
   panelFor = d.id;
   loadExtra(d);
@@ -2513,6 +2553,7 @@ function renderPanel() {
   const more = btn('', e => openMenu({ anchor: e.currentTarget, title: docTitle(d), subtitle: fileSubtitle(d), items: docMenuItems(d.id).filter(it => it?.label !== 'Show details') }),
     { cls: 'icon', aria: 'More actions', title: 'More actions', icon: 'more' });
   const close = btn('', closeDoc, { cls: 'icon close', aria: 'Close the details', title: 'Close (Esc)', icon: 'close' });
+  Object.entries({ back, prev, next, h2, more, close }).forEach(([k, x]) => { x.dataset.keep = k; });
   head.append(back, prev, next, h2, el('span', 'grow'), more, close);
   const body = el('div', 'dpbody');
   const job = el('div', 'dpjob');
@@ -2580,7 +2621,13 @@ function renderPanel() {
   syncPanelJob();
   body.scrollTop = scrollTop;
   if (focusField) p.querySelector(`[data-field="${focusField}"]`)?.focus({ preventScroll: true });
+  else if (focusKeep) {
+    const x = p.querySelector(`[data-keep="${focusKeep}"]`);
+    (x && !x.disabled && x.offsetParent ? x : panelHome())?.focus({ preventScroll: true });  // Previous at the first: the heading
+  }
 }
+// Where focus goes in the panel when it opens on a phone or a medium screen: Back on a phone, else the heading.
+const panelHome = () => $('docpanel').querySelector(isS.matches ? '.dphead .back' : '.dphead h2');
 
 function actions(d, where) {
   const box = el('div', `dacts ${where}`), bar = where === 'dock';  // dock: a phone's bottom bar
@@ -2606,6 +2653,7 @@ function actions(d, where) {
     items.push(open);
   }
   items.push(move, reread, del);
+  [ask, move, reread, del].forEach((x, k) => { x.dataset.keep = `${where}-${['ask', 'move', 'reread', 'del'][k]}`; });
   box.append(...items);
   return box;
 }
@@ -3153,7 +3201,7 @@ $('scopeall').onclick = () => {
   drawScope();
 };
 $('scopenone').onclick = () => { sv.docs.clear(); sv.folders.clear(); drawScope(); };
-$('scopeevery').onclick = () => { setScope({}); $('scopeview').close(); $('question').focus(); };
+$('scopeevery').onclick = () => { setScope({}); $('scopeview').close(); focusAsk(); };
 $('scopeuse').onclick = () => { const { top, docs } = svCounts(); sv = null; askAbout({ docs, folders: top }); };
 $('svclose').onclick = () => $('scopeview').close();
 $('scopeview').addEventListener('close', () => { sv = null; });
