@@ -27,6 +27,12 @@ TRANSCRIBE_PROMPT = (
     "Output only the transcription, with no preamble or commentary."
 )
 _PAGE_MARK = re.compile(r"^[ \t]*<<<\s*PAGE\s+(\d+)\s*>>>[ \t]*$", re.M | re.I)
+# A photo of a document (an upload of a JPG, PNG, WebP or HEIC), for Claude and the local
+# vision model alike (ollama.transcribe_image).
+PHOTO_PROMPT = (
+    "Transcribe all the text in this photo of a document (a receipt, bill, letter or page), top to bottom. "
+    "Keep line breaks, amounts, dates and the rows of tables as plain text. Output only the text."
+)
 # Models offered in the UI's model pickers.
 MODELS = [
     ("claude-opus-5-5", "Claude Opus 5.5"),
@@ -243,6 +249,26 @@ def _transcribe(client, model, pages, total, pdf_bytes, on_usage=None):
     return split_pages(_text(response), pages)
 
 
+def transcribe_image(client, jpeg, model=MODEL, on_usage=None):
+    """The text of a photo of a document (JPEG bytes, extract.prepare_image), read by Claude:
+    one image block and PHOTO_PROMPT, as the local vision model is given."""
+    response = client.beta.messages.create(
+        model=model,
+        max_tokens=8000,
+        output_config={"effort": EFFORT},
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                         "data": base64.standard_b64encode(jpeg).decode("ascii")}},
+            {"type": "text", "text": PHOTO_PROMPT},
+        ]}],
+        **_fallback(model),
+    )
+    _report(on_usage, "transcribe", model, response)  # billed even when the reply is unusable
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("the photo holds more text than one call can return")
+    return _text(response)
+
+
 def excerpt_text(hit):
     """A retrieved chunk as the model reads it (and the page shows it as a source): litre/
     gallon misprints corrected so the model doesn't repeat them, and where a chunk of a PDF
@@ -278,13 +304,22 @@ def library_text(docs, total):
             + "\n".join(lines) + "\n</library>\n")
 
 
-def build_user_message(question, hits, scope=None, library=None):
+def build_user_message(question, hits, scope=None, library=None, folders=None):
     """The question, after the excerpts retrieved for it. Each names its file and, for a
     PDF read since pages were kept, its page or pages, which PAGE_NOTE asks the answer to
     cite. `scope`: the file names of the documents the user limited the question to.
-    `library`: db.library_overview(), given when no excerpt was found."""
+    `folders`: the folders it was limited to ([{name, count}]: documents in each, its
+    subfolders' included). `library`: db.library_overview(), given when no excerpt was found."""
     head = ""
-    if scope:
+    if folders:
+        items = [f"the folder {f['name']} ({f['count']} document{'' if f['count'] == 1 else 's'}, including its "
+                 "subfolders)" for f in folders[:10]]
+        if len(folders) > 10:
+            items.append(f"{len(folders) - 10} more folders")
+        names = list(scope or [])
+        items += names[:10] + ([f"{len(names) - 10} more documents"] if len(names) > 10 else [])
+        head = f"<scope>Only these were searched: {'; '.join(items)}</scope>\n"
+    elif scope:
         names = ", ".join(scope[:10]) + (f" and {len(scope) - 10} more" if len(scope) > 10 else "")
         head = f"<scope>Only these documents were searched: {names}</scope>\n"
     if not hits:

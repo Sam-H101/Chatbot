@@ -5,15 +5,18 @@ where it stopped instead of paying for those pages again. With no job to do, the
 embeds chunks that have no vectors yet (vectors.backfill). Flask-free, like llm.py and
 ollama.py: the routes that create jobs and report on them are in main.py."""
 import logging
+import math
 import os
+import re
 import sqlite3
 import threading
 import time
+import unicodedata
 
 import anthropic
 import pypdfium2
 
-from . import db, extract, llm, ollama, sections, units, vectors
+from . import db, extract, llm, ollama, sections, thumbs, units, vectors
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +46,10 @@ CONFIRM_COST_USD = float(os.environ.get("CONFIRM_COST_USD") or "1.00")
 # writes, the metadata reply, and the notes on each section of a long document. Analysis
 # input is about 4 characters a token.
 PAGE_INPUT_TOKENS, PAGE_OUTPUT_TOKENS, ANALYSIS_OUTPUT_TOKENS, NOTES_OUTPUT_TOKENS = 2000, 600, 500, 1000
+# A photo: Claude bills an image by its pixels (about width x height / 750 tokens, at most
+# about 1,600 at the size it is sent, extract.CLAUDE_PHOTO_SIDE), plus the prompt; the text
+# of a receipt or a page runs to about PHOTO_OUTPUT_TOKENS, PHOTO_TEXT_CHARS characters.
+PHOTO_MAX_TOKENS, PHOTO_PROMPT_TOKENS, PHOTO_OUTPUT_TOKENS, PHOTO_TEXT_CHARS = 1600, 300, 600, 2400
 # Tests turn the thread off and run the queue in their own thread with drain().
 BACKGROUND = True
 
@@ -169,7 +176,7 @@ def describe(e, name):
     if isinstance(e, ollama.OllamaError):
         return f"Ollama error: {e}"
     if isinstance(e, NoText):
-        return "No text found in file"
+        return str(e) or "No text found in file"
     if isinstance(e, db.JobGone):
         return str(e)
     return f"Could not read {name}: {e}"
@@ -349,24 +356,31 @@ def _process(job):
         with open(os.path.join(db.files_dir(), os.path.basename(job["file_path"])), "rb") as f:
             data = f.read()
         text, meta, analysis, who, note = _read(job, opts, data, progress, on_usage)
+        kind = extract.kind(job["filename"])
         chunks = extract.chunk_text(text)
         # A PDF's text has pages (page 1 too when no page break follows it): each chunk's are
         # kept for citations, and the unit check lists the litre/gallon misprints, that answers
-        # will be corrected for, by page.
-        paged = job["filename"].lower().endswith(".pdf")
+        # will be corrected for, by page. Photos have none: they are cited by file name.
+        paged = kind == "pdf"
         pages = extract.page_ranges(chunks) if paged else None
         check = units.check(chunks, paged=paged)
         vecs = _index(chunks, progress, on_usage)
+        if kind in thumbs.KINDS:
+            progress.stage("Making a thumbnail")
+            thumbs.try_make(job["sha256"], data, kind)  # none (a typed icon) rather than a failed job
         progress.stage("Saving")
+        info = _details(meta)
         result = {**used(who, note), "title": meta.get("title") or job["filename"], "chunks": len(chunks),
                   "analysis": analysis, "replaced": [], "unit_fixes": check["total"], "embedded": vecs is not None}
         if job["kind"] == "reread":
             db.replace_document(job["doc_id"], chunks, meta, analysis, label(*who), units=check, job=(job_id, result),
-                                pages=pages, vectors=vecs)
+                                pages=pages, vectors=vecs, details=info, suggestion=info["folder"])
         else:
             db.add_document(job["filename"], chunks, meta, analysis, label(*who), sha=job["sha256"],
                             size=job["file_size"], mime=job["mime"], replace=opts.get("on_duplicate") == "replace",
-                            units=check, job=(job_id, result), pages=pages, vectors=vecs)
+                            units=check, job=(job_id, result), pages=pages, vectors=vecs, details=info,
+                            folder_id=opts.get("folder_id"), auto_file=bool(opts.get("auto_file")),
+                            suggestion=info["folder"], confidence=info["confidence"])
         status = "done"
     except AwaitConfirmation:
         status = "awaiting_confirmation"
@@ -389,6 +403,44 @@ def _process(job):
                 db.link_usage(job_id, doc_id)
             except Exception:
                 log.exception("Could not link the usage of job %d", job_id)
+
+
+_AMOUNT = re.compile(r"-?\d{1,12}([.,]\d{1,4})?")
+
+
+def _details(meta):
+    """The key details and filing suggestion of an analysis (META_SCHEMA's strings), checked:
+    {document_date, vendor, total_amount, currency, due_date, folder, confidence}, None for
+    anything missing or not what it should be. Older readings and test fakes lack the keys.
+    Dates must be real YYYY-MM-DD dates (1900-2100). An amount is digits with a dot, or a
+    comma when there is no dot, for decimals (currency signs and spaces dropped); a comma
+    before exactly three digits could be a thousands separator ("1,234"), so it is left
+    out, as is "1.234,50". The currency, three letters, is kept only with an amount. The
+    folder is a path of at most 3 clean names (db.clean_folder_name: bad levels dropped);
+    its confidence is "high" only when the model said so."""
+    def text(key):
+        value = meta.get(key, "")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):  # an amount given as a number
+            value = str(value)
+        return value.strip() if isinstance(value, str) else ""
+
+    raw = "".join(c for c in text("total_amount") if not c.isspace() and unicodedata.category(c) != "Sc")
+    amount = None
+    if _AMOUNT.fullmatch(raw) and not re.search(r",\d{3}$", raw):
+        value = float(raw.replace(",", "."))
+        amount = value if math.isfinite(value) and abs(value) < 1e12 else None
+    currency = text("currency").upper()
+    vendor = " ".join(text("vendor").split())[:200].strip()
+    folder = []
+    for segment in text("folder").split("/"):
+        try:
+            folder.append(db.clean_folder_name(segment))
+        except db.BadFolderName:
+            continue
+    return {"document_date": db.parse_date(text("document_date")), "due_date": db.parse_date(text("due_date")),
+            "vendor": vendor or None, "total_amount": amount,
+            "currency": currency if amount is not None and re.fullmatch(r"[A-Z]{3}", currency) else None,
+            "folder": "/".join(folder[:3]) or None, "confidence": "high" if meta.get("folder_confidence") == "high" else "low"}
 
 
 def _fail(job_id, error):
@@ -428,7 +480,7 @@ def _read(job, opts, data, progress, on_usage):
     the text read here when just the local analysis failed. Returns (text, meta,
     analysis, (backend, model) that analyzed it, why it switched)."""
     name, key = job["filename"], _keys.get(job["id"]) or os.environ.get("ANTHROPIC_API_KEY", "")
-    is_pdf = name.lower().endswith(".pdf") and PDF_EXTRACTOR != "local"
+    is_pdf = extract.kind(name) == "pdf" and PDF_EXTRACTOR != "local"
     mode = opts.get("claude_pages") or CLAUDE_PDF_PAGES
     backend, _, model = job["model"].partition(":")
     reading = (job, data, is_pdf, mode, progress, on_usage)
@@ -480,13 +532,24 @@ def _analysis_calls(chars, n, read):
 def estimate(name, data, model, is_pdf, mode, text=None):
     """What reading a file with Claude `model` should cost: pages, pages Claude reads,
     tokens and USD, from about 2,000 input and 600 output tokens per page Claude reads
-    plus the analysis (one call, or for a long text one per section and one more). With
-    `text` (read already), just the analysis. Each call is priced on its own, as the API
-    bills it. A model missing from llm.PRICES is priced like the dearest one there (and
-    marked), so the confirmation still works."""
+    plus the analysis (one call, or for a long text one per section and one more). A photo
+    is one call reading it (its pixels, PHOTO_MAX_TOKENS at most, and its text) and the
+    analysis of about PHOTO_TEXT_CHARS. With `text` (read already), just the analysis. Each
+    call is priced on its own, as the API bills it. A model missing from llm.PRICES is
+    priced like the dearest one there (and marked), so the confirmation still works."""
     pages = read = 0
+    photo = None  # (input, output) tokens of reading a photo
     if text is not None:
         chars, is_pdf = len(extract.plain(text)), False
+    elif extract.kind(name) == "image":
+        try:
+            w, h = extract.image_size(data)
+        except Exception:  # checked at upload; should its header still not read, count the most
+            w = h = extract.CLAUDE_PHOTO_SIDE
+        s = min(1.0, extract.CLAUDE_PHOTO_SIDE / max(w, h, 1))
+        photo = (round(min(PHOTO_MAX_TOKENS, w * s * h * s / 750)) + PHOTO_PROMPT_TOKENS, PHOTO_OUTPUT_TOKENS)
+        chars, is_pdf = PHOTO_TEXT_CHARS, False
+        text = "x" * chars
     elif is_pdf:
         texts = extract.pdf_texts(data)
         reads = [mode == "all" or extract.is_scan(t) for t in texts]
@@ -506,8 +569,11 @@ def estimate(name, data, model, is_pdf, mode, text=None):
     for start in range(0, read, extract.PDF_PAGES_PER_CALL):
         n = min(extract.PDF_PAGES_PER_CALL, read - start)
         cost += llm.cost(price, {"input": n * PAGE_INPUT_TOKENS, "output": n * PAGE_OUTPUT_TOKENS})
+    if photo:
+        cost += llm.cost(price, {"input": photo[0], "output": photo[1]})
+        calls = [photo, *calls]
     return {"model": model, "model_label": llm.label(model), "mode": mode if is_pdf else None,
-            "pages": pages, "claude_pages": read,
+            "pages": pages, "claude_pages": read, "image": photo is not None,
             "input_tokens": read * PAGE_INPUT_TOKENS + sum(i for i, _ in calls),
             "output_tokens": read * PAGE_OUTPUT_TOKENS + sum(o for _, o in calls), "cost_usd": round(cost, 6),
             "sections": list(parts), "priced": model in llm.PRICES,
@@ -521,7 +587,9 @@ def _check_cost(job, opts, data, model, is_pdf, mode, progress, text=None):
     retry that would cost more, say Auto now has Claude read instead of just analyze,
     asks again)."""
     est = job["estimate"]
-    if not est or (est["model"], est["mode"]) != (model, mode if is_pdf and text is None else None):
+    photo = text is None and extract.kind(job["filename"]) == "image"
+    if not est or (est["model"], est["mode"], est.get("image", False)) != (
+            model, mode if is_pdf and text is None else None, photo):
         progress.stage("Estimating the cost")
         est = estimate(job["filename"], data, model, is_pdf, mode, text)
     confirmed = opts.get("confirmed")
@@ -535,7 +603,20 @@ def _check_cost(job, opts, data, model, is_pdf, mode, progress, text=None):
 
 
 def _text(backend, model, client, job, data, is_pdf, mode, progress, on_usage):
-    """The file's text, read by one model. PDF pages stay apart with "\\f"."""
+    """The file's text, read by one model. PDF pages stay apart with "\\f". A photo is read
+    by the local vision model, or by Claude: one call either way, and no pages."""
+    if extract.kind(job["filename"]) == "image":
+        if backend == "ollama":
+            progress.stage(f"Reading the photo with {ollama.VISION_MODEL}")
+            text = ollama.transcribe_image(extract.prepare_image(data, extract.OLLAMA_PHOTO_SIDE), on_usage)
+        else:
+            progress.stage(f"Reading the photo with {llm.label(model)}")
+            text = llm.transcribe_image(client, extract.prepare_image(data, extract.CLAUDE_PHOTO_SIDE), model,
+                                        on_usage)
+        text = text.replace(extract.PAGE_BREAK, "\n")
+        if not extract.chunk_text(text):
+            raise NoText("No text found in the photo")
+        return text
     if not is_pdf:
         progress.stage("Reading the file")
         text = extract.extract_text(job["filename"], data)
@@ -561,7 +642,8 @@ def _analyze(backend, model, client, job, text, progress, on_usage):
     notes = f"notes:{backend}:{model}"
     hooks = {"on_usage": on_usage, "kept": progress.kept(notes),
              "on_progress": lambda stage, done, total: progress.stage(f"{stage} with {who}", done, total),
-             "on_notes": lambda key, got: progress.keep(notes, {key: got})}
+             "on_notes": lambda key, got: progress.keep(notes, {key: got}),
+             "folders": db.folder_paths()}  # where it may be filed (sections.analyze)
     try:
         if backend == "ollama":
             return ollama.analyze(None, name, text, model, **hooks)

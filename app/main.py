@@ -2,6 +2,7 @@
 import itertools
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -12,7 +13,7 @@ import anthropic
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory, stream_with_context
 from werkzeug.routing import IntegerConverter
 
-from . import auth, db, extract, jobs, llm, ollama, vectors
+from . import auth, db, extract, jobs, llm, ollama, thumbs, vectors
 
 log = logging.getLogger(__name__)
 
@@ -35,9 +36,16 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 #             Claude only when needed and a Claude key is available.
 #   "claude": the Claude API (CLAUDE_MODEL), with the key from the browser or ANTHROPIC_API_KEY.
 BACKEND = os.environ.get("LLM_BACKEND", "ollama")
-# Kept originals shown in the browser: PDFs open in its viewer, plain text as text.
-# Everything else downloads, so an uploaded HTML or SVG file never runs script here.
-INLINE_TYPES = {"application/pdf", "text/plain"}
+# Kept originals shown in the browser: PDFs open in its viewer, plain text (Markdown too) as
+# text, and photos as images. Everything else downloads (HEIC too, which browsers can't
+# show), so an uploaded HTML or SVG file never runs script here.
+INLINE_TYPES = {"application/pdf", "text/plain", "image/jpeg", "image/png", "image/webp"}
+# Inline photos and text get a sandbox besides nosniff: nothing in them can run or load. Not
+# PDFs, whose viewer it breaks.
+SANDBOX_CSP = "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"
+# What the file picker offers (GET /api/models). The server takes any UTF-8 text file too.
+UPLOAD_EXTS = (".pdf", ".docx", ".txt", ".md", ".markdown", ".csv", ".json", ".html", ".xml", ".log", ".py", ".js",
+               ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif")
 # The slim image has no /etc/mime.types, and Python's own table lacks these two.
 mimetypes.add_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx")
 mimetypes.add_type("text/plain", ".log")
@@ -220,6 +228,19 @@ for _cls in (MissingKey, BadChoice, extract.Unsupported, NotFound, anthropic.Aut
     app.register_error_handler(_cls, _error_reply)
 
 
+@app.errorhandler(db.FolderError)
+def _folder_error(e):
+    """A folder change that can't be made: a bad name (400), a folder that is gone (404), a
+    folder put inside itself (400), a name already used there (409, naming that folder), a
+    delete whose documents changed meanwhile (409, with the counts now)."""
+    if isinstance(e, db.FolderConflict):
+        return jsonify(error=str(e), conflict=e.existing), 409
+    if isinstance(e, db.FolderChanged):
+        return jsonify(error=str(e), counts=e.counts), 409
+    status = 404 if isinstance(e, db.MissingFolder) else 409 if isinstance(e, db.NoSuggestion) else 400
+    return jsonify(error=str(e)), status
+
+
 @app.errorhandler(413)
 def _too_large(e):
     return jsonify(error=f"File is larger than the {MAX_UPLOAD_MB} MB upload limit (MAX_UPLOAD_MB)"), 413
@@ -270,22 +291,74 @@ def models():
         server_key=bool(os.environ.get("ANTHROPIC_API_KEY")),
         max_upload_mb=MAX_UPLOAD_MB, max_question_chars=QUESTION_CHARS,
         claude_pages=jobs.CLAUDE_PDF_PAGES, confirm_cost_usd=jobs.CONFIRM_COST_USD,
+        upload_types={"extensions": [e for e in UPLOAD_EXTS if extract.HEIC or e not in (".heic", ".heif")],
+                      "heic": extract.HEIC},
     )
+
+
+def _int_arg(name, default, low, high):
+    """A whole-number query parameter from low to high, `default` when absent; else a 400."""
+    raw = request.args.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        n = None
+    if n is None or not low <= n <= high:
+        raise BadChoice(f"{name} must be a whole number from {low} to {high}")
+    return n
+
+
+def _row_id(value, what):
+    """An id from a JSON body: a whole number (None for none). One too large for SQLite names
+    no row: it becomes 0, which none has either, so the usual 404 follows (RowId)."""
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise BadChoice(f"{what} must be a folder id or null")
+    return value if -2**63 <= value < 2**63 else 0
+
+
+def _folder_filter():
+    """The documents a listing or search is limited to by ?folder=<id> (and, with
+    ?recursive=1, the default, the folders inside it) or ?folder=unfiled: their ids, or None
+    without the parameter. A folder that doesn't exist is a 404."""
+    raw = request.args.get("folder", "").strip()
+    if not raw:
+        return None
+    recursive = request.args.get("recursive", "1").strip()
+    if recursive not in ("0", "1"):
+        raise BadChoice("recursive must be 1 or 0")
+    if raw != "unfiled":
+        try:
+            raw = _row_id(int(raw), "folder")
+        except ValueError:
+            raise BadChoice("folder must be a folder id or 'unfiled'") from None
+    return db.folder_documents([raw], recursive == "1")
 
 
 @app.get("/api/documents")
 def documents():
-    q = request.args.get("q", "").strip()
-    return jsonify(db.search_documents(q) if q else db.list_documents())
+    """Every document, newest first; with q, those whose metadata matches it, best first (at
+    most `limit`, 10 by default). Either limited to a folder: ?folder=<id>|unfiled, with
+    ?recursive=0 for its own documents only."""
+    q, only = request.args.get("q", "").strip(), _folder_filter()
+    if q:
+        return jsonify(db.search_documents(q, _int_arg("limit", 10, 1, 200), only))
+    return jsonify(db.list_documents(only))
 
 
 @app.get("/api/search")
 def search():
     """Passages with the words of q, for the library's search box: by keywords only, since
-    it marks the words it found."""
+    it marks the words it found. At most `limit` (10 by default), and limited to a folder as
+    GET /api/documents is (?folder, ?recursive)."""
+    only = _folder_filter()
     return jsonify([{**{k: h[k] for k in ("doc_id", "filename", "title", "idx", "page_start", "page_end")},
                      "snippet": extract.plain(h["snippet"])}
-                    for h in db.search_chunks(request.args.get("q", ""), limit=10)])
+                    for h in db.search_chunks(request.args.get("q", ""), limit=_int_arg("limit", 10, 1, 50),
+                                              doc_ids=only)])
 
 
 @app.get("/api/search/status")
@@ -309,9 +382,23 @@ def upload():
     on_duplicate = request.form.get("on_duplicate", "")
     if on_duplicate not in ("", "replace", "keep"):
         raise BadChoice("on_duplicate must be 'replace' or 'keep'")
-    options = {"on_duplicate": on_duplicate, "claude_pages": _claude_pages(request.form.get("claude_pages"))}
+    # Where it goes: folder_id (empty: Unfiled), and, into Unfiled, whether a folder the
+    # analysis is sure of may take it (auto_file, on unless "0"). See db.add_document.
+    folder_id = request.form.get("folder_id", "").strip() or None
+    if folder_id is not None:
+        try:
+            folder_id = _row_id(int(folder_id), "folder_id")
+        except ValueError:
+            raise BadChoice("folder_id must be a folder id, or empty for Unfiled") from None
+        if not db.get_folder(folder_id):
+            return jsonify(error="That folder was deleted", folder_gone=True), 404
+    auto_file = request.form.get("auto_file", "1").strip() or "1"
+    if auto_file not in ("1", "0"):
+        raise BadChoice("auto_file must be 1 or 0")
+    options = {"on_duplicate": on_duplicate, "claude_pages": _claude_pages(request.form.get("claude_pages")),
+               "folder_id": folder_id, "auto_file": auto_file == "1"}
     data = f.read()
-    extract.check(name, data)  # a file that can never be read gets its 400 now, not a failed job later
+    photo = extract.check(name, data)  # a file that can never be read gets its 400 now, not a failed job later
     sha = db.file_hash(data)
     with db.files_lock:  # check and queue together: two uploads of one file can't both pass
         dups, reading = db.find_duplicates(sha), db.active_jobs(sha=sha)
@@ -323,9 +410,10 @@ def upload():
             d = dups[0]
             return jsonify(error=f"{name} is already in the library", duplicate={
                 "id": d["id"], "filename": d["filename"], "title": d["title"], "created_at": d["uploaded_at"],
-                "model": d["model"], "copies": len(dups)}), 409
+                "model": d["model"], "copies": len(dups), "folder_id": d["folder_id"]}), 409
+        # A photo is kept as the type of its bytes (check), never what the browser said.
         job_id = _add_job("upload", name, sha, model, options, data=data,
-                          mime=mimetypes.guess_type(name)[0] or f.mimetype or "application/octet-stream")
+                          mime=photo or mimetypes.guess_type(name)[0] or f.mimetype or "application/octet-stream")
     jobs.wake()
     return jsonify(job=_job_out(db.get_job(job_id))), 202
 
@@ -424,13 +512,216 @@ def job_retry(job_id):
 
 @app.get("/api/documents/<id:doc_id>/file")
 def document_file(doc_id):
+    """A document's kept original: PDFs, plain text, Markdown (as plain text) and photos
+    (not HEIC) open in the browser, everything else downloads."""
     f = db.stored_file(doc_id)
     if not f:  # also documents uploaded before originals were kept
         return jsonify(error="No original file is kept for this document"), 404
-    resp = send_file(f["path"], mimetype=f["mime"], as_attachment=f["mime"] not in INLINE_TYPES,
-                     download_name=f["filename"], max_age=0)
+    mime = f["mime"]
+    if mime == "text/markdown" or extract.kind(f["filename"]) == "markdown":
+        mime = "text/plain"  # shown as it is written; the page renders it, sanitized
+    inline = mime in INLINE_TYPES
+    resp = send_file(f["path"], mimetype=mime, as_attachment=not inline, download_name=f["filename"], max_age=0)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    if inline and mime != "application/pdf":
+        resp.headers["Content-Security-Policy"] = SANDBOX_CSP
+    return resp
+
+
+@app.get("/api/documents/<id:doc_id>/thumb")
+def document_thumb(doc_id):
+    """A document's thumbnail (thumbs.py), WebP: ?size=card (400 px wide, the default) or
+    large (1200). Made now if missing. Cached for good when ?v= is its file's hash (as
+    listings give it in `thumb`: ids are reused, hashes not), else revalidated by ETag. 404
+    for a document with no kept file, of another kind than PDF or photo, or that can't be
+    rendered: the page shows a typed icon instead. Never SVG."""
+    size = request.args.get("size", "card")
+    if size not in thumbs.SIZES:
+        raise BadChoice("size must be 'card' or 'large'")
+    f = db.stored_file(doc_id)
+    kind = f and extract.kind(f["filename"])
+    if not f or not f["sha256"] or kind not in thumbs.KINDS or thumbs.failed(f["sha256"]):
+        return jsonify(error="No thumbnail"), 404
+    sha = f["sha256"]
+    tag = f"{sha[:16]}-{size}"
+    if request.if_none_match.contains_weak(tag):
+        resp = Response(status=304)
+    else:
+        target = thumbs.get(sha, f["path"], kind, size)
+        if not target:
+            return jsonify(error="No thumbnail"), 404
+        resp = send_file(target, mimetype="image/webp", conditional=False, etag=False)
+    resp.headers["ETag"] = f'"{tag}"'
+    resp.headers["Cache-Control"] = ("private, max-age=31536000, immutable" if request.args.get("v") == sha[:12]
+                                     else "private, no-cache")
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
+
+
+@app.get("/api/documents/<id:doc_id>/text")
+def document_text_view(doc_id):
+    """A document's text for its preview, at most `max` characters (200,000 by default):
+    {text, truncated, source, kind, bytes}. Markdown and text files give their kept original
+    as written ("file"); others (DOCX, PDFs, photos, or no kept file) the text indexed for
+    them ("chunks"), as read."""
+    most = _int_arg("max", 200_000, 1, 500_000)
+    doc = db.get_document(doc_id)
+    if not doc:
+        return jsonify(error="Not found"), 404
+    f = db.stored_file(doc_id) if doc["kind"] in ("markdown", "text") else None
+    if f:
+        with open(f["path"], "rb") as fh:
+            raw = fh.read(most * 4 + 4)  # enough for `most` characters of any UTF-8
+        size = os.path.getsize(f["path"])
+        text = raw.decode("utf-8", errors="replace")
+        return jsonify(text=text[:most], truncated=len(raw) < size or len(text) > most, source="file",
+                       kind=doc["kind"], bytes=size)
+    text = extract.plain(db.document_text(doc_id))
+    return jsonify(text=text[:most], truncated=len(text) > most, source="chunks", kind=doc["kind"],
+                   bytes=len(text.encode()))
+
+
+@app.get("/api/documents/<id:doc_id>")
+def document_get(doc_id):
+    """A document as listed, plus pages (the last its text reaches; null without pages) and
+    copies ([{id, folder_id}] of other documents holding the same file)."""
+    doc = db.get_document(doc_id)
+    return jsonify(doc) if doc else (jsonify(error="Not found"), 404)
+
+
+def _text_field(body, key, most, empty=None):
+    value = body[key]
+    if value is None and empty is None:
+        return None
+    if not isinstance(value, str):
+        raise BadChoice(f"{key} must be text")
+    value = value.strip()
+    if len(value) > most:
+        raise BadChoice(f"{key} is {most} characters at most")
+    return value or empty
+
+
+def _document_fields(body):
+    """PATCH /api/documents/<id>'s body, checked: (fields for db.update_document, suggestion)."""
+    unknown = sorted(set(body) - {*db.EDITABLE, "folder_id", "suggestion"})
+    if unknown:
+        raise BadChoice(f"Unknown field: {unknown[0]}")
+    fields = {}
+    if "title" in body:
+        title = body["title"].strip() if isinstance(body["title"], str) else ""
+        if not title:
+            raise BadChoice("A title can't be empty")
+        if len(title) > 300:
+            raise BadChoice("A title is 300 characters at most")
+        fields["title"] = title
+    if "doc_type" in body:
+        fields["doc_type"] = _text_field(body, "doc_type", 60, empty="")
+    for key in ("document_date", "due_date"):
+        if key in body:
+            fields[key] = None if body[key] is None else db.parse_date(body[key])
+            if body[key] is not None and fields[key] is None:
+                raise BadChoice(f"{key} must be a date like 2026-11-03")
+    if "vendor" in body:
+        fields["vendor"] = _text_field(body, "vendor", 200)
+    if "total_amount" in body:
+        amount = body["total_amount"]
+        if amount is not None and (not isinstance(amount, (int, float)) or isinstance(amount, bool)
+                                   or not math.isfinite(amount) or abs(amount) >= 1e12):
+            raise BadChoice("total_amount must be a number, or null")
+        fields["total_amount"] = None if amount is None else float(amount)
+    if "currency" in body:
+        currency = _text_field(body, "currency", 3)
+        currency = currency and currency.upper()
+        if currency is not None and not re.fullmatch(r"[A-Z]{3}", currency):
+            raise BadChoice("currency must be a three-letter code like GBP, or null")
+        fields["currency"] = currency
+    if "folder_id" in body:
+        fields["folder_id"] = _row_id(body["folder_id"], "folder_id")
+    suggestion = body.get("suggestion")
+    if suggestion not in (None, "apply", "dismiss"):
+        raise BadChoice("suggestion must be 'apply' or 'dismiss'")
+    if suggestion == "apply" and "folder_id" in fields:
+        raise BadChoice("Send folder_id or suggestion: apply, not both")
+    return fields, suggestion
+
+
+@app.patch("/api/documents/<id:doc_id>")
+def document_edit(doc_id):
+    """Change a document's title, type or key details (each then kept by re-reads), move it
+    (folder_id, null for Unfiled), or accept ("apply", making its folders if need be) or
+    dismiss its suggested folder. Returns it as listed, with `created` (folder ids) for apply."""
+    fields, suggestion = _document_fields(_body())
+    got = db.update_document(doc_id, fields, suggestion)
+    if not got:
+        return jsonify(error="Not found"), 404
+    doc, created = got
+    return jsonify({**doc, **({"created": created} if suggestion == "apply" else {})})
+
+
+@app.post("/api/documents/move")
+def documents_move():
+    """Move documents: {"ids": [...], "folder_id": id or null (Unfiled)}, or {"ids": [...],
+    "path": "Household/Bills"}, which makes the folders missing from the path. Returns
+    {moved, folder_id, created, from: {id: the folder each was in}}, which an Undo needs."""
+    body = _body()
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+        raise BadChoice('Expected {"ids": [1, 2, ...]} and a folder_id or path')
+    if ("folder_id" in body) == ("path" in body):
+        raise BadChoice("Send a folder_id (null for Unfiled) or a path, not both")
+    if "path" in body:
+        out = db.move_documents(ids, path=db.clean_path(body["path"]))
+    else:
+        out = db.move_documents(ids, folder_id=_row_id(body["folder_id"], "folder_id"))
+    return jsonify({**out, "from": {str(k): v for k, v in out["from"].items()}})
+
+
+# ---- folders ----
+
+@app.get("/api/folders")
+def folder_list():
+    """Every folder, sorted by path: id, name, parent_id, path (names from the top), doc_count
+    (its own documents), total_count (with its subfolders'), created_at, updated_at."""
+    return jsonify(db.list_folders())
+
+
+@app.post("/api/folders")
+def folder_add():
+    """Make a folder: {"name", "parent_id": id or null for the top level}. 201 with it."""
+    body = _body()
+    return jsonify(db.add_folder(body.get("name"), _row_id(body.get("parent_id"), "parent_id"))), 201
+
+
+@app.patch("/api/folders/<id:folder_id>")
+def folder_edit(folder_id):
+    """Rename a folder ({"name"}) and/or move it ({"parent_id": id, or null for the top level})."""
+    body = _body()
+    changes = {}
+    if "name" in body:
+        changes["name"] = body["name"]
+    if "parent_id" in body:
+        changes["parent_id"] = _row_id(body["parent_id"], "parent_id")
+    return jsonify(db.update_folder(folder_id, **changes))
+
+
+@app.delete("/api/folders/<id:folder_id>")
+def folder_delete(folder_id):
+    """Delete a folder. ?contents=move (the default): its documents and folders go to its
+    parent. ?contents=delete: everything in it is deleted too, documents included, only with
+    ?confirm_documents= the number of documents that is (409 with the counts otherwise)."""
+    contents = request.args.get("contents", "move")
+    if contents not in ("move", "delete"):
+        raise BadChoice("contents must be 'move' or 'delete'")
+    confirm = request.args.get("confirm_documents", "").strip()
+    try:
+        confirm = int(confirm) if confirm else None
+    except ValueError:
+        raise BadChoice("confirm_documents must be a whole number") from None
+    out = db.delete_folder(folder_id, contents, confirm)
+    if contents == "delete":
+        jobs.interrupt()  # re-reads of its documents were cancelled
+        jobs.prune_keys()
+    return jsonify(out)
 
 
 @app.get("/api/documents/<id:doc_id>/units")
@@ -518,17 +809,38 @@ def delete_instruction(rule_id):
     return ("", 204) if db.delete_instruction(rule_id) else (jsonify(error="Not found"), 404)
 
 
-def _scope(raw):
-    """POST /api/chat's doc_ids: the documents a question is limited to, as {id: file
-    name}, those deleted meanwhile left out. None (or []) means every document."""
-    if raw is None or raw == []:
-        return None
+def _id_list(raw, error):
+    """Ids from a JSON body, as given ([] when absent); those too large for SQLite are left
+    out, as they can't name a row."""
+    if raw is None:
+        return [], []
     if not isinstance(raw, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in raw):
-        raise BadChoice("doc_ids must be a list of document ids")
-    names = db.document_names([i for i in dict.fromkeys(raw) if -2**63 <= i < 2**63])  # others can't exist
-    if not names:
-        raise BadChoice("None of the chosen documents is in the library any more: choose others, or ask all documents")
-    return names
+        raise BadChoice(error)
+    return raw, [i for i in dict.fromkeys(raw) if -2**63 <= i < 2**63]
+
+
+def _scope(raw_docs, raw_folders=None):
+    """POST /api/chat's doc_ids and folder_ids: what a question is limited to, those deleted
+    meanwhile left out. None (both absent or []) means every document. Else {ids: {id: file
+    name} of every document searched, direct: those of the documents chosen themselves,
+    folders: [{id, name, count}]}: a folder's documents, its subfolders' included, are
+    looked up now, so documents added to it since it was chosen are searched too."""
+    docs, doc_ids = _id_list(raw_docs, "doc_ids must be a list of document ids")
+    folders, folder_ids = _id_list(raw_folders, "folder_ids must be a list of folder ids")
+    if not docs and not folders:
+        return None
+    direct, chosen = db.document_names(doc_ids), db.scope_folders(folder_ids)
+    if not direct and not chosen:
+        if not folders:  # worded as before folders could be chosen
+            raise BadChoice("None of the chosen documents is in the library any more: choose others, or ask all documents")
+        raise BadChoice("None of the chosen folders or documents is in the library any more: choose others, "
+                        "or ask all documents")
+    ids = {**db.document_names([d for f in chosen for d in f["doc_ids"]]), **direct}
+    if not ids:
+        names = [f["name"] for f in chosen]
+        raise BadChoice(f"{names[0]} has no documents yet: add some, or ask all documents" if len(names) == 1 else
+                        f"These folders have no documents yet: {', '.join(names)}. Add some, or ask all documents")
+    return {"ids": ids, "direct": direct, "folders": [{k: f[k] for k in ("id", "name", "count")} for f in chosen]}
 
 
 def _cited(hits):
@@ -566,7 +878,7 @@ def _question(body):
         raise BadChoice("Empty question")
     if len(question) > QUESTION_CHARS:
         raise BadChoice(f"The question is too long ({QUESTION_CHARS:,} characters at most)")
-    choice, scope = _choice(body.get("model")), _scope(body.get("doc_ids"))
+    choice, scope = _choice(body.get("model")), _scope(body.get("doc_ids"), body.get("folder_ids"))
     if choice[0] == "claude" and not _has_key():  # before anything is kept
         raise MissingKey()
     conv_id = body.get("conversation_id")
@@ -593,15 +905,20 @@ def _prompt(question, scope, history, on_usage):
     Claude is sent all of it. So a long conversation stays on the local model with Auto,
     which switches to Claude only for a question too long for it however short the history."""
     system = llm.system_prompt(db.active_instructions())
-    hits = vectors.search(question, int(os.environ.get("TOP_K", "5")), scope and list(scope), on_usage=on_usage)
+    hits = vectors.search(question, int(os.environ.get("TOP_K", "5")), scope and list(scope["ids"]), on_usage=on_usage)
     # No passage at all ("Summarise everything in my library", or small talk): the model is
     # given the documents' titles and summaries instead, so it can say what the library holds.
     library = db.library_overview() if not hits and scope is None else None
-    user_message = llm.build_user_message(question, hits, scope and list(scope.values()), library)
+    user_message = llm.build_user_message(question, hits, scope and list(scope["direct"].values()), library,
+                                          scope and scope["folders"])
     excerpts, sources = _cited(hits)
+    # What it was asked of: the documents chosen ([] when only folders were), their names, the
+    # folders chosen, and how many documents that came to (all None: every document).
     found = {"sources": sources, "excerpts": excerpts,
              "overview": bool(library and library[1]),  # given the library's summaries instead of passages
-             "scope": scope and list(scope), "scope_names": scope and list(scope.values())}
+             "scope": scope and list(scope["direct"]), "scope_names": scope and list(scope["direct"].values()),
+             "scope_folders": scope and [{"id": f["id"], "name": f["name"]} for f in scope["folders"]],
+             "scope_count": scope and len(scope["ids"])}
     local = ollama.recent(history, {"content": system}, {"content": user_message})
     return system, user_message, found, local
 
@@ -618,8 +935,9 @@ def _begin(conv, question, choice, scope):
     """Keep a question as it is asked, in its conversation (a new one, titled by the question,
     when conv is None), its answer to be filled in by _finish: {conversation_id, title,
     question_id, answer_id}. NotFound if the conversation was deleted since _question."""
-    ex = db.begin_exchange(conv and conv["id"], question, _choice_text(choice), scope and list(scope),
-                           _title(question))
+    folders = [f["id"] for f in scope["folders"]] if scope and scope["folders"] else None
+    ex = db.begin_exchange(conv and conv["id"], question, _choice_text(choice), scope and list(scope["direct"]),
+                           _title(question), folder_ids=folders)
     if not ex:
         raise NotFound("This conversation was deleted.")
     return ex
@@ -648,7 +966,8 @@ def _turns(user_message, text):
 @app.post("/api/chat")
 def chat():
     """Answer a question from the passages that best match it, in all documents or only
-    those in doc_ids, and keep both in the conversation conversation_id (a new one without).
+    those in doc_ids and in the folders folder_ids (with their subfolders, as they are at
+    the time of asking), and keep both in the conversation conversation_id (a new one without).
     The whole answer at once; /api/chat/stream sends it as it is written. The question is
     kept as it is asked; if it then fails, it is kept with the reason, and the error names
     the conversation (conversation_id, title) as an answer would."""
@@ -810,8 +1129,9 @@ def chat_stop():
 @app.get("/api/conversations")
 def conversation_list():
     """Saved conversations, the one asked last first: id, title, created_at, updated_at,
-    model (the choice of its last question), doc_ids (the documents it was limited to:
-    null for all, [] when they were all deleted) and questions (how many it has)."""
+    model (the choice of its last question), doc_ids and folder_ids (the documents and
+    folders it was limited to: both null for all; [] when they were all deleted; doc_ids []
+    when only folders were chosen) and questions (how many it has)."""
     return jsonify(db.list_conversations())
 
 

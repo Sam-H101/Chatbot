@@ -28,6 +28,8 @@ class TooLong(Exception):
     read in smaller pieces."""
 
 
+# Key details and the folder are strings, "" when unknown: no null unions, which both Ollama's
+# `format` and Claude's json_schema take. jobs._details checks and converts them.
 META_SCHEMA = {
     "type": "object",
     "properties": {
@@ -36,10 +38,41 @@ META_SCHEMA = {
         "summary": {"type": "string", "description": "2-3 sentences"},
         "keywords": {"type": "array", "items": {"type": "string"},
                      "description": "5-12 search terms: topics, names, entities"},
+        "document_date": {"type": "string", "description": "The date the document itself bears (issue, invoice or "
+                          "receipt date) as YYYY-MM-DD; \"\" if it has none or the date is ambiguous"},
+        "vendor": {"type": "string", "description": "Receipts, bills and invoices: the shop or company that issued "
+                   "it; otherwise \"\""},
+        "total_amount": {"type": "string", "description": "Receipts, bills and invoices: the total to pay, digits "
+                         "with a dot for decimals, no currency sign (e.g. 1234.50); otherwise \"\""},
+        "currency": {"type": "string", "description": "ISO 4217 code of total_amount (GBP, EUR, USD...), or \"\""},
+        "due_date": {"type": "string", "description": "Bills and invoices: the payment due date as YYYY-MM-DD; "
+                     "otherwise \"\""},
+        "folder": {"type": "string", "description": "Where to file it: one of the listed folder paths if it clearly "
+                   "belongs there, otherwise a short new category (1-3 words, plural noun, e.g. Receipts), never the "
+                   "document's own title; \"\" if unsure"},
+        "folder_confidence": {"type": "string", "enum": ["high", "low"]},
     },
-    "required": ["title", "doc_type", "summary", "keywords"],
+    "required": ["title", "doc_type", "summary", "keywords", "document_date", "vendor", "total_amount", "currency",
+                 "due_date", "folder", "folder_confidence"],
     "additionalProperties": False,
 }
+# The existing folders a metadata prompt lists, at most: this many paths and about this many
+# characters (a library with hundreds of folders must not crowd out the document).
+PROMPT_FOLDERS, PROMPT_FOLDER_CHARS = 200, 6000
+DETAILS_GUIDANCE = (
+    "Fill document_date, vendor, total_amount, currency and due_date only with values the document itself states; "
+    "leave a field empty if unsure, and never guess an ambiguous date (03/04/2026). Manuals, letters and papers have "
+    "no vendor or total.")
+# The schema's descriptions say this too, but Ollama turns a schema into a grammar and never
+# shows them to the model: told only there, qwen3.5:9b wrote "3 November 2026" for a date and
+# filed a receipt as "Household/Bills/Receipts" beside an existing "Receipts". Told here, it
+# wrote 2026-11-03, chose the listed folder that fit (the deepest one, Receipts/2026, where
+# there was one), and gave "" for a manual with no folder to fit.
+FIELD_RULES = (
+    "Write dates as YYYY-MM-DD (3 November 2026 is 2026-11-03) and total_amount as digits with a dot for decimals "
+    "(1234.50).\nfolder: where to file it. If one of the existing folders below clearly fits, copy its path exactly as "
+    "listed. Otherwise give a short new category (1-3 words, plural noun, e.g. Receipts), never the document's own "
+    "title; \"\" if unsure. folder_confidence: high only when you are sure.")
 NOTES_SCHEMA = {
     "type": "object",
     "properties": {
@@ -58,9 +91,28 @@ _HEADINGS = (("topics", "Key topics"), ("specifications", "Specifications and va
 _SPACE = re.compile(r"\s*")
 
 
-def _meta_prompt(filename, text):
+def _folder_lines(folders):
+    """The existing folders' paths as a metadata prompt lists them, "" for none."""
+    folders, lines, used = list(folders), [], 0
+    for path in folders[:PROMPT_FOLDERS]:
+        if lines and used + len(path) > PROMPT_FOLDER_CHARS:
+            break
+        lines.append(f"- {path}")
+        used += len(path)
+    return "\n".join(lines) + (", …" if len(lines) < len(folders) else "") if lines else ""
+
+
+def folders_text(folders):
+    """What a metadata prompt adds: the key details guidance, how to write them and the
+    folder, and the existing folders, for the model to file the document into one (or
+    suggest a new one)."""
+    return (f"\n\n{DETAILS_GUIDANCE}\n{FIELD_RULES}\nExisting folders (levels separated by /):\n"
+            f"{_folder_lines(folders) or '(none yet)'}")
+
+
+def _meta_prompt(filename, text, folders=()):
     return (f"Extract metadata for the document below.\n\nFile name: {filename}\n\n"
-            f"<document>\n{text}\n</document>")
+            f"<document>\n{text}\n</document>{folders_text(folders)}")
 
 
 def _notes_prompt(filename, label, text):
@@ -79,12 +131,12 @@ def _merge_prompt(filename, label, notes):
             f"\n\nFile name: {filename}\n\n<notes>\n{notes}\n</notes>")
 
 
-def _combine_prompt(filename, notes, total, read):
+def _combine_prompt(filename, notes, total, read, folders=()):
     sample = "" if read == total else (
         f" Only {read} of its {total} parts were read, spread evenly through it, so the notes cover part of it.")
     return (f"Extract metadata for the document below. It was too long to read at once, so it was read in {total} "
             f"parts and notes were taken on each.{sample} Describe the whole document from these notes."
-            f"\n\nFile name: {filename}\n\n<notes>\n{notes}\n</notes>")
+            f"\n\nFile name: {filename}\n\n<notes>\n{notes}\n</notes>{folders_text(folders)}")
 
 
 def _pieces(page, limit, size):
@@ -251,7 +303,7 @@ def _notes(ask, filename, label, text, size, depth=0):
 
 
 def analyze(ask, filename, text, limit, size=len, skip=(ValueError,), on_progress=None, kept=None,
-            on_notes=None):
+            on_notes=None, folders=()):
     """(metadata, analysis) for a document. ask(prompt, schema, kind) makes one call and
     returns its parsed JSON; `limit` is how much of the document (or of notes) one call may
     carry, as size(text) measures it: characters by default, estimated tokens for a local
@@ -260,6 +312,11 @@ def analyze(ask, filename, text, limit, size=len, skip=(ValueError,), on_progres
     section was read, else 'partial: <read> of <sections> sections, <share> of the text'.
     A prompt that `ask` finds too long after all (TooLong) is read in smaller pieces.
 
+    The metadata calls (the one call, or the last, which combines the notes) are also given
+    the existing folders' paths (`folders`, db.folder_paths), to suggest where to file the
+    document, and asked for its key details (META_SCHEMA); the room the list takes comes
+    off what they carry of the document. Notes on sections are asked for as before.
+
     on_progress(stage, done, total) hears of each step. on_notes(key, notes) gets each
     section's notes as they come, and `kept` ({key: notes}, from an earlier attempt)
     saves asking for them again. A section whose call fails with one of `skip` (a reply
@@ -267,10 +324,15 @@ def analyze(ask, filename, text, limit, size=len, skip=(ValueError,), on_progres
     the last one if no section could be read."""
     filename = filename if len(filename) <= NAME_CHARS else filename[:NAME_CHARS - 1] + "…"
     body = plain(text)
-    parts = split(text, limit, size) if size(body) > limit else []
+    # What a metadata call carries of the document beside the folder list. The guidance around
+    # it is short, like the rest of a prompt's own words (which `limit` leaves room for).
+    room = max(limit / 2, limit - size(_folder_lines(folders)))
+    parts = split(text, limit, size) if size(body) > room else []
+    if len(parts) == 1 and size(body) > room:  # fits a call of notes, not one with the folders: smaller
+        parts = split(text, room, size)
     if len(parts) <= 1:
         try:
-            return ask(_meta_prompt(filename, parts[0][2] if parts else body), META_SCHEMA, "analyze"), "full"
+            return ask(_meta_prompt(filename, parts[0][2] if parts else body, folders), META_SCHEMA, "analyze"), "full"
         except TooLong:  # denser than `size` reckoned: in sections after all
             parts = split(text, size(body) / 2, size)
             if len(parts) < 2:
@@ -301,14 +363,14 @@ def analyze(ask, filename, text, limit, size=len, skip=(ValueError,), on_progres
     if not read:
         raise error
     say(f"Combining the notes of {len(read)} sections", len(chosen), len(chosen))
-    blocks, budget = read, limit
+    blocks, budget = read, room
     while True:
         fitted = _fit(ask, filename, blocks, n, budget, size, say, skip)
         if fitted is not blocks:  # merging showed steps of its own
             say(f"Combining the notes of {len(read)} sections", len(chosen), len(chosen))
         blocks = fitted
         try:
-            meta = ask(_combine_prompt(filename, _joined(blocks), n, len(read)), META_SCHEMA, "analyze")
+            meta = ask(_combine_prompt(filename, _joined(blocks), n, len(read), folders), META_SCHEMA, "analyze")
             break
         except TooLong:  # denser notes than `size` reckoned: fit them into less
             if budget < limit / 8:

@@ -324,9 +324,43 @@ Everything below is committed (as of 2026-11-12); nothing after 894b984 has been
   naming that address as their origin pass the other-site check (404 for ids that don't exist; another origin gets 403).
   The checks left 32 rows in the usage log (embedding and qwen3.5 calls, all local, $0) and the test upload's finished
   job row. No Claude calls were made. The chatbot log shows no errors or warnings.
+- 2026-11-12: Documents and folders overhaul, backend (the Documents view that uses it comes next). Nested folders (`folders` table, AUTOINCREMENT ids; `documents.folder_id`, NULL is
+  Unfiled): names unique per parent ignoring case (casefold), at most 100 characters, no `/`; no folder inside itself
+  or its own folders; delete moves the contents up (clashing names become "Name (2)") or, with `contents=delete` and
+  the right `confirm_documents` count, deletes the subtree and its documents; uploads on their way in are retargeted
+  and chats forget it. Routes: `GET/POST /api/folders`, `PATCH/DELETE /api/folders/<id>`, `POST /api/documents/move`
+  (`folder_id` or a `path` that makes missing folders; `from` for Undo), `GET/PATCH /api/documents/<id>` (title,
+  type, key details, folder, `suggestion: apply|dismiss`; edited fields kept in `user_edited`, which re-reads and
+  Replace keep), `GET /api/documents/<id>/text` and `/thumb`; `?folder=&recursive=&limit=` on `/api/documents` and
+  `/api/search`; `upload_types` in `/api/models`. Uploads take `folder_id` and `auto_file`; a duplicate's 409 names
+  its folder; Replace keeps the replaced copy's folder; a re-read never moves a document. Analysis returns key details
+  (`document_date`, `vendor`, `total_amount`, `currency`, `due_date`; checked in `jobs._details`) and a folder from
+  the existing paths: an Unfiled upload with auto-file on goes into an existing folder only on a `high` confidence
+  and an exact path, otherwise the suggestion is kept (never a folder made without a click). Photos (JPG, PNG, WebP,
+  HEIC with `pillow-heif`, now in requirements.txt): checked at upload (format by the bytes, at most 50 megapixels),
+  read by minicpm-v4.6 or by Claude from an image block (Auto local first), estimated for Claude, kept as the type
+  of their bytes and opened inline with a sandbox CSP. Markdown (`.md`, `.markdown`) opens as plain text. Thumbnails
+  (WebP, 400/1200 px) made in the job and cached in `THUMBS_DIR` by hash, made lazily for older files, served with
+  immutable caching when `v` is the hash, removed with their original, not backed up. Chat and streaming take
+  `folder_ids`, resolved at question time (subfolders included); answers give `scope_folders` and `scope_count`;
+  conversations keep `folder_ids` (added after the AUTOINCREMENT copy). Found on staging: Ollama never shows a
+  schema's descriptions to the model, so the date and folder rules sit in the prompt too (`sections.FIELD_RULES`);
+  without it qwen3.5:9b wrote "3 November 2026" and filed a receipt as a new "Household/Bills/Receipts" beside the
+  existing "Receipts". 243 tests pass (27 new; the `.png` row of the unreadable-files test now expects the photo
+  error). Staging (fresh library, real models): a generated receipt photo read by minicpm-v4.6 (text exact) and
+  auto-filed into Receipts with date 2026-11-03, Tesco Stores, 42.10 GBP; a water bill PDF auto-filed into
+  Household/Bills with bill and due dates, vendor and 84.20 GBP; a manual page uploaded into Tractor stayed there
+  with no vendor or total; a `.markdown` file served as text/plain and given back as written; thumbnails 400 px wide;
+  a question about Tractor answered from it alone ("38.0 litres", cited with its page); a re-read kept the folder and
+  the edited vendor and due date; one receipt read by Claude Haiku 5.5 through an image block (2 calls, $0.0005).
+  The current page still works with it all (light and dark, 1400 and 390 px, no console errors). Not done here: the
+  page's CSP on `/` (it needs the page split into files first, the frontend's first step)
 
 ## To do
 
+- The Documents view (frontend) on the folders API: folder tree, grid and list, detail panel with key details and
+  previews (a sanitized Markdown preview), selection and bulk moves, ask about a folder, uploads into a folder, and
+  the page's CSP on `/` once the page is split into files. Not deployed yet: the backend works with today's page.
 - Install the port proxy task once, from an elevated PowerShell (README, "Reach it from the LAN").
 - Decide the backup time zone: nightly backups run at 03:00 UTC (10 or 11 p.m. Eastern) unless `TZ` is set in `.env`
   (e.g. `TZ=America/New_York`, then `docker compose up -d backup`).

@@ -354,7 +354,7 @@
     <small class="muted">PDF (text or scanned), DOCX, text</small>
     <label class="pick">Read with <select id="docModel" aria-label="Model that reads uploaded documents"></select></label>
     <label class="pick check" id="allPagesBox" hidden><input type="checkbox" id="allPages"> Claude reads every page</label>
-    <input id="file" type="file" multiple hidden accept=".pdf,.docx,.txt,.md,.csv,.json,.html,.xml,.log,.py,.js,text/*">
+    <input id="file" type="file" multiple hidden accept=".pdf,.docx,.txt,.md,.markdown,.csv,.json,.html,.xml,.log,.py,.js,.jpg,.jpeg,.png,.webp,.heic,.heif,text/*,text/markdown,image/jpeg,image/png,image/webp,image/heic,image/heif">
   </div>
   <div id="queue"></div>
   <div class="shelfhead"><span class="label">Library</span><input id="q" type="search" placeholder="Search titles and text…" aria-label="Search documents"><button id="tablebtn" type="button" title="Show all documents in a table">Table</button></div>

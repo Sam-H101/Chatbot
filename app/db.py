@@ -1,5 +1,7 @@
 """Embedded metadata database: SQLite + FTS5. One file, no server.
-Original uploads are kept as plain files next to it (see files_dir)."""
+Original uploads are kept as plain files next to it (see files_dir), and their thumbnails
+in a folder of their own (thumbs_dir, thumbs.py)."""
+import datetime
 import hashlib
 import json
 import os
@@ -12,6 +14,10 @@ DB_PATH = os.environ.get("DB_PATH", "data/metabase.db")
 # Where original uploads are kept, one file per distinct content, named by its SHA-256.
 # Empty means a "files" folder next to DB_PATH (/data/files in the container).
 FILES_DIR = os.environ.get("FILES_DIR", "")
+# Where thumbnails of PDFs and photos are kept (thumbs.py), named by the original's hash.
+# Empty means a "thumbs" folder next to DB_PATH (/data/thumbs). Not backed up: they can
+# always be made again from the originals.
+THUMBS_DIR = os.environ.get("THUMBS_DIR", "")
 # Serialises writing and removing stored files with the rows that point at them, so a
 # delete never removes a file that an upload is about to reference (one gunicorn worker).
 # Reentrant: the upload route holds it across its duplicate check and add_job.
@@ -154,6 +160,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     text, tokenize='porter unicode61'
 );
+CREATE TABLE IF NOT EXISTS folders (            -- documents.folder_id; nested through parent_id
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,  -- never reused: chat scopes and open tabs hold folder ids
+    parent_id  INTEGER,                         -- NULL = top level. No REFERENCES: kept valid under files_lock
+    name       TEXT NOT NULL,                   -- as typed, trimmed, inner whitespace collapsed (clean_folder_name)
+    name_key   TEXT NOT NULL,                   -- name.casefold(): names are unique per parent, ignoring case
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS folders_unique ON folders(IFNULL(parent_id, 0), name_key);
+CREATE INDEX IF NOT EXISTS folders_parent ON folders(parent_id);
 """.replace("{conversations}", CONVERSATIONS.format(table="conversations"))
 
 
@@ -166,9 +182,37 @@ COLUMNS = {
     "file_size": "INTEGER",
     "mime": "TEXT",
     "unit_findings": "TEXT",  # litre/gallon misprints; checked at upload, older documents by jobs.check_units
+    "folder_id": "INTEGER",   # its folder (folders.id); NULL: Unfiled
+    "filed_by": "TEXT",       # 'auto' when auto-filing put it in its folder; NULL otherwise (any move clears it)
+    "suggested_folder": "TEXT",  # a folder path the analysis suggested ("Household/Bills"), while it is Unfiled
+    # Key details read from it (jobs._details), or typed in by the user (user_edited):
+    "document_date": "TEXT",  # the date it bears, YYYY-MM-DD
+    "vendor": "TEXT",         # receipts, bills, invoices: who issued it
+    "total_amount": "REAL",   # ... the total to pay
+    "currency": "TEXT",       # ... its ISO 4217 code (GBP, EUR, USD)
+    "due_date": "TEXT",       # bills, invoices: when payment is due, YYYY-MM-DD
+    "user_edited": "TEXT",    # JSON list of the fields (EDITABLE) the user changed: re-reads and Replace keep them
 }
 USAGE_COLUMNS = {"job_id": "INTEGER"}  # usage rows from before jobs have none
 CHUNK_COLUMNS = {"page_start": "INTEGER", "page_end": "INTEGER"}  # older chunks have no pages: cited by file name
+# Added after conversations were copied into a table with AUTOINCREMENT (_keep_conversation_ids,
+# whose column list stays as it was): so added after that copy.
+CONVERSATION_COLUMNS = {"folder_ids": "TEXT"}  # JSON: the folders its last question was limited to; NULL: none
+# Key details a reading fills in (jobs._details), and what the user may change of a document.
+DETAILS = ("document_date", "vendor", "total_amount", "currency", "due_date")
+EDITABLE = ("title", "doc_type", *DETAILS)
+
+
+def parse_date(value):
+    """A date as documents keep it (YYYY-MM-DD), or None if `value` isn't a real date written
+    so, from 1900 to 2100. (date.fromisoformat alone also takes 20261103 and 2026-W45-2.)"""
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        return None
+    try:
+        day = datetime.date.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return day.isoformat() if 1900 <= day.year <= 2100 else None
 # A document's columns as the API lists it. Its unit check's findings stay here (they have
 # their own route, unit_findings()): listings read only how many there are (_doc_columns).
 _DOC_FIELDS = ("id", "filename", "uploaded_at", "char_count", "title", "doc_type", "summary", "keywords", "analysis",
@@ -208,7 +252,17 @@ def lock_library(exclusive=False, wait=True):
 
 def _migrate(con):
     con.executescript(SCHEMA)
-    for table, columns in (("documents", COLUMNS), ("usage", USAGE_COLUMNS), ("chunks", CHUNK_COLUMNS)):
+    _add_columns(con, (("documents", COLUMNS), ("usage", USAGE_COLUMNS), ("chunks", CHUNK_COLUMNS)))
+    con.execute("CREATE INDEX IF NOT EXISTS documents_sha256 ON documents(sha256)")
+    con.execute("CREATE INDEX IF NOT EXISTS documents_folder ON documents(folder_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS usage_job ON usage(job_id)")
+    _keep_conversation_ids(con)
+    _add_columns(con, (("conversations", CONVERSATION_COLUMNS),))
+    con.commit()
+
+
+def _add_columns(con, tables):
+    for table, columns in tables:
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         for name, decl in columns.items():
             if name not in have:
@@ -217,9 +271,6 @@ def _migrate(con):
                 except sqlite3.OperationalError as e:  # another process added it first
                     if "duplicate column name" not in str(e):
                         raise
-    con.execute("CREATE INDEX IF NOT EXISTS documents_sha256 ON documents(sha256)")
-    con.execute("CREATE INDEX IF NOT EXISTS usage_job ON usage(job_id)")
-    _keep_conversation_ids(con)
 
 
 def _autoincrement(con):
@@ -260,17 +311,45 @@ def _doc_columns(t):
         " AS unit_fixes")
 
 
-def _doc(row):
-    """A documents row (_doc_columns) for the API: the stored file's location stays internal."""
+def _doc(row, folders):
+    """A documents row (_doc_columns) for the API: the stored file's location stays internal.
+    Computed: user_edited as a list; suggestion_exists, whether the suggested folder is one
+    of `folders` (_Folders) already (None without a suggestion); kind (extract.kind); and
+    thumb, its thumbnail's URL, versioned by the file's hash since document ids are reused
+    (None for documents with no kept file, of another kind, or whose thumbnail failed)."""
+    from . import extract, thumbs  # thumbs imports this module
     d = dict(row)
     d["has_file"] = bool(d.pop("file_path", None))
+    d["user_edited"] = _edited(d.get("user_edited"))
+    d["suggestion_exists"] = None if not d.get("suggested_folder") else folders.resolve(d["suggested_folder"]) is not None
+    d["kind"] = extract.kind(d["filename"])
+    sha = d.get("sha256")
+    d["thumb"] = (f"/api/documents/{d['id']}/thumb?v={sha[:12]}"
+                  if d["has_file"] and sha and d["kind"] in thumbs.KINDS and not thumbs.failed(sha) else None)
     return d
+
+
+def _docs(con, rows):
+    folders = _Folders(con)
+    return [_doc(r, folders) for r in rows]
+
+
+def _edited(raw):
+    try:
+        got = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return [k for k in EDITABLE if k in got] if isinstance(got, list) else []
 
 
 # ---- original files ----
 
 def files_dir():
     return FILES_DIR or os.path.join(os.path.dirname(DB_PATH) or ".", "files")
+
+
+def thumbs_dir():
+    return THUMBS_DIR or os.path.join(os.path.dirname(DB_PATH) or ".", "thumbs")
 
 
 def file_hash(data):
@@ -298,10 +377,14 @@ def _store(sha, data):
 
 
 def _remove(file_path):
+    """Remove a stored original, and its thumbnails."""
+    from . import thumbs
+    name = os.path.basename(file_path)
     try:
-        os.remove(os.path.join(files_dir(), os.path.basename(file_path)))
+        os.remove(os.path.join(files_dir(), name))
     except FileNotFoundError:
         pass
+    thumbs.remove(name)
 
 
 def stored_file(doc_id):
@@ -329,8 +412,8 @@ def find_duplicates(sha):
     """Documents holding a file with this hash, newest first. Documents from before
     hashing have none, so they never match."""
     with connect() as con:
-        return [_doc(r) for r in con.execute(
-            f"SELECT {_doc_columns('d')} FROM documents d WHERE sha256=? ORDER BY id DESC", (sha,))]
+        return _docs(con, con.execute(
+            f"SELECT {_doc_columns('d')} FROM documents d WHERE sha256=? ORDER BY id DESC", (sha,)))
 
 
 class JobGone(Exception):
@@ -385,8 +468,22 @@ def _units(check):
     return None if check is None else json.dumps(check, ensure_ascii=False)
 
 
+def _index_doc(con, doc_id):
+    """(Re)write a document's docs_fts row from its documents row: its vendor is searchable
+    with its keywords."""
+    con.execute("DELETE FROM docs_fts WHERE rowid=?", (doc_id,))
+    con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords)"
+                " SELECT id, filename, title, doc_type, summary, CASE WHEN IFNULL(vendor, '') = '' THEN keywords"
+                " WHEN keywords = '' THEN vendor ELSE keywords || ', ' || vendor END FROM documents WHERE id=?",
+                (doc_id,))
+
+
+FOLDER_GONE_NOTE = "Its folder was deleted, so it is in Unfiled"
+
+
 def add_document(filename, chunks, meta, analysis, model="", data=None, mime=None, sha=None, replace=False,
-                 size=None, job=None, units=None, pages=None, vectors=None):
+                 size=None, job=None, units=None, pages=None, vectors=None, details=None, folder_id=None,
+                 auto_file=False, suggestion=None, confidence="low"):
     """Index a document and return its id. Its original is `data`, stored here under
     files_dir(), or one already stored under its hash `sha` (by an upload job) with
     `size` bytes; with neither, the document has no kept file. replace=True first
@@ -394,31 +491,75 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
     (job id, result dict) marks that job done in the same transaction too, the result
     gaining doc_id and replaced; if the job was cancelled meanwhile, nothing is added.
     `units`: its unit check (units.check); None leaves it to jobs.check_units. `pages`
-    and `vectors`: its chunks', as _insert_chunks takes them."""
+    and `vectors`: its chunks', as _insert_chunks takes them. `details`: its key details
+    ({DETAILS}, jobs._details).
+
+    Where it goes, decided here, in the transaction, so a folder deleted meanwhile can't
+    be missed: replacing copies, the folder of the newest of them, with the details the
+    user edited on it ("kept"); else `folder_id` if that folder still exists ("chosen"),
+    Unfiled if not (with a note); else, uploaded into Unfiled with `auto_file` on and a
+    "high" `confidence`, the existing folder the path `suggestion` names ("auto"; folders
+    are never made here); else Unfiled with the suggestion kept for the user to accept.
+    The job's result gains folder_id, filed, suggested_folder, suggestion_exists and
+    folder_note."""
     if data is not None:
         sha, size = sha or file_hash(data), len(data)
     kept = sha is not None and size is not None
+    title, doc_type, summary, keywords = _meta(meta)
+    values = {"title": title, "doc_type": doc_type, **{k: (details or {}).get(k) for k in DETAILS}}
     with files_lock:
         wrote = False
         try:
             with connect() as con:
-                following = []
+                folders = _Folders(con)
+                following, edited, filed, note = [], [], None, None
+                place = {"folder_id": None, "filed_by": None, "suggested_folder": None}
+                old = []
                 if replace and sha:
-                    old = [r[0] for r in con.execute("SELECT id FROM documents WHERE sha256=?", (sha,))]
+                    copies = con.execute(f"SELECT id, folder_id, filed_by, user_edited, {', '.join(EDITABLE)}"
+                                         " FROM documents WHERE sha256=? ORDER BY id DESC", (sha,)).fetchall()
+                    old = [r["id"] for r in copies]
                     following = _scoped_to(con, old)  # before _delete_rows takes them out
                     _delete_rows(con, old)  # the file stays: the new row points at it
                     if job:
                         job[1]["replaced"] = old
+                    if copies:  # the newest copy's place, and what the user changed of it
+                        newest = copies[0]
+                        edited = _edited(newest["user_edited"])
+                        values.update({k: newest[k] for k in edited})
+                        place.update(folder_id=newest["folder_id"], filed_by=newest["filed_by"])
+                        if newest["folder_id"] not in folders.rows:  # Unfiled: a re-read's rule, never moved
+                            place.update(folder_id=None, filed_by=None, suggested_folder=suggestion)
+                        filed = "kept"
+                if not old:
+                    if folder_id is not None:
+                        if folder_id in folders.rows:
+                            place["folder_id"], filed = folder_id, "chosen"
+                        else:
+                            place["suggested_folder"], note = suggestion, FOLDER_GONE_NOTE
+                    else:
+                        target = folders.resolve(suggestion) if auto_file and confidence == "high" and suggestion else None
+                        if target is not None:
+                            place.update(folder_id=target, filed_by="auto")
+                            filed = "auto"
+                        else:
+                            place["suggested_folder"] = suggestion
                 doc_id = con.execute(
                     "INSERT INTO documents (filename, char_count, title, doc_type, summary, keywords, analysis,"
-                    " model, sha256, file_path, file_size, mime, unit_findings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (filename, sum(len(c) for c in chunks), *_meta(meta), analysis, model,
-                     sha if kept else None, sha if kept else None, size if kept else None, mime if kept else None,
-                     _units(units)),
+                    " model, sha256, file_path, file_size, mime, unit_findings, folder_id, filed_by, suggested_folder,"
+                    " document_date, vendor, total_amount, currency, due_date, user_edited)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (filename, sum(len(c) for c in chunks), values["title"], values["doc_type"], summary, keywords,
+                     analysis, model, sha if kept else None, sha if kept else None, size if kept else None,
+                     mime if kept else None, _units(units), place["folder_id"], place["filed_by"],
+                     place["suggested_folder"], *(values[k] for k in DETAILS), json.dumps(edited) if edited else None),
                 ).lastrowid
-                con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords)"
-                            " VALUES (?,?,?,?,?,?)", (doc_id, filename, *_meta(meta)))
+                _index_doc(con, doc_id)
                 _insert_chunks(con, doc_id, chunks, pages, vectors)
+                if job:
+                    if "title" in edited:
+                        job[1]["title"] = values["title"]
+                    job[1].update(_placed(folders, place, filed, note))
                 for conv_id, ids in following:  # conversations limited to a replaced copy ask the new one
                     con.execute("UPDATE conversations SET doc_ids=? WHERE id=?",
                                 (_ids(dict.fromkeys(doc_id if i in old else i for i in ids)), conv_id))
@@ -434,31 +575,124 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
     return doc_id
 
 
-def replace_document(doc_id, chunks, meta, analysis, model, job=None, units=None, pages=None, vectors=None):
-    """A re-read: new text, chunks, metadata, model and unit check for a document,
-    keeping its id, file and upload date. `job`, `units`, `pages` and `vectors` as in
-    add_document; the old chunks' vectors go with them (ON DELETE CASCADE)."""
+def _placed(folders, place, filed, note):
+    """What a job's result says of where its document went."""
+    suggested = place["suggested_folder"]
+    return {"folder_id": place["folder_id"], "filed": filed, "suggested_folder": suggested,
+            "suggestion_exists": None if not suggested else folders.resolve(suggested) is not None, "folder_note": note}
+
+
+def replace_document(doc_id, chunks, meta, analysis, model, job=None, units=None, pages=None, vectors=None,
+                     details=None, suggestion=None):
+    """A re-read: new text, chunks, metadata, key details, model and unit check for a
+    document, keeping its id, file, upload date and folder (a re-read never moves it), and
+    the fields the user edited (user_edited). Its folder `suggestion` is kept only while it
+    is Unfiled. `job`, `units`, `pages`, `vectors` and `details` as in add_document; the
+    old chunks' vectors go with them (ON DELETE CASCADE)."""
+    title, doc_type, summary, keywords = _meta(meta)
+    new = {"title": title, "doc_type": doc_type, **{k: (details or {}).get(k) for k in DETAILS}}
     with connect() as con:
-        row = con.execute("SELECT filename FROM documents WHERE id=?", (doc_id,)).fetchone()
+        row = con.execute(f"SELECT folder_id, user_edited, suggested_folder, {', '.join(EDITABLE)} FROM documents"
+                          " WHERE id=?", (doc_id,)).fetchone()
         if not row:
             raise JobGone("The document was deleted while it was being read")
+        folders = _Folders(con)
+        edited = _edited(row["user_edited"])
+        values = {k: row[k] if k in edited else new[k] for k in EDITABLE}
+        unfiled = row["folder_id"] not in folders.rows
+        place = {"folder_id": row["folder_id"], "suggested_folder": suggestion if unfiled else row["suggested_folder"]}
         con.execute("DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE doc_id=?)", (doc_id,))
         con.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
-        con.execute("UPDATE documents SET char_count=?, title=?, doc_type=?, summary=?, keywords=?, analysis=?,"
-                    " model=?, unit_findings=? WHERE id=?",
-                    (sum(len(c) for c in chunks), *_meta(meta), analysis, model, _units(units), doc_id))
-        con.execute("DELETE FROM docs_fts WHERE rowid=?", (doc_id,))
-        con.execute("INSERT INTO docs_fts (rowid, filename, title, doc_type, summary, keywords) VALUES (?,?,?,?,?,?)",
-                    (doc_id, row["filename"], *_meta(meta)))
+        con.execute("UPDATE documents SET char_count=?, title=?, doc_type=?, summary=?, keywords=?, analysis=?, model=?,"
+                    " unit_findings=?, suggested_folder=?, document_date=?, vendor=?, total_amount=?, currency=?,"
+                    " due_date=? WHERE id=?",
+                    (sum(len(c) for c in chunks), values["title"], values["doc_type"], summary, keywords, analysis,
+                     model, _units(units), place["suggested_folder"], *(values[k] for k in DETAILS), doc_id))
+        _index_doc(con, doc_id)
         _insert_chunks(con, doc_id, chunks, pages, vectors)
         if job:
+            if "title" in edited:
+                job[1]["title"] = values["title"]
+            job[1].update(_placed(folders, place, "kept", None))
             _finish_job(con, job, doc_id)
     _index_changed()
 
 
-def list_documents():
+def list_documents(doc_ids=None):
+    """Every document, newest first; only those among `doc_ids` (folder_documents), if given."""
+    scope, args = _only(doc_ids)
     with connect() as con:
-        return [_doc(r) for r in con.execute(f"SELECT {_doc_columns('d')} FROM documents d ORDER BY id DESC")]
+        return _docs(con, con.execute(f"SELECT {_doc_columns('d')} FROM documents d WHERE 1{scope} ORDER BY id DESC",
+                                      args))
+
+
+def _only(doc_ids, column="d.id"):
+    """A filter on `column` for documents among `doc_ids` (None: all of them), as _among."""
+    if doc_ids is None:
+        return "", ()
+    return f" AND {column} IN (SELECT value FROM json_each(?))", (json.dumps(list(doc_ids)),)
+
+
+def get_document(doc_id):
+    """A document as listings have it, plus `pages` (the last page its chunks reach, None for
+    text without pages) and `copies` ([{id, folder_id}] of other documents holding the same
+    file). None if there is no such document."""
+    with connect() as con:
+        row = con.execute(f"SELECT {_doc_columns('d')} FROM documents d WHERE d.id=?", (doc_id,)).fetchone()
+        if not row:
+            return None
+        doc = _docs(con, [row])[0]
+        doc["pages"] = con.execute("SELECT MAX(page_end) FROM chunks WHERE doc_id=?", (doc_id,)).fetchone()[0]
+        doc["copies"] = [dict(r) for r in con.execute(
+            "SELECT id, folder_id FROM documents WHERE sha256=? AND id != ? ORDER BY id DESC",
+            (doc["sha256"], doc_id))] if doc["sha256"] else []
+    return doc
+
+
+def document_text(doc_id):
+    """A document's text as indexed: its chunks, in order (page breaks kept as "\\f")."""
+    with connect() as con:
+        return "\n\n".join(r[0] for r in con.execute("SELECT text FROM chunks WHERE doc_id=? ORDER BY idx", (doc_id,)))
+
+
+def update_document(doc_id, fields, suggestion=None):
+    """Change a document: `fields` (checked by the caller) of EDITABLE, each added to its
+    user_edited so re-reads keep it, and folder_id (a move: Unfiled when None). `suggestion`:
+    "dismiss" forgets its suggested folder; "apply" moves it there, making any folders on the
+    path that are missing (the user's click is the consent). Returns (the document, ids of
+    folders made), or None if there is no such document. MissingFolder: folder_id names none;
+    NoSuggestion: "apply" with none to apply."""
+    with files_lock:
+        with connect() as con:
+            row = con.execute("SELECT user_edited, suggested_folder FROM documents WHERE id=?", (doc_id,)).fetchone()
+            if not row:
+                return None
+            sets, created = {}, []
+            edited = set(_edited(row["user_edited"]))
+            for k in EDITABLE:
+                if k in fields:
+                    sets[k] = fields[k]
+                    edited.add(k)
+            if fields.keys() & set(EDITABLE):
+                sets["user_edited"] = json.dumps([k for k in EDITABLE if k in edited])
+            if "folder_id" in fields:
+                if fields["folder_id"] is not None and not _folder_exists(con, fields["folder_id"]):
+                    raise MissingFolder()
+                sets.update(folder_id=fields["folder_id"], filed_by=None, suggested_folder=None)
+            if suggestion == "dismiss":
+                sets["suggested_folder"] = None
+            elif suggestion == "apply":
+                if not row["suggested_folder"]:
+                    raise NoSuggestion("There is no suggestion to apply")
+                folder_id, created = _ensure_path(con, row["suggested_folder"].split("/"))
+                sets.update(folder_id=folder_id, filed_by=None, suggested_folder=None)
+            if sets:
+                con.execute(f"UPDATE documents SET {', '.join(f'{k}=?' for k in sets)} WHERE id=?",
+                            (*sets.values(), doc_id))
+            if sets.keys() & {"title", "doc_type", "vendor"}:
+                _index_doc(con, doc_id)
+            row = con.execute(f"SELECT {_doc_columns('d')} FROM documents d WHERE d.id=?", (doc_id,)).fetchone()
+            return _docs(con, [row])[0], created
 
 
 # ---- unit checks: litre/gallon misprints found in a document (units.check) ----
@@ -565,6 +799,392 @@ def delete_documents(ids):
         for p in unused:  # only after the commit: a rollback must not lose a file
             _remove(p)
     return deleted
+
+
+# ---- folders: documents.folder_id, nested through folders.parent_id ----
+# Every change is made under files_lock in one transaction, so the tree stays a tree (no
+# folder inside itself, no document in a deleted folder) without foreign keys.
+
+FOLDER_NAME_CHARS = 100
+_KEEP = object()  # update_folder: leave as it is
+
+
+class FolderError(Exception):
+    """A folder change that can't be made; the message is for the user."""
+
+
+class BadFolderName(FolderError, ValueError):
+    pass
+
+
+class MissingFolder(FolderError, LookupError):
+    def __init__(self, message="That folder was deleted"):
+        super().__init__(message)
+
+
+class FolderCycle(FolderError):
+    def __init__(self, message="A folder can't go inside itself or one of its own folders"):
+        super().__init__(message)
+
+
+class FolderConflict(FolderError):
+    """A folder of that name (ignoring case) is already there: `existing` {id, name}."""
+    def __init__(self, message, existing):
+        super().__init__(message)
+        self.existing = existing
+
+
+class FolderChanged(FolderError):
+    """A delete of a folder and its documents whose count of documents was not the one confirmed."""
+    def __init__(self, counts):
+        super().__init__(f"The folder changed: it now holds {counts['documents']} "
+                         f"document{'' if counts['documents'] == 1 else 's'}")
+        self.counts = counts
+
+
+class NoSuggestion(FolderError):
+    pass
+
+
+def clean_folder_name(raw):
+    """A folder name as kept: trimmed, inner whitespace collapsed. BadFolderName when it is
+    empty, too long, or has a / (paths are written with it) or control characters."""
+    name = " ".join(raw.split()) if isinstance(raw, str) else ""
+    if not name:
+        raise BadFolderName("A folder needs a name")
+    if len(name) > FOLDER_NAME_CHARS:
+        raise BadFolderName(f"Folder names are {FOLDER_NAME_CHARS} characters at most")
+    if "/" in name:
+        raise BadFolderName("Folder names can't contain /")
+    if re.search(r"[\x00-\x1f\x7f]", name):
+        raise BadFolderName("Folder names can't contain control characters")
+    return name
+
+
+def clean_path(raw, most=None):
+    """A folder path ("Household/Bills") as a list of clean names. BadFolderName for any bad
+    one, or for more than `most` levels."""
+    segments = [clean_folder_name(s) for s in (raw.split("/") if isinstance(raw, str) else [None])]
+    if most and len(segments) > most:
+        raise BadFolderName(f"A folder path has {most} levels at most")
+    return segments
+
+
+class _Folders:
+    """Every folder, from one query: by id, with their paths and lookups by name."""
+
+    def __init__(self, con):
+        self.rows = {r["id"]: dict(r) for r in con.execute(
+            "SELECT id, parent_id, name, name_key, created_at, updated_at FROM folders")}
+        self.by_key = {(r["parent_id"] or 0, r["name_key"]): i for i, r in self.rows.items()}
+
+    def path(self, folder_id):
+        """Names from the top level down to this folder."""
+        names, seen = [], set()
+        while folder_id in self.rows and folder_id not in seen:  # seen: a damaged tree can't loop forever
+            seen.add(folder_id)
+            names.append(self.rows[folder_id]["name"])
+            folder_id = self.rows[folder_id]["parent_id"]
+        return names[::-1]
+
+    def resolve(self, path):
+        """The id of the existing folder a path names (each level matched ignoring case), or None."""
+        parent = 0
+        for name in path.split("/") if isinstance(path, str) else path:
+            parent = self.by_key.get((parent, " ".join(name.split()).casefold()))
+            if parent is None:
+                return None
+        return parent or None
+
+
+def _folder_exists(con, folder_id):
+    return isinstance(folder_id, int) and con.execute("SELECT 1 FROM folders WHERE id=?", (folder_id,)).fetchone()
+
+
+def _folder_list(con, only=None):
+    """Folders as the API lists them, sorted by path: their path, how many documents each holds
+    (doc_count) and holds with its subfolders' (total_count)."""
+    folders = _Folders(con)
+    direct = dict(con.execute("SELECT folder_id, count(*) FROM documents WHERE folder_id IS NOT NULL GROUP BY folder_id"))
+    total = dict.fromkeys(folders.rows, 0)
+    for folder_id, n in direct.items():
+        seen = set()
+        while folder_id in folders.rows and folder_id not in seen:
+            seen.add(folder_id)
+            total[folder_id] += n
+            folder_id = folders.rows[folder_id]["parent_id"]
+    out = []
+    for i, r in folders.rows.items():
+        if only is None or i == only:
+            out.append({"id": i, "name": r["name"], "parent_id": r["parent_id"], "path": folders.path(i),
+                        "created_at": r["created_at"], "updated_at": r["updated_at"],
+                        "doc_count": direct.get(i, 0), "total_count": total[i]})
+    return sorted(out, key=lambda f: ([n.casefold() for n in f["path"]], f["id"]))
+
+
+def list_folders():
+    """[{id, name, parent_id, path, created_at, updated_at, doc_count, total_count}], by path."""
+    with connect() as con:
+        return _folder_list(con)
+
+
+def get_folder(folder_id):
+    with connect() as con:
+        return next(iter(_folder_list(con, folder_id)), None)
+
+
+def folder_paths():
+    """Every folder's path, levels joined by / ("Tractor/Manuals"), sorted: what an analysis
+    may file a document into."""
+    with connect() as con:
+        folders = _Folders(con)
+    return sorted(("/".join(folders.path(i)) for i in folders.rows), key=str.casefold)
+
+
+def _conflict(con, parent_id, name, but=None):
+    """FolderConflict if `parent_id` (None: the top level) already holds a folder named `name`."""
+    row = con.execute("SELECT id, name FROM folders WHERE IFNULL(parent_id, 0)=? AND name_key=? AND id IS NOT ?",
+                      (parent_id or 0, name.casefold(), but)).fetchone()
+    if row:
+        raise _conflict_error(con, parent_id, row)
+
+
+def _conflict_error(con, parent_id, row):
+    where = con.execute("SELECT name FROM folders WHERE id=?", (parent_id,)).fetchone() if parent_id else None
+    message = (f"{where[0]} already has a folder named \"{row['name']}\"" if where
+               else f"There is already a folder named \"{row['name']}\"")
+    return FolderConflict(message, {"id": row["id"], "name": row["name"]})
+
+
+def _insert_folder(con, name, parent_id):
+    try:
+        return con.execute("INSERT INTO folders (parent_id, name, name_key) VALUES (?,?,?)",
+                           (parent_id, name, name.casefold())).lastrowid
+    except sqlite3.IntegrityError:  # the unique index: a clash _conflict missed can't get past it
+        _conflict(con, parent_id, name)
+        raise
+
+
+def add_folder(name, parent_id=None):
+    """Make a folder in `parent_id` (None: the top level) and return it. BadFolderName,
+    MissingFolder (the parent), FolderConflict."""
+    name = clean_folder_name(name)
+    with files_lock:
+        with connect() as con:
+            if parent_id is not None and not _folder_exists(con, parent_id):
+                raise MissingFolder()
+            _conflict(con, parent_id, name)
+            folder_id = _insert_folder(con, name, parent_id)
+            return _folder_list(con, folder_id)[0]
+
+
+def _ancestors(con, folder_id):
+    """This folder and every folder above it."""
+    return {r[0] for r in con.execute(
+        "WITH RECURSIVE up(id) AS (SELECT ? UNION SELECT f.parent_id FROM folders f JOIN up ON f.id = up.id"
+        " WHERE f.parent_id IS NOT NULL) SELECT id FROM up", (folder_id,))}
+
+
+def update_folder(folder_id, name=_KEEP, parent_id=_KEEP):
+    """Rename a folder and/or move it into `parent_id` (None: the top level), and return it.
+    A rename that only changes case is allowed. MissingFolder (it, or the new parent),
+    FolderCycle (into itself or one of its own folders), BadFolderName, FolderConflict."""
+    with files_lock:
+        with connect() as con:
+            row = con.execute("SELECT name, parent_id FROM folders WHERE id=?", (folder_id,)).fetchone()
+            if not row:
+                raise MissingFolder()
+            name = row["name"] if name is _KEEP else clean_folder_name(name)
+            parent_id = row["parent_id"] if parent_id is _KEEP else parent_id
+            if parent_id is not None:
+                if not _folder_exists(con, parent_id):
+                    raise MissingFolder()
+                if folder_id in _ancestors(con, parent_id):
+                    raise FolderCycle()
+            _conflict(con, parent_id, name, but=folder_id)
+            if (name, parent_id) != (row["name"], row["parent_id"]):
+                try:
+                    con.execute("UPDATE folders SET name=?, name_key=?, parent_id=?, updated_at=datetime('now')"
+                                " WHERE id=?", (name, name.casefold(), parent_id, folder_id))
+                except sqlite3.IntegrityError:
+                    _conflict(con, parent_id, name, but=folder_id)
+                    raise
+            return _folder_list(con, folder_id)[0]
+
+
+def subtree(con, ids):
+    """Ids of these folders (those that exist) and of every folder inside them, at any depth."""
+    return [r[0] for r in con.execute(
+        "WITH RECURSIVE sub(id) AS (SELECT id FROM folders WHERE id IN (SELECT value FROM json_each(?))"
+        " UNION SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id) SELECT id FROM sub",
+        (json.dumps(list(ids)),))]
+
+
+def _folder_docs(con, ids, recursive=True):
+    """Ids of the documents in these folders ("unfiled": in none), and in their subfolders."""
+    unfiled = "unfiled" in ids
+    ids = [i for i in ids if i != "unfiled"]
+    found = subtree(con, ids) if recursive else ids
+    where = "folder_id IN (SELECT value FROM json_each(?))" + (" OR folder_id IS NULL" if unfiled else "")
+    return [r[0] for r in con.execute(f"SELECT id FROM documents WHERE {where} ORDER BY id DESC", (json.dumps(found),))]
+
+
+def folder_documents(folder_ids, recursive=True):
+    """Ids of the documents in these folders, and with `recursive` in every folder inside
+    them; "unfiled" stands for the documents in no folder. MissingFolder for an id that
+    names no folder."""
+    with connect() as con:
+        for i in folder_ids:
+            if i != "unfiled" and not _folder_exists(con, i):
+                raise MissingFolder()
+        return _folder_docs(con, folder_ids, recursive)
+
+
+def scope_folders(folder_ids):
+    """The folders among these that exist, as a question limited to them searches them now:
+    [{id, name, count, doc_ids}], the documents in each folder and its subfolders, looked up
+    at the time of asking, so documents added since the folder was chosen are included."""
+    with connect() as con:
+        folders = _Folders(con)
+        out = []
+        for i in dict.fromkeys(folder_ids):
+            if i in folders.rows:
+                docs = _folder_docs(con, [i])
+                out.append({"id": i, "name": folders.rows[i]["name"], "count": len(docs), "doc_ids": docs})
+    return out
+
+
+def _ensure_path(con, segments):
+    """Walk a folder path from the top level, matching each level ignoring case, and make the
+    folders missing from it. Returns (its folder id, ids of the folders made)."""
+    parent, created = None, []
+    for raw in segments:
+        name = clean_folder_name(raw)
+        row = con.execute("SELECT id FROM folders WHERE IFNULL(parent_id, 0)=? AND name_key=?",
+                          (parent or 0, name.casefold())).fetchone()
+        if row:
+            parent = row[0]
+        else:
+            parent = _insert_folder(con, name, parent)
+            created.append(parent)
+    if parent is None:
+        raise BadFolderName("A folder needs a name")
+    return parent, created
+
+
+def ensure_path(segments):
+    """_ensure_path, in a transaction of its own."""
+    with files_lock:
+        with connect() as con:
+            return _ensure_path(con, segments)
+
+
+def move_documents(ids, folder_id=None, path=None):
+    """Move documents into a folder (None: Unfiled), or into the folder at `path` (a list of
+    names), making the folders missing from it. Their filed_by and suggestion are cleared:
+    the user put them there. Ids that name no document are skipped. Returns {moved,
+    folder_id, created: [folder ids made], from: {document id: the folder it was in}}, which
+    is what an Undo needs. MissingFolder: folder_id names none."""
+    ids = [i for i in dict.fromkeys(ids) if -2**63 <= i < 2**63]
+    with files_lock:
+        with connect() as con:
+            created = []
+            if path is not None:
+                folder_id, created = _ensure_path(con, path)
+            elif folder_id is not None and not _folder_exists(con, folder_id):
+                raise MissingFolder()
+            arg = json.dumps(ids)
+            before = dict(con.execute("SELECT id, folder_id FROM documents WHERE id IN (SELECT value FROM json_each(?))",
+                                      (arg,)).fetchall())
+            con.execute("UPDATE documents SET folder_id=?, filed_by=NULL, suggested_folder=NULL"
+                        " WHERE id IN (SELECT value FROM json_each(?))", (folder_id, arg))
+    return {"moved": len(before), "folder_id": folder_id, "created": created,
+            "from": {i: before[i] for i in ids if i in before}}
+
+
+def _free_name(con, parent_id, name):
+    """`name`, or "name (2)", "name (3)" ... the lowest that `parent_id` doesn't hold yet."""
+    n = 2
+    while True:
+        suffix = f" ({n})"
+        candidate = name[:FOLDER_NAME_CHARS - len(suffix)].rstrip() + suffix
+        if not con.execute("SELECT 1 FROM folders WHERE IFNULL(parent_id, 0)=? AND name_key=?",
+                           (parent_id or 0, candidate.casefold())).fetchone():
+            return candidate
+        n += 1
+
+
+def _forget_folders(con, ids):
+    """Conversations limited to these folders forget them, as they forget deleted documents;
+    uploads on their way into them are told to go to Unfiled instead."""
+    arg = json.dumps(list(ids))
+    con.execute("UPDATE conversations SET folder_ids = (SELECT json_group_array(value) FROM json_each(folder_ids)"
+                " WHERE value NOT IN (SELECT value FROM json_each(?))) WHERE folder_ids IS NOT NULL AND EXISTS"
+                " (SELECT 1 FROM json_each(folder_ids) WHERE value IN (SELECT value FROM json_each(?)))", (arg, arg))
+
+
+def _retarget_uploads(con, ids, folder_id):
+    """Uploads not saved yet (queued, waiting, running, or failed and so retryable) whose
+    destination is one of these folders go to `folder_id` instead (None: Unfiled)."""
+    marks = ",".join("?" * len(HOLDING_JOBS))
+    return con.execute(
+        f"UPDATE jobs SET options=json_set(options, '$.folder_id', ?), updated_at=datetime('now')"
+        f" WHERE kind='upload' AND status IN ({marks}) AND json_extract(options, '$.folder_id')"
+        f" IN (SELECT value FROM json_each(?))", (folder_id, *HOLDING_JOBS, json.dumps(list(ids)))).rowcount
+
+
+def delete_folder(folder_id, contents="move", confirm_documents=None):
+    """Delete a folder. contents="move": its documents go to its parent (Unfiled at the top
+    level) and its folders too, each renamed "Name (2)" and so on when the parent already
+    has one of that name. contents="delete": it, every folder inside it, and every document
+    in them go, but only when `confirm_documents` is how many documents that is now (none
+    needs no confirmation): FolderChanged with the counts otherwise. Either way, chats
+    forget it, and uploads on their way into it go to the parent (move) or Unfiled (delete).
+    Files no document or job uses any more are removed after the commit. Returns
+    {deleted_folders, moved_documents, moved_folders, deleted_documents, renamed: [{id,
+    from, to}], parent_id}. MissingFolder if there is no such folder."""
+    out = {"deleted_folders": 0, "moved_documents": 0, "moved_folders": 0, "deleted_documents": 0, "renamed": []}
+    unused = []
+    with files_lock:
+        with connect() as con:
+            row = con.execute("SELECT parent_id FROM folders WHERE id=?", (folder_id,)).fetchone()
+            if not row:
+                raise MissingFolder()
+            parent = out["parent_id"] = row["parent_id"]
+            if contents == "delete":
+                gone = subtree(con, [folder_id])
+                docs = _folder_docs(con, gone, recursive=False)
+                if docs and confirm_documents != len(docs):
+                    raise FolderChanged({"documents": len(docs), "folders": len(gone) - 1})
+                out["deleted_documents"], files = _delete_rows(con, docs)
+                con.execute("DELETE FROM folders WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(gone),))
+                out["deleted_folders"] = len(gone)
+                _retarget_uploads(con, gone, None)
+                _forget_folders(con, gone)
+                unused = [p for p in files if _unused(con, p)]
+            else:
+                children = con.execute("SELECT id, name FROM folders WHERE parent_id=? ORDER BY id",
+                                       (folder_id,)).fetchall()
+                con.execute("DELETE FROM folders WHERE id=?", (folder_id,))  # first: a child may share its name
+                for child in children:
+                    name = child["name"]
+                    if con.execute("SELECT 1 FROM folders WHERE IFNULL(parent_id, 0)=? AND name_key=?",
+                                   (parent or 0, name.casefold())).fetchone():
+                        name = _free_name(con, parent, name)
+                        out["renamed"].append({"id": child["id"], "from": child["name"], "to": name})
+                    con.execute("UPDATE folders SET parent_id=?, name=?, name_key=?, updated_at=datetime('now')"
+                                " WHERE id=?", (parent, name, name.casefold(), child["id"]))
+                out["moved_folders"] = len(children)
+                out["moved_documents"] = con.execute(
+                    "UPDATE documents SET folder_id=?, filed_by=NULL WHERE folder_id=?", (parent, folder_id)).rowcount
+                out["deleted_folders"] = 1
+                _retarget_uploads(con, [folder_id], parent)
+                _forget_folders(con, [folder_id])
+        if contents == "delete":
+            _index_changed()  # the documents' chunks' vectors went with them
+            for p in unused:  # only after the commit, as in delete_documents
+                _remove(p)
+    return out
 
 
 # ---- jobs: uploads and re-reads waiting for, or in, the background worker ----
@@ -703,15 +1323,18 @@ def fts_query(text, question=False):
     return " OR ".join(f'"{t}"' for t in dict.fromkeys(rare if rare or question else terms))
 
 
-def search_documents(text, limit=10):
+def search_documents(text, limit=10, doc_ids=None):
+    """Documents whose file name, title, type, summary, keywords or vendor have the words of
+    `text`, best first (bm25); only among `doc_ids` (folder_documents), if given."""
     q = fts_query(text)
     if not q:
         return []
+    scope, args = _only(doc_ids)
     with connect() as con:
         rows = con.execute(
             f"SELECT {_doc_columns('d')} FROM docs_fts f JOIN documents d ON d.id = f.rowid"
-            " WHERE docs_fts MATCH ? ORDER BY bm25(docs_fts) LIMIT ?", (q, limit))
-        return [_doc(r) for r in rows]
+            f" WHERE docs_fts MATCH ?{scope} ORDER BY bm25(docs_fts) LIMIT ?", (q, *args, limit))
+        return _docs(con, rows)
 
 
 # A chunk as search returns it: where it is (document, place, pages) and whether its
@@ -881,22 +1504,27 @@ def _ids(doc_ids):
     return None if doc_ids is None else json.dumps(list(doc_ids))
 
 
-def begin_exchange(conv_id, question, model="", doc_ids=None, title=""):
+def begin_exchange(conv_id, question, model="", doc_ids=None, title="", folder_ids=None):
     """Keep a question as it is asked, with an empty answer ('answering') that finish_exchange
     fills in: a reloaded page, another tab, or a restart still finds the question. A new
     conversation titled `title` when conv_id is None. The conversation takes the question's
-    model choice and documents (doc_ids, None for all; those deleted meanwhile left out, so a
-    delete while it is answered isn't undone). Returns {conversation_id, title, question_id,
+    model choice, documents and folders (doc_ids and folder_ids, both None for all; those
+    deleted meanwhile left out, so a delete while it is answered isn't undone; with folders,
+    doc_ids is kept as a list, [] for none). Returns {conversation_id, title, question_id,
     answer_id}, or None if the conversation was deleted meanwhile (nothing is kept then)."""
     with connect() as con:
+        if folder_ids is not None:
+            folder_ids = [r[0] for r in con.execute(
+                "SELECT value FROM json_each(?) WHERE value IN (SELECT id FROM folders)", (_ids(folder_ids),))]
+            doc_ids = [] if doc_ids is None else doc_ids
         if doc_ids is not None:
             doc_ids = [r[0] for r in con.execute(
                 "SELECT value FROM json_each(?) WHERE value IN (SELECT id FROM documents)", (_ids(doc_ids),))]
         if conv_id is None:
-            conv_id = con.execute("INSERT INTO conversations (title, model, doc_ids) VALUES (?,?,?)",
-                                  (title, model, _ids(doc_ids))).lastrowid
-        elif not con.execute("UPDATE conversations SET updated_at=datetime('now'), model=?, doc_ids=? WHERE id=?",
-                             (model, _ids(doc_ids), conv_id)).rowcount:
+            conv_id = con.execute("INSERT INTO conversations (title, model, doc_ids, folder_ids) VALUES (?,?,?,?)",
+                                  (title, model, _ids(doc_ids), _ids(folder_ids))).lastrowid
+        elif not con.execute("UPDATE conversations SET updated_at=datetime('now'), model=?, doc_ids=?, folder_ids=?"
+                             " WHERE id=?", (model, _ids(doc_ids), _ids(folder_ids), conv_id)).rowcount:
             return None
         title = con.execute("SELECT title FROM conversations WHERE id=?", (conv_id,)).fetchone()[0]
         question_id = con.execute("INSERT INTO messages (conversation_id, role, content) VALUES (?, 'user', ?)",
@@ -963,13 +1591,14 @@ def history(conv_id):
     return turns
 
 
-_CONVERSATION = ("c.id, c.title, c.created_at, c.updated_at, c.model, c.doc_ids, (SELECT count(*) FROM messages m"
-                 " WHERE m.conversation_id = c.id AND m.role = 'user') AS questions")
+_CONVERSATION = ("c.id, c.title, c.created_at, c.updated_at, c.model, c.doc_ids, c.folder_ids, (SELECT count(*)"
+                 " FROM messages m WHERE m.conversation_id = c.id AND m.role = 'user') AS questions")
 
 
 def _conversation(row):
     c = dict(row)
-    c["doc_ids"] = None if c["doc_ids"] is None else json.loads(c["doc_ids"])
+    for k in ("doc_ids", "folder_ids"):
+        c[k] = None if c[k] is None else json.loads(c[k])
     return c
 
 
@@ -1018,7 +1647,8 @@ def _message(row):
         return {k: m[k] for k in ("id", "role", "content", "created_at")}
     m["usage"] = json.loads(m["usage"]) if m["usage"] else None
     found = json.loads(m.pop("sources") or "null") or {}
-    return {**m, **{k: found.get(k) for k in ("sources", "excerpts", "overview", "scope", "scope_names", "left_out")}}
+    return {**m, **{k: found.get(k) for k in ("sources", "excerpts", "overview", "scope", "scope_names", "scope_folders",
+                                              "scope_count", "left_out")}}
 
 
 def rename_conversation(conv_id, title):

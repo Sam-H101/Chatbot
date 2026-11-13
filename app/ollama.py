@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 
 from . import extract, sections
-from .llm import SYSTEM
+from .llm import PHOTO_PROMPT, SYSTEM
 
 URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
@@ -34,8 +34,9 @@ TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "600"))
 EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:0.6b")
 # Seconds an embedding call may take: a question waits for it, so far less than TIMEOUT.
 EMBED_TIMEOUT = 60
-# What an analysis prompt adds to the text it carries (its instructions, the file name and
-# labels), in tokens, and the factor a token estimate (tokens) is raised by for what it misses.
+# What an analysis prompt adds to the text it carries (its instructions, the key details
+# guidance, the file name and labels; a list of folders comes off the text, sections.analyze),
+# in tokens, and the factor a token estimate (tokens) is raised by for what it misses.
 PROMPT_TOKENS, MARGIN = 500, 1.1
 # Bits of text that are about a token each for qwen3.5, whose tokenizer, like many, gives
 # every digit a token of its own: a digit, a non-ASCII character, a word (with its leading
@@ -380,6 +381,16 @@ def transcribe_pdf(data, on_usage=None, done=None, on_page=None):
         if on_page:
             on_page(n, total, text, read)
     return out
+
+
+def transcribe_image(jpeg, on_usage=None):
+    """The text of a photo of a document, read by the vision model: one call, given the photo
+    as extract.prepare_image makes it (JPEG bytes)."""
+    r = _chat(VISION_MODEL, [{"role": "user", "content": PHOTO_PROMPT,
+                              "images": [base64.standard_b64encode(jpeg).decode("ascii")]}], temperature=0)
+    if on_usage:
+        on_usage("transcribe", "ollama", VISION_MODEL, _usage(r))
+    return r["message"]["content"]
 
 
 def chat(_client, history, user_message, model=MODEL, system=SYSTEM, on_usage=None):

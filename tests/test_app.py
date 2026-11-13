@@ -8,8 +8,10 @@ import pytest
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    from app import auth, db, jobs, llm, main, ollama, vectors
+    from app import auth, db, jobs, llm, main, ollama, thumbs, vectors
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setattr(db, "THUMBS_DIR", "")  # thumbnails go to tmp_path / "thumbs"
+    monkeypatch.setattr(thumbs, "_failed", set())
     monkeypatch.setattr(auth, "PASSWORD", "")  # no login, unless a test sets a password (guarded)
     # No embedding model unless a test brings one (fake_embedder): search is by keywords, and
     # vectors.py starts each test with no pause and nothing cached.
@@ -1004,7 +1006,8 @@ def test_files_that_can_never_be_read_are_refused_before_they_are_queued(client,
     for name, body, error in [
         ("empty.txt", b"", "No text found in file"),
         ("blank.txt", b"  \n\f ", "No text found in file"),
-        ("picture.png", b"\x89PNG\r\n\x1a\n\x00\xff", "Unsupported file: expected PDF, DOCX or UTF-8 text"),
+        ("data.bin", b"\x89PNG\r\n\x1a\n\x00\xff", "Unsupported file: expected PDF, DOCX or UTF-8 text"),
+        ("picture.png", b"\x89PNG\r\n\x1a\n\x00\xff", "Could not open this photo: it is damaged"),  # a photo now
         ("broken.pdf", b"%PDF-1.4 not really", "Could not open this PDF: "),
         ("none.pdf", blank_pdf(0), "Could not open this PDF: "),                         # PDFium won't load 0 pages
         ("broken.docx", b"PK not a zip", "Could not open this DOCX file"),
@@ -1176,6 +1179,10 @@ def test_library_from_before_kept_files_still_works(client, tmp_path, monkeypatc
     doc = client.get("/api/documents").json[0]
     assert doc["title"] == "Tractor manual" and doc["model"] == "qwen3.5:9b"
     assert doc["has_file"] is False and doc["sha256"] is None and doc["file_size"] is None
+    assert (doc["folder_id"], doc["user_edited"], doc["kind"], doc["thumb"], doc["document_date"]) == (None, [], "pdf",
+                                                                                                         None, None)
+    assert client.get("/api/documents?folder=unfiled").json[0]["id"] == 1                # no folder: Unfiled
+    assert client.get("/api/documents/1").json["pages"] is None                          # no pages kept then
     assert client.get("/api/documents?q=tractor").json[0]["id"] == 1                    # metadata search
     assert client.get("/api/search?q=hydraulic").json[0]["doc_id"] == 1                 # content search
     r = client.post("/api/chat", json={"question": "When do I change the hydraulic oil?"}, headers=H)
@@ -3938,3 +3945,755 @@ def test_scraps_of_long_documents_are_left_out_of_search_by_meaning(client, monk
     assert sorted(vectors._vectors()[0].tolist()) == [page["id"], only["id"]] and scrap["model"]  # embedded, not compared
     assert {h["filename"] for h in client.get("/api/search?q=dog").json} == {"manual.txt", "note.txt"}
     assert db.fts_query("Hi! Thanks, hello", question=True) == ""
+
+
+# ---- folders, key details, photos, thumbnails and Markdown (the documents overhaul) ----
+
+def folder(client, name, parent=None):
+    r = client.post("/api/folders", json={"name": name, "parent_id": parent})
+    assert r.status_code == 201, r.json
+    return r.json["id"]
+
+
+def analysis(monkeypatch, seen=None, **meta):
+    """llm.analyze (the client fixture's backend) faked to answer these keys too (key details,
+    a folder); the folders each call was given are recorded in `seen`."""
+    from app import llm
+    base = {"title": "Lease", "doc_type": "contract", "summary": "A flat lease.", "keywords": ["rent", "tenant"]}
+
+    def analyze(c, name, text, model=None, folders=(), **kw):
+        if seen is not None:
+            seen.append(list(folders))
+        return {**base, **meta}, "full"
+
+    monkeypatch.setattr(llm, "analyze", analyze)
+
+
+def photo(fmt="JPEG", size=(240, 160)):
+    """A small image in this format, made with Pillow (a receipt as far as checks go)."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGB", size, "white")
+    ImageDraw.Draw(im).rectangle((10, 10, 60, 40), fill="black")
+    buf = io.BytesIO()
+    im.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def huge_png(width, height):
+    """A tiny PNG whose header claims width x height pixels: the shape of a decompression bomb."""
+    import struct
+    import zlib
+    data = photo("PNG", (8, 8))
+    chunk = b"IHDR" + struct.pack(">II", width, height) + data[24:29]
+    return data[:8] + struct.pack(">I", 13) + chunk + struct.pack(">I", zlib.crc32(chunk)) + data[33:]
+
+
+def test_folders_are_made_renamed_and_moved(client):
+    tractor = folder(client, "  Tractor \t kit ")
+    (f,) = client.get("/api/folders").json
+    assert {k: f[k] for k in ("id", "name", "parent_id", "path", "doc_count", "total_count")} == {
+        "id": tractor, "name": "Tractor kit", "parent_id": None, "path": ["Tractor kit"], "doc_count": 0,
+        "total_count": 0}                                                                # trimmed, spaces collapsed
+    assert f["created_at"] and f["updated_at"]
+    for bad, error in [("", "A folder needs a name"), ("   ", "A folder needs a name"), (None, "A folder needs a name"),
+                       (5, "A folder needs a name"), ("x" * 101, "Folder names are 100 characters at most"),
+                       ("Bills/2026", "Folder names can't contain /"),
+                       ("bell\x07", "Folder names can't contain control characters")]:
+        r = client.post("/api/folders", json={"name": bad})
+        assert r.status_code == 400 and r.json["error"] == error, bad
+    assert folder(client, "x" * 100)
+    # Names are unique per parent, ignoring case (casefold, so beyond ASCII too).
+    manuals = folder(client, "Manuals", tractor)
+    r = client.post("/api/folders", json={"name": "tractor KIT"})
+    assert r.status_code == 409 and r.json == {"error": 'There is already a folder named "Tractor kit"',
+                                               "conflict": {"id": tractor, "name": "Tractor kit"}}
+    r = client.post("/api/folders", json={"name": "MANUALS", "parent_id": tractor})
+    assert r.status_code == 409 and r.json["error"] == 'Tractor kit already has a folder named "Manuals"'
+    top_manuals = folder(client, "Manuals")                                              # another parent: fine
+    strasse = folder(client, "Straße", tractor)
+    assert client.post("/api/folders", json={"name": "STRASSE", "parent_id": tractor}).json["conflict"]["id"] == strasse
+    r = client.post("/api/folders", json={"name": "x", "parent_id": 9999})
+    assert r.status_code == 404 and r.json["error"] == "That folder was deleted"
+    assert client.post("/api/folders", json={"name": "x", "parent_id": 2**70}).status_code == 404
+    for bad in ("1", True, 1.5):
+        assert client.post("/api/folders", json={"name": "x", "parent_id": bad}).status_code == 400
+    # Renames: one that only changes case is fine; a sibling's name isn't.
+    r = client.patch(f"/api/folders/{tractor}", json={"name": "tractor kit"})
+    assert r.status_code == 200 and r.json["name"] == "tractor kit"
+    assert client.patch(f"/api/folders/{strasse}", json={"name": "manuals"}).status_code == 409
+    assert client.patch(f"/api/folders/{strasse}", json={"name": ""}).status_code == 400
+    # Moves: never into itself or one of its own folders, at any depth.
+    deep = folder(client, "Deep", manuals)
+    for target in (tractor, manuals, deep):
+        r = client.patch(f"/api/folders/{tractor}", json={"parent_id": target})
+        assert r.status_code == 400 and r.json["error"] == "A folder can't go inside itself or one of its own folders"
+    r = client.patch(f"/api/folders/{manuals}", json={"parent_id": None})                 # the top level has one
+    assert r.status_code == 409 and r.json["conflict"]["id"] == top_manuals
+    r = client.patch(f"/api/folders/{manuals}", json={"name": "Old manuals", "parent_id": None}).json
+    assert r["parent_id"] is None and r["path"] == ["Old manuals"]
+    assert {f["id"]: f["path"] for f in client.get("/api/folders").json}[deep] == ["Old manuals", "Deep"]
+    assert client.patch(f"/api/folders/{deep}", json={"parent_id": tractor}).json["path"] == ["tractor kit", "Deep"]
+    assert client.patch("/api/folders/9999", json={"name": "x"}).status_code == 404
+    assert client.patch(f"/api/folders/{deep}", json={"parent_id": 9999}).status_code == 404
+    paths = [f["path"] for f in client.get("/api/folders").json]                          # sorted by path, any case
+    assert paths == sorted(paths, key=lambda p: [n.casefold() for n in p])
+    # Ids are never given out again: chat scopes and open tabs hold them.
+    temporary = folder(client, "Temporary")
+    assert client.delete(f"/api/folders/{temporary}").status_code == 200
+    assert folder(client, "Next") > temporary
+
+
+def test_folders_count_their_documents_and_limit_listings_and_searches(client):
+    tractor, bills = folder(client, "Tractor"), folder(client, "Bills")
+    manuals = folder(client, "Manuals", tractor)
+    a = add(client, "a.txt", b"Hydraulic oil every 400 hours.", folder_id=str(manuals))["doc_id"]
+    b = add(client, "b.txt", b"Tractor hydraulic warranty card.", folder_id=str(tractor))["doc_id"]
+    c = add(client, "c.txt", b"The hydraulic repair bill is due.")["doc_id"]
+    counts = {f["id"]: (f["doc_count"], f["total_count"]) for f in client.get("/api/folders").json}
+    assert counts == {tractor: (1, 2), manuals: (1, 1), bills: (0, 0)}                   # its own, and with subfolders
+
+    def ids(url):
+        r = client.get(url)
+        assert r.status_code == 200, r.json
+        return [d.get("id", d.get("doc_id")) for d in r.json]
+
+    assert ids(f"/api/documents?folder={tractor}") == [b, a]                             # newest first
+    assert ids(f"/api/documents?folder={tractor}&recursive=0") == [b]
+    assert ids("/api/documents?folder=unfiled") == [c] and ids(f"/api/documents?folder={bills}") == []
+    assert set(ids(f"/api/documents?q=tenant&folder={tractor}")) == {a, b}
+    assert ids(f"/api/documents?q=tenant&folder={tractor}&recursive=0") == [b]
+    assert len(ids("/api/documents?q=tenant&limit=2")) == 2 and len(ids("/api/documents?q=tenant")) == 3
+    assert set(ids(f"/api/search?q=hydraulic&folder={tractor}")) == {a, b}
+    assert ids("/api/search?q=hydraulic&folder=unfiled") == [c] and len(ids("/api/search?q=hydraulic&limit=1")) == 1
+    for bad in ("folder=9999", f"folder={2**70}"):
+        r = client.get(f"/api/documents?{bad}")
+        assert r.status_code == 404 and r.json["error"] == "That folder was deleted"
+        assert client.get(f"/api/search?q=oil&{bad}").status_code == 404
+    for bad in ("folder=x", "folder=1.5", f"folder={tractor}&recursive=2", "q=oil&limit=0", "q=oil&limit=201",
+                "q=oil&limit=x"):
+        assert client.get(f"/api/documents?{bad}").status_code == 400, bad
+    assert client.get("/api/search?q=oil&limit=51").status_code == 400
+    assert len(client.get("/api/documents").json) == 3                                   # no parameters: as before
+
+
+def test_deleting_a_folder_moves_what_it_holds_up_a_level(client):
+    from app import db, jobs
+    bills = folder(client, "Bills")
+    in_bills = folder(client, "2025", bills)
+    clashes = [folder(client, "2025"), folder(client, "2025 (2)")]                       # the top level has these
+    a = add(client, "a.txt", b"Electricity bill.", folder_id=str(bills))["doc_id"]
+    b = add(client, "b.txt", b"Water bill.", folder_id=str(in_bills))["doc_id"]
+    queued = post(client, "c.txt", b"Gas bill.", folder_id=str(bills)).json["job"]["id"]  # on its way in
+    conv = client.post("/api/chat", json={"question": "Bills?", "folder_ids": [bills]}, headers=H).json["conversation_id"]
+    r = client.delete(f"/api/folders/{bills}")
+    assert r.status_code == 200 and r.json == {
+        "deleted_folders": 1, "moved_documents": 1, "moved_folders": 1, "deleted_documents": 0,
+        "renamed": [{"id": in_bills, "from": "2025", "to": "2025 (3)"}], "parent_id": None}
+    assert {d["id"]: d["folder_id"] for d in client.get("/api/documents").json} == {a: None, b: in_bills}
+    assert {f["id"]: f["path"] for f in client.get("/api/folders").json} == {
+        clashes[0]: ["2025"], clashes[1]: ["2025 (2)"], in_bills: ["2025 (3)"]}
+    assert db.get_job(queued)["options"]["folder_id"] is None                            # the top level: Unfiled
+    assert client.get(f"/api/conversations/{conv}").json["folder_ids"] == []             # chose only it: all gone
+    # Inside another folder, everything goes to that one, uploads on their way in too.
+    receipts = folder(client, "Receipts")
+    year = folder(client, "2026", receipts)
+    d = add(client, "d.txt", b"Receipt.", folder_id=str(year))["doc_id"]
+    later = post(client, "e.txt", b"Another receipt.", folder_id=str(year)).json["job"]["id"]
+    r = client.delete(f"/api/folders/{year}?contents=move").json
+    assert (r["moved_documents"], r["moved_folders"], r["parent_id"]) == (1, 0, receipts)
+    assert client.get(f"/api/documents/{d}").json["folder_id"] == receipts
+    jobs.drain()
+    assert db.get_job(queued)["result"]["folder_id"] is None
+    assert (db.get_job(later)["result"]["folder_id"], db.get_job(later)["result"]["filed"]) == (receipts, "chosen")
+    assert client.delete(f"/api/folders/{year}").status_code == 404
+
+
+def test_deleting_a_folder_with_its_documents_needs_their_count(client, tmp_path):
+    from app import db
+    tractor, keep = folder(client, "Tractor"), folder(client, "Keep")
+    manuals = folder(client, "Manuals", tractor)
+    a = add(client, "a.txt", b"Hydraulic oil.", folder_id=str(tractor))["doc_id"]
+    add(client, "b.txt", b"Brake pedal.", folder_id=str(manuals))
+    k = add(client, "k.txt", b"Kept elsewhere.", folder_id=str(keep))["doc_id"]
+    queued = post(client, "q.txt", b"Queued note.", folder_id=str(manuals)).json["job"]["id"]
+    conv = client.post("/api/chat", json={"question": "Oil?", "doc_ids": [a, k], "folder_ids": [manuals, keep]},
+                       headers=H).json["conversation_id"]
+    for query in ("contents=delete", "contents=delete&confirm_documents=1", "contents=delete&confirm_documents=3"):
+        r = client.delete(f"/api/folders/{tractor}?{query}")
+        assert r.status_code == 409 and r.json == {"error": "The folder changed: it now holds 2 documents",
+                                                   "counts": {"documents": 2, "folders": 1}}
+    assert client.delete(f"/api/folders/{tractor}?contents=all").status_code == 400
+    assert client.delete(f"/api/folders/{tractor}?contents=delete&confirm_documents=x").status_code == 400
+    assert len(client.get("/api/documents").json) == 3                                   # nothing went
+    r = client.delete(f"/api/folders/{tractor}?contents=delete&confirm_documents=2")
+    assert r.status_code == 200 and r.json == {"deleted_folders": 2, "moved_documents": 0, "moved_folders": 0,
+                                               "deleted_documents": 2, "renamed": [], "parent_id": None}
+    assert [d["id"] for d in client.get("/api/documents").json] == [k]
+    assert client.get("/api/search?q=hydraulic").json == [] and client.get("/api/search?q=brake").json == []
+    assert {p.name for p in (tmp_path / "files").iterdir()} == {
+        hashlib.sha256(b"Kept elsewhere.").hexdigest(), hashlib.sha256(b"Queued note.").hexdigest()}  # theirs went
+    c = client.get(f"/api/conversations/{conv}").json
+    assert (c["doc_ids"], c["folder_ids"]) == ([k], [keep])
+    assert db.get_job(queued)["options"]["folder_id"] is None                            # to Unfiled
+    assert [f["id"] for f in client.get("/api/folders").json] == [keep]
+    assert client.delete(f"/api/folders/{tractor}?contents=delete").status_code == 404
+    empty = folder(client, "Empty")
+    assert client.delete(f"/api/folders/{empty}?contents=delete").json["deleted_folders"] == 1  # no documents: no count
+
+
+def test_documents_are_moved_in_bulk_and_can_be_moved_back(client):
+    a, b = add(client, "a.txt", b"One.")["doc_id"], add(client, "b.txt", b"Two.")["doc_id"]
+    bills = folder(client, "Bills")
+    r = client.post("/api/documents/move", json={"ids": [a, b, 9999, 2**70], "folder_id": bills})
+    assert r.status_code == 200 and r.json == {"moved": 2, "folder_id": bills, "created": [],
+                                               "from": {str(a): None, str(b): None}}   # what an Undo needs
+    r = client.post("/api/documents/move", json={"ids": [a], "folder_id": None}).json
+    assert r["from"] == {str(a): bills} and r["folder_id"] is None
+    # A path makes the folders missing from it, matching those there ignoring case.
+    folder(client, "Household")
+    r = client.post("/api/documents/move", json={"ids": [a, b], "path": " household / Water  bills "}).json
+    (water,) = r["created"]
+    assert r["folder_id"] == water and r["from"] == {str(a): None, str(b): bills}
+    assert {f["id"]: f["path"] for f in client.get("/api/folders").json}[water] == ["Household", "Water bills"]
+    assert client.post("/api/documents/move", json={"ids": [a], "path": "HOUSEHOLD/water BILLS"}).json["created"] == []
+    for bad in ({"ids": [a]}, {"ids": [a], "folder_id": bills, "path": "x"}, {"ids": [], "folder_id": None},
+                {"ids": "1", "folder_id": None}, {"ids": [True], "folder_id": None}, {"ids": [a], "folder_id": "1"},
+                {"ids": [a], "path": "a//b"}, {"ids": [a], "path": ""}, {"ids": [a], "path": 5}, ["x"]):
+        assert client.post("/api/documents/move", json=bad).status_code == 400, bad
+    r = client.post("/api/documents/move", json={"ids": [a], "folder_id": 9999})
+    assert r.status_code == 404 and r.json["error"] == "That folder was deleted"
+
+
+def test_a_documents_title_type_and_key_details_can_be_changed(client):
+    doc_id = add(client)["doc_id"]
+    url = f"/api/documents/{doc_id}"
+    d = client.patch(url, json={"title": "  Flat lease 2026 ", "vendor": " Acme Lettings ", "total_amount": 900,
+                                "currency": "eur", "document_date": "2026-11-03", "due_date": None}).json
+    assert (d["title"], d["vendor"], d["total_amount"], d["currency"], d["document_date"], d["due_date"]) == (
+        "Flat lease 2026", "Acme Lettings", 900.0, "EUR", "2026-11-03", None)
+    assert d["user_edited"] == ["title", "document_date", "vendor", "total_amount", "currency", "due_date"]
+    assert [x["id"] for x in client.get("/api/documents?q=acme").json] == [doc_id]       # the vendor is searchable
+    assert [x["id"] for x in client.get("/api/documents?q=2026").json] == [doc_id]       # and the new title
+    d = client.patch(url, json={"vendor": "", "doc_type": " invoice ", "total_amount": -12.5}).json
+    assert (d["vendor"], d["doc_type"], d["total_amount"]) == (None, "invoice", -12.5) and "doc_type" in d["user_edited"]
+    assert client.get("/api/documents?q=acme").json == [] and client.get("/api/documents?q=invoice").json
+    for body in ({"title": "  "}, {"title": None}, {"title": "x" * 301}, {"document_date": "03/11/2026"},
+                 {"document_date": "20261103"}, {"due_date": "2026-02-30"}, {"due_date": 5}, {"total_amount": "12"},
+                 {"total_amount": True}, {"total_amount": 1e12}, {"currency": "pounds"}, {"currency": 5},
+                 {"vendor": "x" * 201}, {"doc_type": None}, {"doc_type": "x" * 61}, {"colour": "red"},
+                 {"suggestion": "maybe"}, {"folder_id": "3"}, ["title"]):
+        assert client.patch(url, json=body).status_code == 400, body
+    r = client.patch(url, json={"title": " "})
+    assert r.json["error"] == "A title can't be empty"
+    assert client.patch(url, json={"document_date": "2026-13-01"}).json["error"] == (
+        "document_date must be a date like 2026-11-03")
+    assert client.patch("/api/documents/9999", json={"title": "x"}).status_code == 404
+    assert client.patch(url, json={"folder_id": 9999}).status_code == 404
+    bills = folder(client, "Bills")
+    d = client.patch(url, json={"folder_id": bills}).json
+    assert d["folder_id"] == bills and "folder_id" not in d["user_edited"] and "created" not in d
+    r = client.patch(url, json={"suggestion": "apply"})
+    assert r.status_code == 409 and r.json["error"] == "There is no suggestion to apply"
+    assert client.patch(url, json={"suggestion": "apply", "folder_id": None}).status_code == 400
+    assert client.patch(url, json={}).json["title"] == "Flat lease 2026"                  # nothing to change
+
+
+def test_a_document_in_detail_has_its_pages_and_copies(local, monkeypatch):
+    from app import extract
+    monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [("Page one says oil.", None), ("Page two.", None)])
+    bills, pdf = folder(local, "Bills"), blank_pdf(2)
+    first = add(local, "manual.pdf", pdf)["doc_id"]
+    copy = add(local, "copy.pdf", pdf, on_duplicate="keep", folder_id=str(bills))["doc_id"]
+    d = local.get(f"/api/documents/{first}").json
+    assert d["pages"] == 2 and d["copies"] == [{"id": copy, "folder_id": bills}] and d["kind"] == "pdf"
+    assert local.get(f"/api/documents/{copy}").json["copies"] == [{"id": first, "folder_id": None}]
+    t = local.get(f"/api/documents/{add(local)['doc_id']}").json                          # text: no pages, no copies
+    assert (t["pages"], t["copies"], t["kind"]) == (None, [], "text")
+    assert local.get("/api/documents/9999").status_code == 404
+
+
+def test_documents_list_their_folder_key_details_kind_and_thumbnail(client):
+    add(client)
+    (doc,) = client.get("/api/documents").json
+    assert {k: doc[k] for k in ("folder_id", "filed_by", "suggested_folder", "suggestion_exists", "document_date",
+                                "vendor", "total_amount", "currency", "due_date", "user_edited", "kind", "thumb")} == {
+        "folder_id": None, "filed_by": None, "suggested_folder": None, "suggestion_exists": None,
+        "document_date": None, "vendor": None, "total_amount": None, "currency": None, "due_date": None,
+        "user_edited": [], "kind": "text", "thumb": None}
+    assert "unit_findings" not in doc and "file_path" not in doc and doc["unit_fixes"] == 0
+
+
+def test_an_upload_goes_into_the_folder_it_was_made_in(client, monkeypatch):
+    seen = []
+    analysis(monkeypatch, seen, folder="Receipts", folder_confidence="high")
+    folder(client, "Receipts")
+    manuals = folder(client, "Manuals")
+    job = add(client, folder_id=str(manuals))
+    assert job["options"]["folder_id"] == manuals and job["options"]["auto_file"] is True
+    r = job["result"]
+    assert (r["folder_id"], r["filed"], r["suggested_folder"], r["suggestion_exists"], r["folder_note"]) == (
+        manuals, "chosen", None, None, None)                                               # the analysis can't move it
+    doc = client.get(f"/api/documents/{job['doc_id']}").json
+    assert (doc["folder_id"], doc["filed_by"], doc["suggested_folder"]) == (manuals, None, None)
+    assert seen == [["Manuals", "Receipts"]]                                             # the analysis saw the folders
+    r = post(client, "x.txt", b"Other.", folder_id="9999")
+    assert r.status_code == 404 and r.json == {"error": "That folder was deleted", "folder_gone": True}
+    for bad in ({"folder_id": "abc"}, {"folder_id": "1.5"}, {"auto_file": "yes"}):
+        assert post(client, "x.txt", b"Other.", **bad).status_code == 400, bad
+    assert [j["id"] for j in client.get("/api/jobs").json] == [job["id"]]               # nothing else queued
+    assert post(client, "y.txt", b"Unfiled.", folder_id="", auto_file="0").json["job"]["options"] == {
+        "on_duplicate": "", "claude_pages": "scanned", "folder_id": None, "auto_file": False}
+
+
+def test_auto_filing_files_only_confident_matches_of_existing_folders(client, monkeypatch):
+    receipts = folder(client, "Receipts")
+    bills = folder(client, "Bills", folder(client, "Household"))
+    analysis(monkeypatch, folder=" receipts ", folder_confidence="high")
+    first = add(client, "r1.txt", b"Tesco receipt one.")
+    assert (first["result"]["filed"], first["result"]["folder_id"]) == ("auto", receipts)
+    doc = client.get(f"/api/documents/{first['doc_id']}").json
+    assert (doc["folder_id"], doc["filed_by"], doc["suggested_folder"]) == (receipts, "auto", None)
+    analysis(monkeypatch, folder="household/BILLS", folder_confidence="high")
+    assert add(client, "b1.txt", b"Water bill.")["result"]["folder_id"] == bills          # a path, at any depth
+    analysis(monkeypatch, folder="Receipts", folder_confidence="low")                    # not sure: a suggestion
+    r = add(client, "r2.txt", b"Tesco receipt two.")["result"]
+    assert (r["filed"], r["folder_id"], r["suggested_folder"], r["suggestion_exists"]) == (None, None, "Receipts", True)
+    analysis(monkeypatch, folder="Insurance/Car", folder_confidence="high")              # no such folder: never made
+    insured = add(client, "i1.txt", b"Car insurance.")["doc_id"]
+    doc = client.get(f"/api/documents/{insured}").json
+    assert (doc["folder_id"], doc["suggested_folder"], doc["suggestion_exists"]) == (None, "Insurance/Car", False)
+    assert len(client.get("/api/folders").json) == 3
+    analysis(monkeypatch, folder="Receipts", folder_confidence="high")
+    off = add(client, "r3.txt", b"Tesco receipt three.", auto_file="0")                  # auto-file off
+    assert (off["result"]["filed"], off["result"]["suggested_folder"]) == (None, "Receipts")
+    # Accepting a suggestion makes the folders missing from it: the click is the consent.
+    d = client.patch(f"/api/documents/{insured}", json={"suggestion": "apply"}).json
+    assert len(d["created"]) == 2 and (d["suggested_folder"], d["filed_by"]) == (None, None)
+    assert {f["id"]: f["path"] for f in client.get("/api/folders").json}[d["folder_id"]] == ["Insurance", "Car"]
+    d = client.patch(f"/api/documents/{off['doc_id']}", json={"suggestion": "dismiss"}).json
+    assert (d["suggested_folder"], d["folder_id"], d["suggestion_exists"]) == (None, None, None)
+    # Any move clears the mark of auto-filing.
+    client.post("/api/documents/move", json={"ids": [first["doc_id"]], "folder_id": None})
+    assert client.get(f"/api/documents/{first['doc_id']}").json["filed_by"] is None
+
+
+def test_an_upload_whose_folder_goes_meanwhile_lands_in_its_parent_or_unfiled(client):
+    from app import db, jobs
+    receipts, gone = folder(client, "Receipts"), folder(client, "Gone")
+    year = folder(client, "2026", receipts)
+    a = post(client, "a.txt", b"Receipt A.", folder_id=str(year)).json["job"]["id"]
+    b = post(client, "b.txt", b"Receipt B.", folder_id=str(gone)).json["job"]["id"]
+    assert client.delete(f"/api/folders/{year}").status_code == 200                     # through the API: its parent
+    with db.connect() as con:                                                            # gone at the moment of saving
+        con.execute("DELETE FROM folders WHERE id=?", (gone,))
+    jobs.drain()
+    ra, rb = db.get_job(a)["result"], db.get_job(b)["result"]
+    assert (ra["folder_id"], ra["filed"], ra["folder_note"]) == (receipts, "chosen", None)
+    assert (rb["folder_id"], rb["filed"], rb["folder_note"]) == (None, None, "Its folder was deleted, so it is in Unfiled")
+    assert client.get(f"/api/documents/{rb['doc_id']}").json["folder_id"] is None
+
+
+def test_replacing_a_copy_keeps_its_folder_and_what_the_user_changed(client, monkeypatch):
+    bills = folder(client, "Bills")
+    first = add(client, folder_id=str(bills))["doc_id"]
+    client.patch(f"/api/documents/{first}", json={"title": "My lease", "vendor": "Acme"})
+    r = upload(client, "again.txt")
+    assert r.status_code == 409 and r.json["duplicate"]["folder_id"] == bills            # the page names its folder
+    analysis(monkeypatch, title="New reading", vendor="Other Ltd", doc_type="lease", folder="Receipts",
+             folder_confidence="high")
+    job = add(client, "again.txt", on_duplicate="replace", folder_id="")
+    assert (job["result"]["filed"], job["result"]["folder_id"], job["result"]["title"]) == ("kept", bills, "My lease")
+    (doc,) = client.get("/api/documents").json
+    assert (doc["folder_id"], doc["title"], doc["vendor"], doc["doc_type"], doc["user_edited"]) == (
+        bills, "My lease", "Acme", "lease", ["title", "vendor"])
+    assert doc["suggested_folder"] is None and client.get("/api/documents?q=acme").json[0]["id"] == doc["id"]
+    # A copy in Unfiled is replaced in Unfiled, as a re-read: the suggestion kept, not acted on.
+    folder(client, "Receipts")
+    add(client, "note.txt", b"A note.", auto_file="0")
+    job = add(client, "note2.txt", b"A note.", on_duplicate="replace")
+    assert (job["result"]["filed"], job["result"]["folder_id"], job["result"]["suggested_folder"]) == (
+        "kept", None, "Receipts")
+
+
+def test_a_reread_keeps_its_folder_and_edits_and_refreshes_the_rest(client, monkeypatch):
+    from app import jobs
+    bills = folder(client, "Bills")
+    analysis(monkeypatch, vendor="Acme", total_amount="900.00", currency="EUR", folder="Receipts")
+    unfiled = add(client)["doc_id"]
+    filed = add(client, "b.txt", b"Another lease.", folder_id=str(bills))["doc_id"]
+    client.patch(f"/api/documents/{filed}", json={"title": "Mine", "total_amount": 950})
+    assert client.get(f"/api/documents/{unfiled}").json["suggested_folder"] == "Receipts"
+    analysis(monkeypatch, title="Re-read", vendor="Acme Ltd", total_amount="1000", currency="GBP", folder="Leases",
+             folder_confidence="high")
+    for doc_id in (unfiled, filed):
+        assert client.post(f"/api/documents/{doc_id}/reread", json={}, headers=H).status_code == 202
+    jobs.drain()
+    u, f = (client.get(f"/api/documents/{i}").json for i in (unfiled, filed))
+    assert (u["folder_id"], u["suggested_folder"], u["title"], u["vendor"]) == (None, "Leases", "Re-read", "Acme Ltd")
+    assert (f["folder_id"], f["suggested_folder"], f["title"], f["total_amount"], f["vendor"], f["currency"]) == (
+        bills, None, "Mine", 950.0, "Acme Ltd", "GBP")                                    # never moved
+    done = [j for j in client.get("/api/jobs").json if j["kind"] == "reread"]
+    assert {(j["result"]["filed"], j["result"]["folder_id"]) for j in done} == {("kept", None), ("kept", bills)}
+    assert {j["result"]["title"] for j in done} == {"Re-read", "Mine"}
+
+
+def test_key_details_from_an_analysis_are_checked():
+    from app.jobs import _details
+    assert _details({}) == {"document_date": None, "due_date": None, "vendor": None, "total_amount": None,
+                            "currency": None, "folder": None, "confidence": "low"}       # an old reading, or a fake
+    d = _details({"document_date": "2026-11-03", "due_date": " 2026-12-01 ", "vendor": "  Tesco \n Stores ",
+                  "total_amount": "£ 42.10", "currency": "gbp", "folder": "Receipts/ /2026/Tesco/Extra",
+                  "folder_confidence": "high"})
+    assert d == {"document_date": "2026-11-03", "due_date": "2026-12-01", "vendor": "Tesco Stores", "total_amount": 42.1,
+                 "currency": "GBP", "folder": "Receipts/2026/Tesco", "confidence": "high"}
+    amounts = {"42,10": 42.1, "-12.00": -12.0, "1234": 1234.0, "€1 234.5": 1234.5, "1.234,50": None, "1,234": None,
+               "about 40": None, "": None, "12.34567": None, "1" * 13: None, 7: 7.0, True: None}
+    assert {k: _details({"total_amount": k})["total_amount"] for k in amounts} == amounts
+    for date in ("03/04/2026", "2026-13-01", "2026-02-30", "1850-01-01", "20261103", "2026-W45-2", 2026):
+        assert _details({"document_date": date})["document_date"] is None, date
+    assert _details({"currency": "GBP"})["currency"] is None                             # only with an amount
+    assert _details({"total_amount": "5", "currency": "EURO"})["currency"] is None
+    assert len(_details({"vendor": "x" * 300})["vendor"]) == 200
+    for folder_name in ("a" * 101, "Bills\x07", " / ", None):
+        assert _details({"folder": folder_name})["folder"] is None, folder_name
+    assert _details({"folder": "Receipts", "folder_confidence": "HIGH"})["confidence"] == "low"
+
+
+def test_the_analysis_reads_key_details_and_is_shown_the_folders(local, monkeypatch):
+    import json
+    from app import ollama, sections
+    receipts = folder(local, "Receipts")
+    folder(local, "Bills", folder(local, "Household"))
+    base = ollama._chat
+    reply = {"title": "Weekly shop", "doc_type": "receipt", "summary": "s", "keywords": ["groceries"],
+             "document_date": "2026-11-03", "vendor": "Tesco Stores", "total_amount": "42.10", "currency": "gbp",
+             "due_date": "", "folder": "Receipts", "folder_confidence": "high"}
+
+    def chat(model, messages, **kw):
+        got = base(model, messages, **kw)                                                # recorded in local.calls
+        if kw.get("format") is sections.META_SCHEMA:
+            return {**got, "message": {"content": json.dumps(reply)}}
+        return got
+
+    monkeypatch.setattr(ollama, "_chat", chat)
+    job = add(local, "tesco.txt", b"TESCO STORES\nMilk 1.10\nTotal 42.10 GBP\n03/11/2026")
+    (call,) = [c for c in local.calls if c.get("format") is sections.META_SCHEMA]
+    prompt = call["messages"][0]["content"]
+    assert sections.DETAILS_GUIDANCE in prompt and sections.FIELD_RULES in prompt        # Ollama shows no descriptions
+    assert prompt.endswith("Existing folders (levels separated by /):\n- Household\n- Household/Bills\n- Receipts")
+    doc = local.get(f"/api/documents/{job['doc_id']}").json
+    assert (doc["document_date"], doc["vendor"], doc["total_amount"], doc["currency"], doc["due_date"]) == (
+        "2026-11-03", "Tesco Stores", 42.1, "GBP", None)
+    assert (doc["folder_id"], doc["filed_by"], doc["doc_type"]) == (receipts, "auto", "receipt")
+    assert local.get("/api/documents?q=stores").json[0]["id"] == doc["id"]                # the vendor is searchable
+    # Every key is a required string, for Ollama's format and Claude's json_schema alike.
+    schema = sections.META_SCHEMA
+    assert set(schema["required"]) == set(schema["properties"]) and schema["additionalProperties"] is False
+    assert sections.folders_text([]).endswith("Existing folders (levels separated by /):\n(none yet)")
+    many = sections.folders_text([f"Folder {i}" for i in range(250)])
+    assert many.count("\n- ") == 200 and many.endswith("- Folder 199, …")
+    long = sections.folders_text(["x" * 100] * 80)
+    assert long.count("\n- ") == 60 and long.endswith(", …")                              # about 6,000 characters
+
+
+def test_a_long_documents_last_call_is_shown_the_folders_too(local, monkeypatch):
+    folder(local, "Manuals")
+    pdf, seen = long_pdf(local, monkeypatch)
+    assert add(local, "manual.pdf", pdf, model="ollama:qwen3.5:9b")["status"] == "done"
+    kinds = [s[0] for s in seen]
+    assert kinds.count("notes") == 6 and kinds[-1] == "meta"
+    assert seen[-1][4][0]["content"].endswith("Existing folders (levels separated by /):\n- Manuals")
+    assert not any("Existing folders" in s[4][0]["content"] for s in seen[:-1])          # notes calls aren't
+
+
+def test_photos_are_checked_before_they_are_queued(client, monkeypatch):
+    from app import extract
+    assert [extract.check(f"r.{ext}", photo(fmt)) for ext, fmt in (("jpg", "JPEG"), ("PNG", "PNG"), ("webp", "WEBP"))] == [
+        "image/jpeg", "image/png", "image/webp"]
+    assert extract.check("scan.jpg", photo("PNG")) == "image/png"                        # the bytes decide
+    assert [extract.kind(n) for n in ("a.PDF", "b.JPEG", "c.heic", "d.md", "e.Markdown", "f.docx", "g.csv", "noext")] == [
+        "pdf", "image", "image", "markdown", "markdown", "docx", "text", "text"]
+    damaged = "Could not open this photo: it is damaged or not a JPG, PNG, WebP or HEIC image"
+    for name, body in [("anim.jpg", photo("GIF")), ("logo.png", b'<svg xmlns="http://www.w3.org/2000/svg" onload="x()"/>'),
+                       ("noise.webp", b"garbage " * 20), ("empty.jpeg", b"")]:
+        r = post(client, name, body)
+        assert r.status_code == 400 and r.json["error"] == damaged, name
+    r = post(client, "big.png", huge_png(8000, 8000))
+    assert r.status_code == 400 and r.json["error"] == "This photo is too large (64 megapixels); 50 at most"
+    r = post(client, "bomb.png", huge_png(20_000, 20_000))                                # past Pillow's own limit
+    assert r.status_code == 400 and r.json["error"] == "This photo is too large; 50 megapixels at most"
+    assert post(client, "anim.gif", b"GIF89a\x01\x00\x01\x00\x80\xff").json["error"].startswith("Unsupported file")
+    assert client.get("/api/jobs").json == []
+    monkeypatch.setattr(extract, "HEIC", False)
+    r = post(client, "IMG_0001.HEIC", b"anything")
+    assert r.status_code == 400 and r.json["error"] == "HEIC photos aren't supported on this server"
+    types = client.get("/api/models").json["upload_types"]
+    assert types["heic"] is False and ".heic" not in types["extensions"] and ".heif" not in types["extensions"]
+
+
+def test_the_page_is_told_which_files_it_may_upload(client):
+    from app import extract
+    types = client.get("/api/models").json["upload_types"]
+    assert types["heic"] is extract.HEIC and {".md", ".markdown", ".jpg", ".png", ".webp", ".pdf"} <= set(types["extensions"])
+    assert ".svg" not in types["extensions"] and ".gif" not in types["extensions"]
+
+
+def test_a_photo_is_read_by_the_local_vision_model(local, tmp_path):
+    from PIL import Image
+    from app import llm, ollama
+    job = add(local, "receipt.jpg", photo("JPEG", (3000, 1000)))
+    assert job["status"] == "done" and job["result"]["title"] == "Scan"
+    (vision,) = [c for c in local.calls if c["messages"][-1].get("images")]
+    assert vision["model"] == ollama.VISION_MODEL and vision["messages"][-1]["content"] == llm.PHOTO_PROMPT
+    sent = Image.open(io.BytesIO(base64.b64decode(vision["messages"][-1]["images"][0])))
+    assert sent.format == "JPEG" and sent.size == (2000, 667)                            # scaled for the vision model
+    assert local.get("/api/search?q=deposit").json[0]["filename"] == "receipt.jpg"       # its text is indexed
+    doc = local.get(f"/api/documents/{job['doc_id']}").json
+    assert (doc["kind"], doc["mime"], doc["pages"]) == ("image", "image/jpeg", None)     # no pages: cited by name
+    assert doc["thumb"] == f"/api/documents/{doc['id']}/thumb?v={doc['sha256'][:12]}"
+    assert (tmp_path / "thumbs" / f"{doc['sha256']}-card.webp").exists()
+    f = local.get(f"/api/documents/{doc['id']}/file")
+    assert f.status_code == 200 and f.mimetype == "image/jpeg" and f.headers["Content-Disposition"].startswith("inline")
+    assert f.headers["X-Content-Type-Options"] == "nosniff"
+    assert f.headers["Content-Security-Policy"] == "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"
+    png = add(local, "scan.jpg", photo("PNG"))                                           # a PNG named .jpg
+    assert local.get(f"/api/documents/{png['doc_id']}").json["mime"] == "image/png"
+    assert local.get(f"/api/documents/{png['doc_id']}/file").mimetype == "image/png"
+
+
+def test_claude_reads_a_photo_from_an_image_block(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    from PIL import Image
+    from app import llm
+    calls = []
+
+    def create(**kw):
+        calls.append(kw)
+        return NS(stop_reason="end_turn", content=[NS(type="text", text="TESCO\nTotal 42.10 GBP")],
+                  usage=NS(input_tokens=1900, output_tokens=20, cache_read_input_tokens=0, cache_creation_input_tokens=0))
+
+    monkeypatch.setattr(llm, "client_for", lambda key: NS(beta=NS(messages=NS(create=create))))
+    job = add(client, "receipt.jpg", photo("JPEG", (3136, 2352)), model="claude:claude-haiku-5-5")
+    assert job["status"] == "done" and job["result"]["model_label"] == "Claude Haiku 5.5"
+    (call,) = calls
+    image, prompt = call["messages"][0]["content"]
+    assert image["type"] == "image" and image["source"]["media_type"] == "image/jpeg" and prompt["text"] == llm.PHOTO_PROMPT
+    assert Image.open(io.BytesIO(base64.b64decode(image["source"]["data"]))).size == (1568, 1176)
+    est = job["estimate"]
+    assert (est["image"], est["mode"], est["pages"], est["claude_pages"]) == (True, None, 0, 0)
+    photo_in = 1600 + 300                                                                # 1568 x 1176 / 750, capped
+    assert (est["input_tokens"], est["output_tokens"]) == (photo_in + 2400 // 4 + 100, 600 + 500)
+    expected = (llm.cost("claude-haiku-5-5", {"input": photo_in, "output": 600})
+                + llm.cost("claude-haiku-5-5", {"input": 700, "output": 500}))
+    assert est["cost_usd"] == pytest.approx(expected, abs=1e-9)
+    assert [r["kind"] for r in _usage_rows() if r["backend"] == "claude"] == ["transcribe"]
+    assert client.get("/api/search?q=tesco").json[0]["filename"] == "receipt.jpg"
+    from app import jobs
+    small = jobs.estimate("r.png", photo("PNG", (300, 150)), "claude-haiku-5-5", False, "scanned")
+    assert small["input_tokens"] == 60 + 300 + 700                                       # 300 x 150 / 750
+
+
+def test_auto_reads_a_photo_with_claude_when_the_local_vision_model_fails(local, monkeypatch):
+    from app import llm, ollama
+    base = ollama._chat
+
+    def chat(model, messages, **kw):
+        if messages[-1].get("images"):
+            raise ollama.OllamaError(f"{model}: out of memory")
+        return base(model, messages, **kw)
+
+    monkeypatch.setattr(ollama, "_chat", chat)
+    monkeypatch.setattr(llm, "transcribe_image", lambda c, jpeg, model, on_usage=None: "Claude read: total 9.99 EUR")
+    job = add(local, "r.jpg", photo())
+    assert job["status"] == "done" and "out of memory" in job["result"]["switched"] and job["estimate"]["image"] is True
+    assert local.get("/api/search?q=claude").json[0]["filename"] == "r.jpg"
+
+
+def test_a_photo_with_no_text_fails_saying_so(local, monkeypatch):
+    from app import ollama
+    base = ollama._chat
+    monkeypatch.setattr(ollama, "_chat", lambda model, messages, **kw: (
+        {"message": {"content": " \n "}, "prompt_eval_count": 800, "eval_count": 1} if messages[-1].get("images")
+        else base(model, messages, **kw)))
+    job = job_of(local, upload(local, "blank.jpg", photo(), model="ollama:qwen3.5:9b"))
+    assert job["status"] == "failed" and job["error"] == "No text found in the photo"
+
+
+def test_heic_photos_when_the_server_reads_them(local, tmp_path):
+    from PIL import Image
+    from app import extract
+    if not extract.HEIC:
+        pytest.skip("pillow-heif is not installed")
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), "white").save(buf, format="HEIF")
+    assert extract.check("IMG_0001.HEIC", buf.getvalue()) == "image/heic"
+    doc = local.get(f"/api/documents/{add(local, 'IMG_0001.HEIC', buf.getvalue())['doc_id']}").json
+    assert (doc["kind"], doc["mime"]) == ("image", "image/heic") and doc["thumb"]
+    assert local.get(f"{doc['thumb']}&size=large").mimetype == "image/webp"              # shown through its thumbnail
+    f = local.get(f"/api/documents/{doc['id']}/file")
+    assert f.headers["Content-Disposition"].startswith("attachment")                     # browsers can't show HEIC
+
+
+def test_thumbnails_are_made_cached_and_removed_with_their_original(local, tmp_path, monkeypatch):
+    from PIL import Image
+    from app import db, thumbs
+    pdf = text_pdf(["Hydraulic oil every 400 hours."])
+    doc = local.get(f"/api/documents/{add(local, 'manual.pdf', pdf)['doc_id']}").json
+    sha = doc["sha256"]
+    card, large = (tmp_path / "thumbs" / f"{sha}-{size}.webp" for size in ("card", "large"))
+    assert card.exists() and large.exists()                                              # made by the job
+    assert Image.open(card).width == 400 and abs(Image.open(large).width - 1200) <= 1 and Image.open(card).format == "WEBP"
+    url = doc["thumb"]
+    assert url == f"/api/documents/{doc['id']}/thumb?v={sha[:12]}"
+    r = local.get(url)
+    assert r.status_code == 200 and r.mimetype == "image/webp" and r.data == card.read_bytes()
+    assert r.headers["Cache-Control"] == "private, max-age=31536000, immutable" and r.headers["ETag"] == f'"{sha[:16]}-card"'
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    r = local.get(f"/api/documents/{doc['id']}/thumb?size=large&v=0ld")                  # another version: revalidated
+    assert r.data == large.read_bytes() and r.headers["Cache-Control"] == "private, no-cache"
+    r = local.get(url, headers={"If-None-Match": f'"{sha[:16]}-card"'})
+    assert r.status_code == 304 and r.data == b"" and r.headers["ETag"] == f'"{sha[:16]}-card"'
+    assert local.get(f"{url}&size=huge").status_code == 400
+    card.unlink()
+    large.unlink()
+    assert local.get(url).status_code == 200 and card.exists() and large.exists()         # made again when asked for
+    text_doc = add(local)["doc_id"]
+    assert local.get(f"/api/documents/{text_doc}").json["thumb"] is None
+    r = local.get(f"/api/documents/{text_doc}/thumb")
+    assert r.status_code == 404 and r.json == {"error": "No thumbnail"}
+    old = db.add_document("old.pdf", ["Old text."], {"title": "Old"}, "full")             # no kept original
+    assert local.get(f"/api/documents/{old}/thumb").status_code == 404
+    assert local.get("/api/documents/9999/thumb").status_code == 404
+    # Removed with the last document holding their original.
+    copy = add(local, "copy.pdf", pdf, on_duplicate="keep")["doc_id"]
+    local.delete(f"/api/documents/{doc['id']}")
+    assert card.exists()                                                                 # the copy still has them
+    local.delete(f"/api/documents/{copy}")
+    assert not card.exists() and not large.exists()
+    # One that can't be made: no thumbnail (a typed icon) rather than a failed upload.
+    monkeypatch.setattr(thumbs, "_render", lambda source, kind: 1 / 0)
+    bad = add(local, "bad.pdf", blank_pdf(1))
+    d = local.get(f"/api/documents/{bad['doc_id']}").json
+    assert bad["status"] == "done" and d["thumb"] is None
+    assert local.get(f"/api/documents/{d['id']}/thumb?v={d['sha256'][:12]}").status_code == 404
+
+
+def test_markdown_files_are_indexed_and_previewed_as_written(client):
+    import zipfile
+    from app import db
+    md = ("# Hydraulics\n\n- Check the **oil** level\n- Use 15W-40\n\n| Part | Qty |\n|---|---|\n| Filter | 2 |\n\n"
+          "<script>alert(1)</script> [x](javascript:alert(1)) ![remote](https://example.com/x.png)\n").encode()
+    for name in ("notes.md", "notes.markdown"):
+        job = add(client, name, md, on_duplicate="keep")
+        assert job["status"] == "done", job
+        doc = client.get(f"/api/documents/{job['doc_id']}").json
+        assert (doc["kind"], doc["mime"], doc["thumb"]) == ("markdown", "text/markdown", None)
+        f = client.get(f"/api/documents/{doc['id']}/file")
+        assert f.data == md and f.headers["Content-Type"] == "text/plain; charset=utf-8"  # never run as HTML
+        assert f.headers["Content-Disposition"].startswith("inline") and f.headers["X-Content-Type-Options"] == "nosniff"
+        assert f.headers["Content-Security-Policy"].startswith("sandbox;")
+        t = client.get(f"/api/documents/{doc['id']}/text").json
+        assert t == {"text": md.decode(), "truncated": False, "source": "file", "kind": "markdown", "bytes": len(md)}
+    assert {h["filename"] for h in client.get("/api/search?q=hydraulics").json} == {"notes.md", "notes.markdown"}
+    t = client.get(f"/api/documents/{doc['id']}/text?max=5").json
+    assert (t["text"], t["truncated"], t["bytes"]) == ("# Hyd", True, len(md))
+    for bad in ("max=0", "max=500001", "max=x"):
+        assert client.get(f"/api/documents/{doc['id']}/text?{bad}").status_code == 400
+    assert client.get("/api/documents/9999/text").status_code == 404
+    # Others give the text as indexed: a Word file's, or a document with no kept original.
+    docx = io.BytesIO()
+    with zipfile.ZipFile(docx, "w") as z:
+        z.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/'
+                   'main"><w:body><w:p><w:r><w:t>Tyre pressure 1.2 bar.</w:t></w:r></w:p></w:body></w:document>')
+    d = add(client, "tyres.docx", docx.getvalue())["doc_id"]
+    assert client.get(f"/api/documents/{d}/text").json == {"text": "Tyre pressure 1.2 bar.", "truncated": False,
+                                                          "source": "chunks", "kind": "docx", "bytes": 22}
+    old = db.add_document("old.md", ["# Old\n\nNotes."], {"title": "Old"}, "full")
+    assert client.get(f"/api/documents/{old}/text").json == {"text": "# Old\n\nNotes.", "truncated": False,
+                                                            "source": "chunks", "kind": "markdown", "bytes": 13}
+
+
+def test_a_question_can_be_limited_to_folders(client):
+    tractor, empty, other = folder(client, "Tractor"), folder(client, "Empty"), folder(client, "Other")
+    manuals = folder(client, "Manuals", tractor)
+    engine = add(client, "engine.txt", ENGINE, folder_id=str(tractor))["doc_id"]
+    gearbox = add(client, "gearbox.txt", GEARBOX, folder_id=str(manuals))["doc_id"]
+    lease = add(client, "lease.txt", LEASE)["doc_id"]
+
+    def ask(**kw):
+        return client.post("/api/chat", json={"question": "oil fluid rent", **kw}, headers=H)
+
+    r = ask(folder_ids=[tractor]).json
+    assert {e["doc_id"] for e in r["excerpts"]} == {engine, gearbox}                       # its subfolders' too
+    assert (r["scope"], r["scope_names"], r["scope_folders"], r["scope_count"]) == (
+        [], [], [{"id": tractor, "name": "Tractor"}], 2)
+    assert client.seen["msg"].startswith(
+        "<scope>Only these were searched: the folder Tractor (2 documents, including its subfolders)</scope>\n")
+    r = ask(folder_ids=[manuals], doc_ids=[lease]).json
+    assert {e["doc_id"] for e in r["excerpts"]} == {gearbox, lease} and (r["scope"], r["scope_count"]) == ([lease], 2)
+    assert "the folder Manuals (1 document, including its subfolders); lease.txt</scope>" in client.seen["msg"]
+    # Looked up when asked: a document put in the folder later is searched, in the same conversation.
+    conv = ask(folder_ids=[manuals]).json["conversation_id"]
+    c = client.get(f"/api/conversations/{conv}").json
+    assert (c["doc_ids"], c["folder_ids"]) == ([], [manuals])
+    assert (c["messages"][1]["scope_folders"], c["messages"][1]["scope_count"]) == ([{"id": manuals, "name": "Manuals"}], 1)
+    later = add(client, "later.txt", b"More transmission fluid notes: top up the oil.", folder_id=str(manuals))["doc_id"]
+    r = ask(folder_ids=[manuals], conversation_id=conv).json
+    assert later in {e["doc_id"] for e in r["excerpts"]} and r["scope_count"] == 2
+    assert [c["folder_ids"] for c in client.get("/api/conversations").json if c["id"] == conv] == [[manuals]]
+    meta = event(sse(client.post("/api/chat/stream", json={"question": "oil", "folder_ids": [tractor]}, headers=H)), "meta")
+    assert (meta["scope_folders"], meta["scope_count"]) == ([{"id": tractor, "name": "Tractor"}], 3)
+    # Empty folders, and folders that are gone.
+    r = ask(folder_ids=[empty])
+    assert r.status_code == 400 and r.json["error"] == "Empty has no documents yet: add some, or ask all documents"
+    assert ask(folder_ids=[empty, other]).json["error"] == (
+        "These folders have no documents yet: Empty, Other. Add some, or ask all documents")
+    assert ask(folder_ids=[9999, 2**70]).json["error"] == (
+        "None of the chosen folders or documents is in the library any more: choose others, or ask all documents")
+    assert ask(doc_ids=[9999]).json["error"] == (
+        "None of the chosen documents is in the library any more: choose others, or ask all documents")
+    for bad in ("1", [True], ["1"], [1.5], {"ids": [1]}):
+        r = ask(folder_ids=bad)
+        assert r.status_code == 400 and r.json["error"] == "folder_ids must be a list of folder ids"
+    r = ask(folder_ids=[], doc_ids=[]).json
+    assert (r["scope"], r["scope_folders"], r["scope_count"]) == (None, None, None) and "<scope>" not in client.seen["msg"]
+    assert ask(doc_ids=[lease]).json["scope_folders"] == []
+    # A deleted folder leaves the conversations limited to it, and the questions asked of it.
+    client.delete(f"/api/folders/{manuals}")
+    assert client.get(f"/api/conversations/{conv}").json["folder_ids"] == []
+    assert ask(folder_ids=[manuals, tractor]).json["scope_folders"] == [{"id": tractor, "name": "Tractor"}]
+
+
+def test_libraries_from_before_folders_gain_them(client, tmp_path, monkeypatch):
+    """The live library: no folders table, no key details, a conversations table without
+    AUTOINCREMENT (copied into one with it first, then given folder_ids)."""
+    import sqlite3
+    from app import db
+    path = tmp_path / "live.db"
+    con = sqlite3.connect(path)
+    con.executescript(OLD_SCHEMAS["42a0a88"] + """
+        INSERT INTO conversations (id, title, model, doc_ids) VALUES (1, 'Oil', 'auto', '[1]');
+        INSERT INTO messages (conversation_id, role, content, sent) VALUES (1, 'user', 'When?', 'sent When?');
+        INSERT INTO messages (conversation_id, role, content) VALUES (1, 'assistant', 'At 400 hours.');
+    """)
+    con.close()
+    monkeypatch.setattr(db, "DB_PATH", str(path))
+    (doc,) = client.get("/api/documents").json
+    assert (doc["folder_id"], doc["user_edited"], doc["kind"], doc["thumb"], doc["vendor"]) == (None, [], "pdf", None, None)
+    (c,) = client.get("/api/conversations").json
+    assert (c["doc_ids"], c["folder_ids"]) == ([1], None)
+    with db.connect() as con:
+        assert "AUTOINCREMENT" in con.execute("SELECT sql FROM sqlite_master WHERE name='conversations'").fetchone()[0]
+        assert "folder_ids" in {r[1] for r in con.execute("PRAGMA table_info(conversations)")}
+        assert {"documents_folder", "documents_sha256"} <= {r[1] for r in con.execute("PRAGMA index_list(documents)")}
+    tractor = folder(client, "Tractor")
+    assert client.post("/api/documents/move", json={"ids": [1], "folder_id": tractor}).json["moved"] == 1
+    r = client.post("/api/chat", json={"question": "When do I change the hydraulic oil?", "conversation_id": 1,
+                                       "folder_ids": [tractor]}, headers=H).json
+    assert r["scope_count"] == 1 and "400 hours" in client.seen["msg"]
+    db._schema_ready.discard(str(path))                                                  # a restart: migrated again
+    assert client.get("/api/conversations/1").json["folder_ids"] == [tractor]            # kept
+    assert [m["content"] for m in _messages(client, 1)][:2] == ["When?", "At 400 hours."]
+    assert client.patch("/api/documents/1", json={"vendor": "KIOTI"}).status_code == 200
+    assert client.get("/api/documents?q=kioti").json[0]["id"] == 1
+    assert client.post("/api/documents/1/reread", json={"model": "auto"}, headers=H).status_code == 409  # no original

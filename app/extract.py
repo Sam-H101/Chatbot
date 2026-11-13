@@ -2,7 +2,9 @@
 
 PDF text is kept per page: the readers return one string per page, and a document's
 text joins its pages with a form feed ("\\f", see join_pages). Chunks keep those page
-breaks (see chunk_text), which give each chunk's pages (page_ranges) for citations."""
+breaks (see chunk_text), which give each chunk's pages (page_ranges) for citations.
+Photos (receipts, bills) are read by a vision model (jobs.py); here they are only checked
+and made ready for it (check, prepare_image)."""
 import io
 import os
 import re
@@ -10,8 +12,29 @@ import zipfile
 from xml.etree import ElementTree
 
 import pypdfium2
+from PIL import Image, ImageOps
+
+try:  # HEIC photos (iPhones): readable only with pillow-heif, which registers itself with Pillow
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIC = True
+except ImportError:
+    HEIC = False
 
 CHUNK_CHARS = 1500
+# Photos of documents, read by a vision model. Uploads are told apart by their extension
+# (kind); the bytes must then be one of IMAGE_FORMATS (check).
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif")
+MARKDOWN_EXTS = (".md", ".markdown")
+# Pillow's name of each format accepted, and the type the original is stored and served as:
+# that of the bytes, never what the browser said.
+IMAGE_FORMATS = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp", "HEIF": "image/heic"}
+# The most pixels a photo may have, read from its header before anything is decoded: a
+# decompression bomb is refused at the door, and a phone's 48 MP photo still passes.
+MAX_MEGAPIXELS = 50
+# The longest side a photo is sent to a vision model at: Ollama's minicpm-v, and Claude,
+# which scales larger images down to about this itself (and bills by the pixel).
+OLLAMA_PHOTO_SIDE, CLAUDE_PHOTO_SIDE = 2000, 1568
 PAGE_BREAK = "\f"
 # Pages per Claude call. Each call returns its pages' text, so this bounds both
 # the request size and the output length of a single call.
@@ -29,12 +52,28 @@ class Unsupported(ValueError):
     """Not a file this app can read: the user's mistake, not the server's."""
 
 
+def kind(filename):
+    """What sort of document a file is, by its extension: 'pdf', 'image' (a photo, read by a
+    vision model), 'markdown', 'docx', or 'text' (anything else, read as UTF-8 text)."""
+    ext = os.path.splitext(filename.lower())[1]
+    if ext == ".pdf":
+        return "pdf"
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in MARKDOWN_EXTS:
+        return "markdown"
+    return "docx" if ext == ".docx" else "text"
+
+
 def extract_text(filename, data):
     """Local extraction. PDFs are normally read by a model instead (see jobs.py). Only
-    PDFs have pages: a form feed in other text (a printout, ^L in code) is a line break."""
+    PDFs have pages: a form feed in other text (a printout, ^L in code) is a line break.
+    Photos have no text to extract here: a vision model reads them (jobs.py)."""
     name = filename.lower()
     if name.endswith(".pdf"):
         return join_pages(pdf_texts(data))
+    if kind(name) == "image":
+        raise Unsupported("A photo is read by a vision model, not as text")
     if name.endswith(".docx"):
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as z:
@@ -55,8 +94,10 @@ def extract_text(filename, data):
 
 def check(filename, data):
     """Raise Unsupported for a file that can never be read, before it is queued: a PDF
-    that doesn't open or has no pages, a damaged DOCX, text that isn't UTF-8, or no text
-    at all. Quick: a PDF is only opened, as its pages may need a model."""
+    that doesn't open or has no pages, a photo that isn't one (check_image), a damaged
+    DOCX, text that isn't UTF-8, or no text at all. Quick: a PDF is only opened, as its
+    pages may need a model. Returns the type to store a photo as (that of its bytes), else
+    None."""
     if filename.lower().endswith(".pdf"):
         try:
             pages = page_count(data)
@@ -64,8 +105,67 @@ def check(filename, data):
             raise Unsupported(f"Could not open this PDF: {e}") from None
         if not pages:
             raise Unsupported("This PDF has no pages")
+    elif kind(filename) == "image":
+        return check_image(filename, data)
     elif not extract_text(filename, data).strip():  # all whitespace: chunk_text would find nothing
         raise Unsupported("No text found in file")
+    return None
+
+
+def check_image(filename, data):
+    """The stored type of a photo (IMAGE_FORMATS) whose bytes are a JPEG, PNG, WebP or HEIC
+    image of at most MAX_MEGAPIXELS; Unsupported otherwise. Its size comes from the header,
+    before anything is decoded; verify() then reads the rest for damage."""
+    if not HEIC and filename.lower().endswith((".heic", ".heif")):
+        raise Unsupported("HEIC photos aren't supported on this server")
+    damaged = "Could not open this photo: it is damaged or not a JPG, PNG, WebP or HEIC image"
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            if im.format not in IMAGE_FORMATS or (im.format == "HEIF" and not HEIC):
+                raise Unsupported(damaged)
+            megapixels = im.width * im.height / 1e6
+            if megapixels > MAX_MEGAPIXELS:
+                raise Unsupported(f"This photo is too large ({megapixels:.0f} megapixels); {MAX_MEGAPIXELS} at most")
+            fmt = im.format
+            im.verify()
+    except Image.DecompressionBombError:  # Pillow's own limit, far above ours
+        raise Unsupported(f"This photo is too large; {MAX_MEGAPIXELS} megapixels at most") from None
+    except Unsupported:
+        raise
+    except Exception:  # Pillow raises many kinds for a file that isn't an image it reads
+        raise Unsupported(damaged) from None
+    return IMAGE_FORMATS[fmt]
+
+
+def rgb(im):
+    """An image as RGB, transparent parts on white (a PNG screenshot of a bill, say), not black."""
+    if im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info):
+        im = im.convert("RGBA")
+        out = Image.new("RGB", im.size, "white")
+        out.paste(im, mask=im.getchannel("A"))
+        return out
+    return im.convert("RGB")
+
+
+def image_size(data):
+    """(width, height) of a photo as a person sees it (EXIF rotation applied), from its header."""
+    with Image.open(io.BytesIO(data)) as im:
+        w, h = im.size
+        orientation = im.getexif().get(0x0112, 1)  # 5-8: turned a quarter, so sides swap
+    return (h, w) if orientation in (5, 6, 7, 8) else (w, h)
+
+
+def prepare_image(data, max_side):
+    """A photo as a vision model is sent it: upright (EXIF), RGB, its longest side at most
+    `max_side` pixels, as JPEG (quality 90) bytes."""
+    with Image.open(io.BytesIO(data)) as im:
+        if im.format == "JPEG":  # decode at a fraction of the size when that is enough
+            im.draft("RGB", (max_side, max_side))
+        im = rgb(ImageOps.exif_transpose(im))
+    im.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
 
 
 def join_pages(pages):
