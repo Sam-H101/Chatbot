@@ -393,15 +393,19 @@ dialog.menu [role^="menuitem"] > svg.ic { margin: 0; }
 /* A column, so a long chip or title can't widen the card, and the folder line sits at the bottom of every card in a row. */
 .cbody { padding: 9px 11px 11px; display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
 .ctitle { font: 600 15px/1.3 var(--serif); margin: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
-.cmeta { font: 11px/1.4 var(--mono); color: var(--soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cmeta::first-letter, .dtable .c-type .ell::first-letter { text-transform: uppercase; }  /* "service record" as "Service record" */
+/* "Service manual · 3 Nov": the date always shows. A long type ends in "…" on its own line and the
+   date goes under it; the dot sits in the gap before an item, and is cut off at a line's start. */
+.cmeta, .narrowmeta { font: 11px/1.4 var(--mono); color: var(--soft); display: flex; flex-wrap: wrap; column-gap: 1.4em; min-width: 0; overflow: hidden; }
+.cmeta > span, .narrowmeta > span { flex: none; white-space: nowrap; position: relative; }
+.cmeta > .ctype, .narrowmeta > .ctype { flex: 0 1 auto; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.cmeta > span + span::before, .narrowmeta > span + span::before { content: "·"; position: absolute; right: 100%; width: 1.4em; text-align: center; }
 /* Amount and vendor share the first line (the vendor gives way); the due date has its own. */
 .camt { font-size: 13px; display: flex; flex-wrap: wrap; gap: 0 8px; min-width: 0; }
 .amt { font-weight: 600; font-variant-numeric: tabular-nums; flex: none; }
 .camt .vend { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .camt .due { flex-basis: 100%; }
 .due { font-size: 12px; color: var(--soft); white-space: nowrap; }
-.due.soon { color: var(--accent); font-weight: 600; }
+.due.soon { color: var(--accent-text); font-weight: 600; }
 .cbadges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
 .cbadges:empty { display: none; }
 .cpath { font: 11px/1.3 var(--mono); color: var(--soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: auto; padding-top: 4px; }
@@ -427,7 +431,6 @@ button.sug.new { border-color: var(--accent); color: var(--accent); }
          background: linear-gradient(225deg, var(--paper) 10px, transparent 0) top right / 14px 14px no-repeat, var(--card);
          display: grid; align-content: center; justify-items: center; gap: 2px; padding: 4px 2px; text-align: center; }
 .ficon b { font: 600 12px/1 var(--mono); color: var(--accent); }
-.ficon i { font: italic 10.5px/1.15 var(--serif); color: var(--soft); max-width: 52px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ficon.mini { width: 28px; height: 28px; border-left-width: 3px; padding: 0; background: var(--card); border-radius: 3px 5px 5px 3px; }
 .ficon.mini b { font-size: 8.5px; }
 .ficon.big { width: 84px; height: 108px; }
@@ -482,8 +485,11 @@ tr.frow .ntext b { font-weight: 600; }
 @container dmain (min-width: 900px) { .dtable.haspath .c-folder { display: table-cell; } }
 @container dmain (min-width: 960px) { .c-size { display: table-cell; } }
 @container dmain (max-width: 559px) {
-  .ntext small .narrowmeta { display: block; }
+  .ntext small .narrowmeta { display: flex; }
   .tn { width: 40px; height: 52px; border-radius: 6px; }
+  /* The title takes the row up to the ⋯: no cell padding between them. */
+  .dtable td.c-name { padding-right: 0; }
+  .dtable td.cmore { padding-left: 0; padding-right: 0; width: 44px; }
   .dtable td { height: 64px; }
   .dtable .csel { display: none; }
   #dlist.selmode .dtable .csel { display: table-cell; }
@@ -580,7 +586,7 @@ dl.kv dt { font: 600 11px/1.2 var(--mono); letter-spacing: .1em; text-transform:
 dl.kv dd { margin: 0; min-width: 0; display: grid; gap: 2px; }
 dl.kv dd > .due { padding-left: 8px; }  /* under the date as typed, not the field's edge */
 .edited { font: 10px/1 var(--mono); color: var(--soft); text-transform: lowercase; letter-spacing: 0; font-weight: 400; }
-.kvin { width: 100%; border: 1px solid transparent; border-radius: 6px; background: none; padding: 5px 7px; font-size: 14px; min-width: 0; }
+.kvin { width: 100%; border: 1px solid transparent; border-radius: 6px; background: none; padding: 5px 7px; font-size: 14px; min-width: 0; text-overflow: ellipsis; }
 .kvin::placeholder, .titlein::placeholder { color: var(--soft); opacity: .7; font-style: italic; }  /* never mistaken for a value */
 .kvin:hover { border-color: var(--line); }
 .kvin:focus { outline: 0; border-color: var(--accent); background: var(--card); }

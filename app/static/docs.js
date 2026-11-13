@@ -4,8 +4,9 @@
    dialog that chooses what questions search. Shares app.js's global scope. */
 
 // ---- state ----
-const lib = { folders: new Map(), docs: new Map(), kids: new Map(), docsIn: new Map(), loadedAt: 0, loaded: false, error: null };
-// kids: 'root' | folder id -> [folder ids, by name]; docsIn: 'unfiled' | folder id -> [document ids, newest first]
+const lib = { folders: new Map(), docs: new Map(), kids: new Map(), docsIn: new Map(), types: new Map(), loadedAt: 0, loaded: false, error: null };
+// kids: 'root' | folder id -> [folder ids, by name]; docsIn: 'unfiled' | folder id -> [document ids, newest first];
+// types: typeKey -> the type as shown
 const view = { mode: 'chat', place: { type: 'root' }, doc: null, q: '', qScope: 'here', flat: false,
   sort: store.get('docsSort') || 'added:desc', relevance: true, layout: store.get('docsView') === 'list' ? 'list' : 'grid',
   filters: { types: new Set(), from: '', to: '', amount: false, due: false, suggested: null, models: new Set(), partial: false }, selecting: false,
@@ -60,6 +61,10 @@ function kindLabel(d) {
   return { jpeg: 'JPG', markdown: 'MD', heif: 'HEIC', htm: 'HTML' }[ext] || (ext && ext.length <= 4 ? ext.toUpperCase() : 'TXT');
 }
 const isBill = d => /receipt|bill|invoice|statement/i.test(d.doc_type || '');
+// A type as shown everywhere (cards, rows, filters, sorting): trimmed, its first letter upper-cased,
+// the rest as stored ("service manual" -> "Service manual"). Types group ignoring case and accents.
+const typeText = t => { const s = String(t ?? '').trim().replace(/\s+/g, ' '); return s && s[0].toUpperCase() + s.slice(1); };
+const typeKey = t => norm(typeText(t));
 // Title case, plural: "manual" -> "Manuals", "utility bill" -> "Utility Bills", "policy" -> "Policies".
 function pluralName(t) {
   const words = t.trim().split(/\s+/).map(w => w[0].toUpperCase() + w.slice(1));
@@ -140,12 +145,16 @@ function rebuild() {
     return f.total;
   };
   for (const id of lib.kids.get('root')) total(id);
-  const types = new Map(), curs = new Set(['GBP', 'EUR', 'USD']);
+  // Each type once, as most documents spell it: "manual" and "Manual" are one type.
+  const spell = new Map(), curs = new Set(['GBP', 'EUR', 'USD']);
   for (const d of lib.docs.values()) {
-    if (d.doc_type) types.set(norm(d.doc_type), d.doc_type);
+    const t = typeText(d.doc_type), k = norm(t);
+    if (t) { if (!spell.has(k)) spell.set(k, new Map()); spell.get(k).set(t, (spell.get(k).get(t) || 0) + 1); }
     if (d.currency) curs.add(d.currency);
   }
-  $('typelist').replaceChildren(...[...types.values()].sort(collator.compare).map(t => new Option(t)));
+  const caps = t => t.replace(/[^A-Z]/g, '').length;  // a tie goes to the quieter spelling: "Manual", not "MANUAL"
+  lib.types = new Map([...spell].map(([k, m]) => [k, [...m].sort((a, b) => b[1] - a[1] || caps(a[0]) - caps(b[0]))[0][0]]));
+  $('typelist').replaceChildren(...[...lib.types.values()].sort(collator.compare).map(t => new Option(t)));
   $('curlist').replaceChildren(...[...curs].sort().map(c => new Option(c)));
 }
 const isUnfiled = d => d.folder_id == null || !lib.folders.has(d.folder_id);
@@ -609,7 +618,7 @@ const searchKey = () => {
 function sortDocs(docs) {
   const [k, dir] = view.sort.split(':'), sign = dir === 'desc' ? -1 : 1;
   const val = {
-    name: d => docTitle(d), added: d => d.id, date: d => d.document_date, type: d => d.doc_type || null,
+    name: d => docTitle(d), added: d => d.id, date: d => d.document_date, type: d => typeText(d.doc_type) || null,
     size: d => d.file_size, amount: d => d.total_amount,
   }[k] || (d => d.id);
   docs.sort((a, b) => {
@@ -626,7 +635,7 @@ const filtersOn = () => { const f = view.filters; return f.types.size + (f.from 
 const readBy = d => d.model || '';
 const notFull = d => d.analysis !== 'full';  // partial, none (failed), or '' from before analysis was recorded
 function passes(d, f = view.filters) {
-  if (f.types.size && !f.types.has(norm(d.doc_type || ''))) return false;
+  if (f.types.size && !f.types.has(typeKey(d.doc_type))) return false;
   if (f.models.size && !f.models.has(readBy(d))) return false;
   if (f.partial && !notFull(d)) return false;
   if ((f.from || f.to) && (!d.document_date || (f.from && d.document_date < f.from) || (f.to && d.document_date > f.to))) return false;
@@ -861,7 +870,7 @@ $('dselect').onclick = () => { view.selecting = true; syncSelection(); };
 function renderChips() {
   const f = view.filters, box = $('dchips'), chips = [];
   const chip = (label, off) => chips.push(btn(`${label} ✕`, () => { off(); renderDocs(); }, { cls: 'chip', title: 'Remove this filter' }));
-  for (const t of f.types) chip(`type: ${t}`, () => f.types.delete(t));
+  for (const t of f.types) chip(`type: ${lib.types.get(t) || typeText(t)}`, () => f.types.delete(t));
   if (f.from || f.to) chip(`date: ${dateRangeText(f.from, f.to)}`, () => { f.from = f.to = ''; });
   if (f.amount) chip('with an amount', () => { f.amount = false; });
   if (f.due) chip('has a due date', () => { f.due = false; });
@@ -927,10 +936,11 @@ function renderSuggest() {
 
 // ---- the listing ----
 const thumbFailed = new Set();  // documents whose thumbnail didn't load, this session
+// The kind of file (PDF, MD, JPG…, from the file name's extension) on a blank page: the type is in
+// the text beside it, never squeezed into the icon.
 function typedIcon(d, cls = '') {
   const f = el('div', 'ficon' + (cls ? ' ' + cls : ''));
   f.append(el('b', '', kindLabel(d)));
-  if (cls !== 'mini' && d.doc_type) f.append(el('i', '', d.doc_type));
   return f;
 }
 function thumbOrIcon(d, size, iconCls = '') {
@@ -945,9 +955,21 @@ function thumbOrIcon(d, size, iconCls = '') {
 }
 // "Tesco receipt, receipt, 3 November 2026, £42.10, JPG, in Receipts"
 function docLabel(d) {
-  const parts = [docTitle(d), d.doc_type, d.document_date && fmtDate(d.document_date, { month: 'long' }),
+  const parts = [docTitle(d), typeText(d.doc_type), d.document_date && fmtDate(d.document_date, { month: 'long' }),
     d.total_amount != null && fmtAmount(d.total_amount, d.currency), kindLabel(d), `in ${pathText(isUnfiled(d) ? null : d.folder_id)}`];
   return parts.filter(Boolean).join(', ');
+}
+// "Service manual · 3 Nov" (no document date: "Added 12 Nov"), with the amount on a phone's list row.
+// The date always shows: a long type ends in "…", or the date goes under it (the dot is CSS's).
+function metaLine(d, cls, { amount = false } = {}) {
+  const line = el('span', cls), type = typeText(d.doc_type);
+  const date = d.document_date ? fmtDate(d.document_date, { year: false }) : `Added ${fmtAdded(d.uploaded_at, false, false)}`;
+  const amt = amount && d.total_amount != null ? fmtAmount(d.total_amount, d.currency) : '';
+  if (type) line.append(el('span', 'ctype', type));
+  if (date) line.append(el('span', 'cdate', date));
+  if (amt) line.append(el('span', 'camtm', amt));
+  line.title = [type, date, amt].filter(Boolean).join(' · ');
+  return line;
 }
 function suggestionChip(d) {
   if (!d.suggested_folder || !isUnfiled(d)) return null;
@@ -1020,7 +1042,7 @@ function docCard(d, L) {
   const body = el('div', 'cbody'), h = el('h3', 'ctitle');
   h.append(marked(docTitle(d), L.words));
   h.title = docTitle(d);
-  body.append(h, el('div', 'cmeta', [d.doc_type, d.document_date ? fmtDate(d.document_date, { year: false }) : `Added ${fmtAdded(d.uploaded_at, false, false)}`].filter(Boolean).join(' · ')));
+  body.append(h, metaLine(d, 'cmeta'));
   const due = (isBill(d) || d.due_date) && dueInfo(d.due_date);
   if (d.total_amount != null || d.vendor || due) {
     const a = el('div', 'camt');
@@ -1273,17 +1295,16 @@ function docRow(d, L) {
   const chip = suggestionChip(d);
   if (chip) small.append(chip);
   if (String(d.analysis || '').startsWith('none')) { const na = el('span', 'na', 'Not analyzed'); na.title = d.analysis; small.append(na); }
-  const meta = [d.doc_type, d.document_date && fmtDate(d.document_date, { year: false }), d.total_amount != null && fmtAmount(d.total_amount, d.currency)].filter(Boolean).join(' · ');
-  if (meta) small.append(el('span', 'narrowmeta', meta));
+  small.append(metaLine(d, 'narrowmeta', { amount: true }));
   nt.append(b, small);
   const nc = el('span', 'ncell');
   nc.append(tn, nt);
   const fid = isUnfiled(d) ? null : d.folder_id;
-  const path = btn(shortPath(fid), e => { e.stopPropagation(); openPlace(fid == null ? { type: 'unfiled' } : { type: 'folder', id: fid }); },
+  const path = btn(shortPath(fid), e => { e.stopPropagation(); openPlace(fid == null ? { type: 'unfiled' } : { type: 'folder', id: fid }, { focus: true }); },
     { cls: 'pathbtn', title: pathText(fid) });
   path.tabIndex = -1;
-  const type = el('span', 'ell', d.doc_type || '—');
-  if (d.doc_type) type.title = d.doc_type;
+  const type = el('span', 'ell', typeText(d.doc_type) || '—');
+  if (d.doc_type) type.title = typeText(d.doc_type);
   const date = cell('c-date nowrap', d.document_date ? fmtDate(d.document_date) : '—');
   const due = (isBill(d) || d.due_date) && dueInfo(d.due_date);
   if (due) { date.append(el('br'), el('span', 'due' + (due.soon ? ' soon' : ''), due.text)); }
@@ -2331,7 +2352,7 @@ function openGroup(ids) {
   if (!ids.length) return;
   const counts = new Map(), names = new Map();
   for (const id of ids) {
-    const raw = (lib.docs.get(id).doc_type || '').trim(), t = norm(raw);
+    const raw = typeText(lib.docs.get(id).doc_type), t = norm(raw);
     if (!t) continue;
     counts.set(t, (counts.get(t) || 0) + 1);
     if (!names.has(t)) names.set(t, raw);
@@ -2387,12 +2408,15 @@ function placeDocs() {  // what the place lists before filters (search aside)
 }
 function drawFilter() {
   const f = fdraft, body = $('fbody'), docs = placeDocs();
+  // One chip per type whatever its case ("manual" and "Manual" count together), as shown elsewhere.
   const types = new Map();
-  for (const d of docs) if (d.doc_type) { const k = norm(d.doc_type); types.set(k, (types.get(k) || 0) + 1); }
+  for (const d of docs) { const k = typeKey(d.doc_type); if (k) types.set(k, (types.get(k) || 0) + 1); }
+  for (const t of f.types) if (!types.has(t)) types.set(t, 0);
+  const shown = t => lib.types.get(t) || typeText(t);
   const secT = el('div', 'fsec'), chips = el('div', 'chips');
   secT.append(el('span', 'label', 'Type'));
-  for (const [t, n] of [...types].sort((a, b) => collator.compare(a[0], b[0]))) {
-    const c = btn(`${t} · ${n}`, () => { if (f.types.has(t)) f.types.delete(t); else f.types.add(t); drawFilter(); body.querySelector(`[data-t="${CSS.escape(t)}"]`)?.focus(); }, { cls: 'chip' });
+  for (const [t, n] of [...types].sort((a, b) => collator.compare(shown(a[0]), shown(b[0])))) {
+    const c = btn(`${shown(t)} · ${n}`, () => { if (f.types.has(t)) f.types.delete(t); else f.types.add(t); drawFilter(); body.querySelector(`[data-t="${CSS.escape(t)}"]`)?.focus(); }, { cls: 'chip' });
     c.dataset.t = t;
     c.setAttribute('aria-pressed', String(f.types.has(t)));
     chips.append(c);
@@ -2819,11 +2843,12 @@ function detailsSection(d) {
     if (opts.list) i.setAttribute('list', opts.list);
     if (opts.mode) i.inputMode = opts.mode;
     if (opts.placeholder) i.placeholder = opts.placeholder;
+    if (opts.full) { i.title = i.value; i.addEventListener('input', () => { i.title = i.value; }); }  // a long one ends in "…": in full here
     i.onkeydown = e => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); i.value = value ?? ''; i.classList.remove('bad'); i.blur(); } if (e.key === 'Enter') i.blur(); };
     return i;
   };
   const err = () => { const e = el('span', 'err'); e.setAttribute('role', 'alert'); return e; };
-  const type = text('doc_type', d.doc_type, { max: 60, list: 'typelist', placeholder: 'e.g. receipt' });
+  const type = text('doc_type', d.doc_type, { max: 60, list: 'typelist', placeholder: 'e.g. receipt', full: true });
   type.onchange = () => { if (type.value.trim() !== (d.doc_type || '')) patchDoc(d.id, { doc_type: type.value.trim() }, saved); };
   field('Type', 'doc_type', type);
   const dd = text('document_date', d.document_date, { type: 'date' });
@@ -2831,7 +2856,7 @@ function detailsSection(d) {
   field('Document date', 'document_date', dd);
   const showMoney = isBill(d) || d.vendor || d.total_amount != null || d.due_date || moneyOpen.has(d.id);
   if (showMoney) {
-    const vendor = text('vendor', d.vendor, { max: 200, placeholder: 'Add vendor' });
+    const vendor = text('vendor', d.vendor, { max: 200, placeholder: 'Add vendor', full: true });
     vendor.onchange = () => patchDoc(d.id, { vendor: vendor.value.trim() || null }, saved);
     field('Vendor', 'vendor', vendor);
     const amtErr = err(), row = el('div', 'amtrow');
@@ -3161,7 +3186,7 @@ function drawScope() {
     box.checked = on;
     box.disabled = !!above;
     box.onchange = () => { if (box.checked) sv.docs.add(d.id); else sv.docs.delete(d.id); drawScope(); list.querySelector(`[data-sd="${d.id}"] input`)?.focus(); };
-    txt.append(el('b', '', docTitle(d)), el('small', '', [path, d.filename, d.doc_type, above ? `in ${above.name}` : ''].filter(Boolean).join(' · ')));
+    txt.append(el('b', '', docTitle(d)), el('small', '', [path, d.filename, typeText(d.doc_type), above ? `in ${above.name}` : ''].filter(Boolean).join(' · ')));
     lab.append(box, icon(d.kind === 'image' ? 'image' : 'page'), txt);  // its name in line with the folders' names
     li.dataset.sd = d.id;
     li.append(chev, lab);
