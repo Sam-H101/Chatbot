@@ -39,6 +39,12 @@ _version_lock = threading.Lock()
 # can hold the database longer: 7 s for a 44 MB text, when polls and questions failed with
 # "database is locked".
 BUSY_SECONDS = 30
+# What a search snippet (search_chunks) puts around each word it found: two Unicode
+# noncharacters, which are kept for a program's own use, so a document's text has none (any
+# that one had are dropped when it is indexed). Brackets were ambiguous: a passage's own "["
+# looked like the start of a match.
+MATCH_START, MATCH_END = chr(0xFDD0), chr(0xFDD1)
+_NO_MARKS = {ord(MATCH_START): None, ord(MATCH_END): None}
 
 # AUTOINCREMENT: a deleted conversation's id is never given out again, so a tab or device
 # that still has it open gets 404 rather than writing into someone's new chat. The table
@@ -442,6 +448,7 @@ def _insert_chunks(con, doc_id, chunks, pages=None, vectors=None):
     a paged text (extract.page_ranges), None for text without pages. `vectors`: (embedding
     model, one vector per chunk) for search by meaning; None leaves them to vectors.backfill."""
     for i, text in enumerate(chunks):
+        text = text.translate(_NO_MARKS)  # search_chunks marks matches with these: never in the text
         first, last = pages[i] if pages else (None, None)
         cid = con.execute("INSERT INTO chunks (doc_id, idx, text, page_start, page_end) VALUES (?,?,?,?,?)",
                           (doc_id, i, text, first, last)).lastrowid
@@ -1409,15 +1416,17 @@ def _among(doc_ids):
 
 
 def search_chunks(text, limit=5, doc_ids=None, question=False):
-    """Chunks with the words of `text`, best first (bm25), each with a snippet that marks
-    them [like this]; only in the documents `doc_ids`, if given. `question`: as fts_query."""
+    """Chunks with the words of `text`, best first (bm25), each with a snippet of its text as
+    stored (Markdown, HTML and all) that puts each word found between MATCH_START and
+    MATCH_END (extract.snippet_parts makes it plain text); only in the documents `doc_ids`,
+    if given. `question`: as fts_query."""
     q = fts_query(text, question)
     if not q:
         return []
     scope, args = _among(doc_ids)
     with connect() as con:
         rows = con.execute(
-            f"SELECT {_HIT}, snippet(chunks_fts, 0, '[', ']', ' … ', 24) AS snippet"
+            f"SELECT {_HIT}, snippet(chunks_fts, 0, '{MATCH_START}', '{MATCH_END}', ' … ', 24) AS snippet"
             " FROM chunks_fts f JOIN chunks c ON c.id = f.rowid JOIN documents d ON d.id = c.doc_id"
             f" WHERE chunks_fts MATCH ?{scope} ORDER BY bm25(chunks_fts) LIMIT ?", (q, *args, limit))
         return [_hit(r) for r in rows]
@@ -1439,6 +1448,18 @@ def opening_chunks(doc_ids, limit):
         return [_hit(r) for r in con.execute(
             f"SELECT {_HIT} FROM chunks c JOIN documents d ON d.id = c.doc_id WHERE 1{scope}"
             " ORDER BY c.idx, c.doc_id LIMIT ?", (*args, limit))]
+
+
+def doc_types(but_doc=None, but_sha=None):
+    """The library's document types as written, each with how many documents have it, most
+    used first (then the most recently given): [(type, count)]. Without the document
+    `but_doc` and the documents holding the file `but_sha` (what a re-read or a Replace is
+    about to describe anew)."""
+    with connect() as con:
+        return [tuple(r) for r in con.execute(
+            "SELECT doc_type, count(*) AS n FROM documents WHERE doc_type != '' AND id IS NOT ?"
+            " AND (sha256 IS NULL OR sha256 IS NOT ?) GROUP BY doc_type ORDER BY n DESC, max(id) DESC",
+            (but_doc, but_sha))]
 
 
 def library_overview(limit=60):

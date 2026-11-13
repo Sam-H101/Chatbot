@@ -35,7 +35,7 @@ EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:0.6b")
 # Seconds an embedding call may take: a question waits for it, so far less than TIMEOUT.
 EMBED_TIMEOUT = 60
 # What an analysis prompt adds to the text it carries (its instructions, the key details
-# guidance, the file name and labels; a list of folders comes off the text, sections.analyze),
+# guidance, the file name and labels; the lists of folders and types come off the text, sections.analyze),
 # in tokens, and the factor a token estimate (tokens) is raised by for what it misses.
 PROMPT_TOKENS, MARGIN = 500, 1.1
 # Bits of text that are about a token each for qwen3.5, whose tokenizer, like many, gives

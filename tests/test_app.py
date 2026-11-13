@@ -124,6 +124,73 @@ def test_upload_search_delete(client):
     assert client.get("/api/search?q=rent").json == []
 
 
+# A manual's page as a model reads it: Markdown headings and table, HTML in a cell, a note in brackets.
+BRAKE_PAGE = ("# CHAPTER 7\n# BRAKE\n## BRAKE 7-3\n### 1. TROUBLESHOOTING\n\n"
+              "| Symptom | Provable Causes | Solution |\n|---|---|---|\n"
+              "| Pedal travel too long | Pedal free play incorrectly adjusted<br>- Brake disc worn | Adjust; replace "
+              "[see figure 3] |\n\n- Check the **hydraulic** fluid &amp; the `pedal` *before* driving.")
+
+
+def search_parts(client, q):
+    """GET /api/search's hits, each checked against the contract: snippet_parts alternate text
+    and matches, starting and ending with text (as str.split(/(re)/) gives them), and snippet
+    is the same text with the matches [in brackets]."""
+    hits = client.get(f"/api/search?q={q}").json
+    for h in hits:
+        parts = h["snippet_parts"]
+        assert len(parts) % 2 == 1 and all(isinstance(p, str) for p in parts), parts
+        assert all(parts[1::2]) and h["snippet"] == "".join(f"[{p}]" if i % 2 else p for i, p in enumerate(parts))
+    return hits
+
+
+def test_search_snippets_are_plain_text_in_parts(client):
+    add(client, "brakes.md", BRAKE_PAGE.encode())
+    (hit,) = search_parts(client, "figure")
+    assert hit["snippet_parts"] == [
+        "… TROUBLESHOOTING Symptom · Provable Causes · Solution · Pedal travel too long · Pedal free play incorrectly "
+        "adjusted · Brake disc worn · Adjust; replace [see ", "figure", " 3] Check …"]               # its "[" is text
+    (hit,) = search_parts(client, "brake")
+    parts = hit["snippet_parts"]
+    assert parts[1::2] == ["BRAKE", "BRAKE", "Brake"] and parts[0] == "CHAPTER 7 "
+    text = "".join(parts)
+    assert not any(s in text for s in ("#", "|", "<br>", "- Brake", "---")), text                 # no Markdown or HTML
+    assert "incorrectly adjusted · Brake disc" in text                                          # a cell's lines apart
+    (hit,) = search_parts(client, "hydraulic")                                                  # a match in **bold**
+    assert hit["snippet_parts"] == ["… long · Pedal free play incorrectly adjusted · Brake disc worn · Adjust; replace "
+                                    "[see figure 3] Check the ", "hydraulic", " fluid & the pedal before driving."]
+    (hit,) = search_parts(client, "chapter")
+    assert hit["snippet_parts"][:2] == ["", "CHAPTER"]                                          # a match first: "" before it
+    assert hit["snippet"].startswith("[CHAPTER] 7 BRAKE BRAKE 7-3 1. TROUBLESHOOTING Symptom · ")
+
+
+def test_snippet_parts_take_markdown_and_html_out(client):
+    from app import db, extract
+
+    def parts(raw):
+        return extract.snippet_parts(raw.replace("{", db.MATCH_START).replace("}", db.MATCH_END),
+                                     db.MATCH_START, db.MATCH_END)
+
+    assert parts("plain [old] {brake} text") == ["plain [old] ", "brake", " text"]
+    assert parts(" … __{oil}__ and *{filter}* … ") == ["… ", "oil", " and ", "filter", " …"]
+    assert parts("snake_{case} 5 * 3 Name: ______") == ["snake_", "case", " 5 * 3 Name: ______"]   # not emphasis
+    assert parts("> - [ ] {check}\n> 1. two\n***\n~~old~~ `x`") == ["", "check", " 1. two old x"]
+    assert parts("a&nbsp;b &lt;i&gt;c&lt;/i&gt; <!-- note --> <span class=\"x\">{d}</span>") == ["a b c ", "d", ""]
+    assert parts("{br}> cut <b>tags</b><td style=\"x") == ["cut tags"]                           # cut by the window
+    assert parts("see [the {manual}](https://example.com/m.pdf) ![chart](c.png)") == ["see the ", "manual", " chart"]
+    assert parts("} stray { open {two} words") == ["stray ", "open two", " words"]              # marks that don't pair
+    assert parts("a {   } b {} c\f\fd") == ["a b c d"]                                            # empty matches: text
+    assert parts("facto\x02ry-set\x00 &#1; tab\there\x85") == ["factory-set tab here"]           # control characters
+    assert parts("") == [""] and parts("<br>") == [""]
+
+
+def test_match_marks_are_never_text(client):
+    from app import db
+    job = add(client, "odd.txt", f"A {db.MATCH_START}stray{db.MATCH_END} mark [about] torque.".encode())
+    assert db.document_text(job["doc_id"]) == "A stray mark [about] torque."                   # dropped when indexed
+    (hit,) = search_parts(client, "torque")
+    assert hit["snippet_parts"] == ["A stray mark [about] ", "torque", "."]
+
+
 def test_upload_is_queued_and_reported_as_a_job(client):
     from app import jobs
     r = post(client)
@@ -2497,7 +2564,7 @@ def test_a_broad_question_still_gets_something_to_answer_from(client, monkeypatc
     assert "The monthly rent is 900 euros." in client.seen["msg"]
     assert ask() == ([], True)                                                             # all documents: none near
     assert ("<library>\nNo excerpt matched the question. The documents in the library, newest first:\n"
-            "- manual.txt: Lease (contract). A flat lease.\n- lease.txt: Lease (contract). A flat lease.\n</library>\n"
+            "- manual.txt: Lease (Contract). A flat lease.\n- lease.txt: Lease (Contract). A flat lease.\n</library>\n"
             "What is this document about?") == client.seen["msg"]
     monkeypatch.setattr(llm, "LIBRARY_CHARS", 50)
     ask()
@@ -4436,7 +4503,7 @@ def test_replacing_a_copy_keeps_its_folder_and_what_the_user_changed(client, mon
     assert (job["result"]["filed"], job["result"]["folder_id"], job["result"]["title"]) == ("kept", bills, "My lease")
     (doc,) = client.get("/api/documents").json
     assert (doc["folder_id"], doc["title"], doc["vendor"], doc["doc_type"], doc["user_edited"]) == (
-        bills, "My lease", "Acme", "lease", ["title", "vendor"])
+        bills, "My lease", "Acme", "Lease", ["title", "vendor"])                        # the new type, tidied
     assert doc["suggested_folder"] is None and client.get("/api/documents?q=acme").json[0]["id"] == doc["id"]
     # A copy in Unfiled is replaced in Unfiled, as a re-read: the suggestion kept, not acted on.
     folder(client, "Receipts")
@@ -4515,7 +4582,7 @@ def test_the_analysis_reads_key_details_and_is_shown_the_folders(local, monkeypa
     doc = local.get(f"/api/documents/{job['doc_id']}").json
     assert (doc["document_date"], doc["vendor"], doc["total_amount"], doc["currency"], doc["due_date"]) == (
         "2026-11-03", "Tesco Stores", 42.1, "GBP", None)
-    assert (doc["folder_id"], doc["filed_by"], doc["doc_type"]) == (receipts, "auto", "receipt")
+    assert (doc["folder_id"], doc["filed_by"], doc["doc_type"]) == (receipts, "auto", "Receipt")
     assert local.get("/api/documents?q=stores").json[0]["id"] == doc["id"]                # the vendor is searchable
     # Every key is a required string, for Ollama's format and Claude's json_schema alike.
     schema = sections.META_SCHEMA
@@ -4535,6 +4602,99 @@ def test_a_long_documents_last_call_is_shown_the_folders_too(local, monkeypatch)
     assert kinds.count("notes") == 6 and kinds[-1] == "meta"
     assert seen[-1][4][0]["content"].endswith("Existing folders (levels separated by /):\n- Manuals")
     assert not any("Existing folders" in s[4][0]["content"] for s in seen[:-1])          # notes calls aren't
+    assert "Existing document types (most used first):\n(none yet)\n\n" in seen[-1][4][0]["content"]   # nor types
+
+
+def test_document_types_are_tidied():
+    from app.jobs import normalize_doc_type as tidy
+    cases = {"Technical Manual / Service Guide": "Technical manual / service guide", "Owner's Manual": "Owner's manual",
+             "service manual": "Service manual", "IRS form W-2": "IRS form W-2", "PDF": "PDF",
+             "iPhone receipt": "iPhone receipt", "McDonald's Receipt": "McDonald's receipt",
+             "O'Brien Letter": "O'Brien letter", "2024 Tax Return": "2024 tax return", "e-bill": "E-bill",
+             "(Draft) Contract": "(Draft) contract", "Électricité Facture": "Électricité facture",
+             "SERVICE MANUAL": "Service manual", "IRS FORM W-2": "IRS form W-2", "BILL": "Bill", "VAT": "VAT",
+             '  "Receipt."  ': "Receipt", "“Invoice”": "Invoice", "- **Invoice**": "Invoice", "# Bill:": "Bill",
+             "Service Manual /": "Service manual", "Water\n\tbill ": "Water bill", "Bill​\x07": "Bill",
+             "Wiring Diagram and Electric System": "Wiring diagram and electric system",
+             "": "", "  ": "", '""': "", "...": "", 42: "", None: "", True: ""}
+    assert {k: tidy(k) for k in cases} == cases
+    assert tidy(["Bill"]) == "" and tidy({"type": "Bill"}) == ""
+    assert tidy("Operator " * 10) == "Operator" + " operator" * 5                         # 60 at most, cut at a word
+    assert tidy("x" * 70) == "X" + "x" * 59
+
+
+def test_an_analysis_takes_the_librarys_spelling_of_its_type(client, monkeypatch):
+    from app import db
+    for i, t in enumerate(["Technical Manual / Service Guide"] * 2 + ["service manual", "Receipts", "W-2 form"]):
+        db.add_document(f"old{i}.txt", ["Old."], {"title": "Old", "doc_type": t}, "full")
+    for i, (given, kept) in enumerate([
+            ("service manual / technical guide", "Technical Manual / Service Guide"),   # the same words in any order
+            ("TECHNICAL MANUAL/SERVICE GUIDE", "Technical Manual / Service Guide"),
+            ("Service Manual", "service manual"),                                     # the library's own spelling
+            ("receipt", "Receipts"),                                                  # plurals aside
+            ("w2 Form", "W-2 form"),                                                  # punctuation aside
+            ("Owner's Manual", "Owner's manual"),                                     # new: tidied
+            ("owners manual", "Owner's manual"),                                      # ... and then the library's
+            ("Manual", "Manual")]):                                                   # fewer words: another type
+        analysis(monkeypatch, doc_type=given)
+        job = add(client, f"new{i}.txt", f"Document {i}.".encode())
+        assert client.get(f"/api/documents/{job['doc_id']}").json["doc_type"] == kept, given
+    assert db.doc_types()[:2] == [("Technical Manual / Service Guide", 4), ("Owner's manual", 2)]
+
+
+def test_the_analysis_is_shown_the_librarys_types(local, monkeypatch):
+    import json
+    from app import db, jobs, ollama, sections
+    for t in ["Service manual"] * 3 + ["Owner's Manual"] * 2 + ["owners manual", "Receipt"]:
+        db.add_document("old.txt", ["Old."], {"title": "Old", "doc_type": t}, "full")
+    wiring = db.add_document("wiring.txt", ["Wiring."], {"title": "Wiring Diagram and Electric System",
+                                                         "doc_type": "Wiring Diagram and Electric System"}, "full",
+                             data=b"Wiring.")
+    base, reply = ollama._chat, {"title": "t", "summary": "s", "keywords": [], "doc_type": "owners manual"}
+
+    def chat(model, messages, **kw):
+        got = base(model, messages, **kw)                                                # recorded in local.calls
+        return {**got, "message": {"content": json.dumps(reply)}} if kw.get("format") is sections.META_SCHEMA else got
+
+    def prompt():
+        return [c for c in local.calls if c.get("format") is sections.META_SCHEMA][-1]["messages"][0]["content"]
+
+    monkeypatch.setattr(ollama, "_chat", chat)
+    job = add(local, "manual.txt", b"How to use the tractor.")
+    assert sections.TYPE_RULES in prompt()                                               # Ollama shows no descriptions
+    assert ("Existing document types (most used first):\n- Service manual\n- Owner's Manual\n"   # one spelling each,
+            "- Wiring Diagram and Electric System\n- Receipt\n\n" + sections.DETAILS_GUIDANCE) in prompt()  # newest first
+    assert local.get(f"/api/documents/{job['doc_id']}").json["doc_type"] == "Owner's Manual"
+    # A re-read is not shown its own type, and doesn't keep its spelling: it is being described anew.
+    reply["doc_type"] = "wiring diagram and electric system"
+    assert local.post(f"/api/documents/{wiring}/reread", json={"model": "ollama:qwen3.5:9b"}).status_code == 202
+    jobs.drain()
+    assert "Wiring Diagram" not in prompt() and "- Service manual\n" in prompt()
+    assert local.get(f"/api/documents/{wiring}").json["doc_type"] == "Wiring diagram and electric system"
+    # The list is bounded like the folders', and the prompt's own words fit what a local model keeps for them.
+    many = sections.folders_text([], [f"Type {i}" for i in range(100)])
+    assert many.count("\n- ") == 40 and "- Type 39, …\n\n" in many
+    assert sections.folders_text([], ["x" * 60] * 40).count("\n- ") == 20                  # about 1,200 characters
+    assert jobs.prompt_types([f"Type {i}" for i in range(100)]) == [f"Type {i}" for i in range(41)]
+    assert ollama.tokens(sections._meta_prompt("n" * sections.NAME_CHARS, "")) <= ollama.PROMPT_TOKENS
+
+
+def test_a_users_own_type_is_kept_as_typed(client, monkeypatch):
+    from app import jobs
+    doc_id = add(client)["doc_id"]
+    d = client.patch(f"/api/documents/{doc_id}", json={"doc_type": "  my   ODD\ttype "}).json
+    assert d["doc_type"] == "my ODD type" and "doc_type" in d["user_edited"]             # white space only
+    r = client.patch(f"/api/documents/{doc_id}", json={"doc_type": "x" * 58 + "    y"})  # 60 once tidied
+    assert r.status_code == 200 and r.json["doc_type"] == "x" * 58 + " y"
+    assert client.patch(f"/api/documents/{doc_id}", json={"doc_type": "x" * 61}).status_code == 400
+    client.patch(f"/api/documents/{doc_id}", json={"doc_type": "my ODD type"})
+    analysis(monkeypatch, doc_type="Contract")
+    assert client.post(f"/api/documents/{doc_id}/reread", json={}, headers=H).status_code == 202
+    jobs.drain()
+    assert client.get(f"/api/documents/{doc_id}").json["doc_type"] == "my ODD type"     # a re-read keeps it
+    analysis(monkeypatch, doc_type="My odd type")
+    job = add(client, "b.txt", b"Another lease.")
+    assert client.get(f"/api/documents/{job['doc_id']}").json["doc_type"] == "my ODD type"   # their spelling
 
 
 def test_photos_are_checked_before_they_are_queued(client, monkeypatch):

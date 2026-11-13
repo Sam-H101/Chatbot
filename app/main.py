@@ -357,6 +357,14 @@ def documents():
     return jsonify(db.list_documents(only))
 
 
+def _snippet(raw):
+    """A passage's snippet as search gives it: `snippet_parts`, plain text alternating with
+    the words found (extract.snippet_parts), and `snippet`, the same text with those words
+    [in brackets], as before parts were given (a passage's own brackets look the same)."""
+    parts = extract.snippet_parts(raw, db.MATCH_START, db.MATCH_END)
+    return {"snippet": "".join(f"[{p}]" if i % 2 else p for i, p in enumerate(parts)), "snippet_parts": parts}
+
+
 @app.get("/api/search")
 def search():
     """Passages with the words of q, for the library's search box: by keywords only, since
@@ -364,7 +372,7 @@ def search():
     GET /api/documents is (?folder, ?recursive)."""
     only = _folder_filter()
     return jsonify([{**{k: h[k] for k in ("doc_id", "filename", "title", "idx", "page_start", "page_end")},
-                     "snippet": extract.plain(h["snippet"])}
+                     **_snippet(h["snippet"])}
                     for h in db.search_chunks(request.args.get("q", ""), limit=_int_arg("limit", 10, 1, 50),
                                               doc_ids=only)])
 
@@ -597,13 +605,14 @@ def document_get(doc_id):
     return jsonify(doc) if doc else (jsonify(error="Not found"), 404)
 
 
-def _text_field(body, key, most, empty=None):
+def _text_field(body, key, most, empty=None, collapse=False):
+    """body[key] trimmed (`collapse`: with each run of white space made one space), or BadChoice."""
     value = body[key]
     if value is None and empty is None:
         return None
     if not isinstance(value, str):
         raise BadChoice(f"{key} must be text")
-    value = value.strip()
+    value = " ".join(value.split()) if collapse else value.strip()
     if len(value) > most:
         raise BadChoice(f"{key} is {most} characters at most")
     return value or empty
@@ -622,8 +631,8 @@ def _document_fields(body):
         if len(title) > 300:
             raise BadChoice("A title is 300 characters at most")
         fields["title"] = title
-    if "doc_type" in body:
-        fields["doc_type"] = _text_field(body, "doc_type", 60, empty="")
+    if "doc_type" in body:  # as the user typed it: analyses' types are tidied (jobs.doc_type), not theirs
+        fields["doc_type"] = _text_field(body, "doc_type", 60, empty="", collapse=True)
     for key in ("document_date", "due_date"):
         if key in body:
             fields[key] = None if body[key] is None else db.parse_date(body[key])

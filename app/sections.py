@@ -34,7 +34,9 @@ META_SCHEMA = {
     "type": "object",
     "properties": {
         "title": {"type": "string"},
-        "doc_type": {"type": "string", "description": "e.g. invoice, contract, paper, notes, code"},
+        "doc_type": {"type": "string", "description": "What kind of document it is: one of the listed existing "
+                     "types, copied exactly, if one fits; otherwise a short general type (1-3 words, e.g. Receipt, "
+                     "Service manual), never the document's own title"},
         "summary": {"type": "string", "description": "2-3 sentences"},
         "keywords": {"type": "array", "items": {"type": "string"},
                      "description": "5-12 search terms: topics, names, entities"},
@@ -59,6 +61,17 @@ META_SCHEMA = {
 # The existing folders a metadata prompt lists, at most: this many paths and about this many
 # characters (a library with hundreds of folders must not crowd out the document).
 PROMPT_FOLDERS, PROMPT_FOLDER_CHARS = 200, 6000
+# The same for the library's document types (the most used first), each 60 characters at most.
+PROMPT_TYPES, PROMPT_TYPE_CHARS = 40, 1200
+# Asked just for a type, the analyses of the live library's 14 manuals of one tractor gave six:
+# "Technical Manual / Service Guide", "Service Manual / Technical Guide", "service manual",
+# "manual", "Owner's Manual" and one's title ("Wiring Diagram and Electric System"). Shown the
+# library's types, a model can reuse one; jobs.doc_type then tidies what it gives and maps
+# another spelling of an existing type onto that type.
+TYPE_RULES = (
+    "doc_type: what kind of document this is. If one of the existing document types below fits, copy it exactly "
+    "as listed. Otherwise give a short general type of 1-3 words (e.g. Receipt, Bill, Invoice, Service manual, "
+    "Owner's manual, Wiring diagram), never the document's own title.")
 DETAILS_GUIDANCE = (
     "Fill document_date, vendor, total_amount, currency and due_date only with values the document itself states; "
     "leave a field empty if unsure, and never guess an ambiguous date (03/04/2026). Manuals, letters and papers have "
@@ -96,28 +109,41 @@ _HEADINGS = (("topics", "Key topics"), ("specifications", "Specifications and va
 _SPACE = re.compile(r"\s*")
 
 
+def _lines(items, most, chars):
+    """Items as a metadata prompt lists them, one a line, at most `most` of them and about
+    `chars` characters; "" for none."""
+    items, lines, used = list(items), [], 0
+    for item in items[:most]:
+        if lines and used + len(item) > chars:
+            break
+        lines.append(f"- {item}")
+        used += len(item)
+    return "\n".join(lines) + (", …" if len(lines) < len(items) else "") if lines else ""
+
+
 def _folder_lines(folders):
     """The existing folders' paths as a metadata prompt lists them, "" for none."""
-    folders, lines, used = list(folders), [], 0
-    for path in folders[:PROMPT_FOLDERS]:
-        if lines and used + len(path) > PROMPT_FOLDER_CHARS:
-            break
-        lines.append(f"- {path}")
-        used += len(path)
-    return "\n".join(lines) + (", …" if len(lines) < len(folders) else "") if lines else ""
+    return _lines(folders, PROMPT_FOLDERS, PROMPT_FOLDER_CHARS)
 
 
-def folders_text(folders):
-    """What a metadata prompt adds: the key details guidance, how to write them and the
-    folder, and the existing folders, for the model to file the document into one (or
-    suggest a new one)."""
-    return (f"\n\n{DETAILS_GUIDANCE}\n{FIELD_RULES}\nExisting folders (levels separated by /):\n"
+def _type_lines(types):
+    """The library's document types as a metadata prompt lists them, "" for none."""
+    return _lines(types, PROMPT_TYPES, PROMPT_TYPE_CHARS)
+
+
+def folders_text(folders, types=()):
+    """What a metadata prompt adds: how to give the type, with the library's types (`types`,
+    most used first) to reuse one; the key details guidance, how to write them and the folder,
+    and the existing folders, for the model to file the document into one (or suggest a new
+    one)."""
+    return (f"\n\n{TYPE_RULES}\nExisting document types (most used first):\n{_type_lines(types) or '(none yet)'}"
+            f"\n\n{DETAILS_GUIDANCE}\n{FIELD_RULES}\nExisting folders (levels separated by /):\n"
             f"{_folder_lines(folders) or '(none yet)'}")
 
 
-def _meta_prompt(filename, text, folders=()):
+def _meta_prompt(filename, text, folders=(), types=()):
     return (f"Extract metadata for the document below.\n\nFile name: {filename}\n\n"
-            f"<document>\n{text}\n</document>{folders_text(folders)}")
+            f"<document>\n{text}\n</document>{folders_text(folders, types)}")
 
 
 def _notes_prompt(filename, label, text):
@@ -136,12 +162,12 @@ def _merge_prompt(filename, label, notes):
             f"\n\nFile name: {filename}\n\n<notes>\n{notes}\n</notes>")
 
 
-def _combine_prompt(filename, notes, total, read, folders=()):
+def _combine_prompt(filename, notes, total, read, folders=(), types=()):
     sample = "" if read == total else (
         f" Only {read} of its {total} parts were read, spread evenly through it, so the notes cover part of it.")
     return (f"Extract metadata for the document below. It was too long to read at once, so it was read in {total} "
             f"parts and notes were taken on each.{sample} Describe the whole document from these notes."
-            f"\n\nFile name: {filename}\n\n<notes>\n{notes}\n</notes>{folders_text(folders)}")
+            f"\n\nFile name: {filename}\n\n<notes>\n{notes}\n</notes>{folders_text(folders, types)}")
 
 
 def _pieces(page, limit, size):
@@ -308,7 +334,7 @@ def _notes(ask, filename, label, text, size, depth=0):
 
 
 def analyze(ask, filename, text, limit, size=len, skip=(ValueError,), on_progress=None, kept=None,
-            on_notes=None, folders=()):
+            on_notes=None, folders=(), types=()):
     """(metadata, analysis) for a document. ask(prompt, schema, kind) makes one call and
     returns its parsed JSON; `limit` is how much of the document (or of notes) one call may
     carry, as size(text) measures it: characters by default, estimated tokens for a local
@@ -319,8 +345,9 @@ def analyze(ask, filename, text, limit, size=len, skip=(ValueError,), on_progres
 
     The metadata calls (the one call, or the last, which combines the notes) are also given
     the existing folders' paths (`folders`, db.folder_paths), to suggest where to file the
-    document, and asked for its key details (META_SCHEMA); the room the list takes comes
-    off what they carry of the document. Notes on sections are asked for as before.
+    document, and the library's document types (`types`, most used first), to reuse one,
+    and asked for its key details (META_SCHEMA); the room the lists take comes off what
+    they carry of the document. Notes on sections are asked for as before.
 
     on_progress(stage, done, total) hears of each step. on_notes(key, notes) gets each
     section's notes as they come, and `kept` ({key: notes}, from an earlier attempt)
@@ -329,15 +356,17 @@ def analyze(ask, filename, text, limit, size=len, skip=(ValueError,), on_progres
     the last one if no section could be read."""
     filename = filename if len(filename) <= NAME_CHARS else filename[:NAME_CHARS - 1] + "…"
     body = plain(text)
-    # What a metadata call carries of the document beside the folder list. The guidance around
-    # it is short, like the rest of a prompt's own words (which `limit` leaves room for).
-    room = max(limit / 2, limit - size(_folder_lines(folders)))
+    # What a metadata call carries of the document beside the lists of folders and types. The
+    # guidance around them is short, like the rest of a prompt's own words (which `limit`
+    # leaves room for).
+    room = max(limit / 2, limit - size(_folder_lines(folders)) - size(_type_lines(types)))
     parts = split(text, limit, size) if size(body) > room else []
-    if len(parts) == 1 and size(body) > room:  # fits a call of notes, not one with the folders: smaller
+    if len(parts) == 1 and size(body) > room:  # fits a call of notes, not one with the lists: smaller
         parts = split(text, room, size)
     if len(parts) <= 1:
         try:
-            return ask(_meta_prompt(filename, parts[0][2] if parts else body, folders), META_SCHEMA, "analyze"), "full"
+            return ask(_meta_prompt(filename, parts[0][2] if parts else body, folders, types), META_SCHEMA,
+                       "analyze"), "full"
         except TooLong:  # denser than `size` reckoned: in sections after all
             parts = split(text, size(body) / 2, size)
             if len(parts) < 2:
@@ -375,7 +404,8 @@ def analyze(ask, filename, text, limit, size=len, skip=(ValueError,), on_progres
             say(f"Combining the notes of {len(read)} sections", len(chosen), len(chosen))
         blocks = fitted
         try:
-            meta = ask(_combine_prompt(filename, _joined(blocks), n, len(read), folders), META_SCHEMA, "analyze")
+            meta = ask(_combine_prompt(filename, _joined(blocks), n, len(read), folders, types), META_SCHEMA,
+                       "analyze")
             break
         except TooLong:  # denser notes than `size` reckoned: fit them into less
             if budget < limit / 8:

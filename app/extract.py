@@ -5,6 +5,7 @@ text joins its pages with a form feed ("\\f", see join_pages). Chunks keep those
 breaks (see chunk_text), which give each chunk's pages (page_ranges) for citations.
 Photos (receipts, bills) are read by a vision model (jobs.py); here they are only checked
 and made ready for it (check, prepare_image)."""
+import html
 import io
 import os
 import re
@@ -306,3 +307,116 @@ def page_ranges(chunks):
 def plain(text):
     """Text for a model or a person to read: page breaks become paragraph breaks."""
     return re.sub(r"\s*\f\s*", "\n\n", text).strip() if PAGE_BREAK in text else text
+
+
+# ---- search snippets: a passage as a person reads it in a list of results ----
+# Models write the pages they read as Markdown, with HTML in table cells ("adjusted<br>- Brake
+# disc worn"), and a snippet showed all of it. Cleaning works on the whole snippet with the
+# matches marked by these two noncharacters (any in the text are dropped first), so a heading,
+# a bullet or **bold** is still seen around a match.
+_OPEN, _CLOSE = chr(0xFDD0), chr(0xFDD1)
+# Dropped from the text with them: control characters that aren't white space, such as the \x02
+# pdfium gives for a hyphen that split a word at the end of a line ("facto\x02ry-set").
+_DROPPED = {c: None for c in (ord(_OPEN), ord(_CLOSE), *range(0x09), *range(0x0e, 0x1c), *range(0x7f, 0xa0))
+            if not chr(c).isspace()}
+_MARKS = re.compile(f"([{_OPEN}{_CLOSE}])")
+_TAG_NAMES = r"(?i:br|hr|p|div|span|font|table|thead|tbody|tr|td|th|ul|ol|li|b|i|u|s|em|strong|sup|sub|small|img|a|h[1-6])"
+_LINE_TAG = re.compile(r"<\s*/?\s*(?i:br|hr|p|div|tr|li|h[1-6])\b[^<>]*>")  # tags that end a line
+_TAG = re.compile(rf"<!--.*?-->|</?{_OPEN}?[A-Za-z][^<>]*>", re.S)
+# A tag the snippet's window cut in two: its end at the start ("br> Brake"), its start at the end.
+_TAG_TAIL = re.compile(rf"^\s*/?{_OPEN}?{_TAG_NAMES}{_CLOSE}?(?:\s+[A-Za-z-]+=[^<>]*)?\s*/?>")
+_TAG_HEAD = re.compile(rf"<{_OPEN}?/?{_OPEN}?{_TAG_NAMES}{_CLOSE}?(?:\s[^<>]*)?\s*$")
+_CUT = re.compile(r"(\s*…)?(.*?)(…\s*)?", re.S)  # the ellipses snippet() adds where it cut the text
+_FENCE = re.compile(r"^[^\S\n]*(?:```|~~~).*$", re.M)
+_QUOTED = re.compile(r"^(?:[^\S\n]*>)+", re.M)
+_HEADING = re.compile(r"^[^\S\n]*#{1,6}(?=\s|$)", re.M)
+_BULLET = re.compile(r"^[^\S\n]*[-*+•](?:[^\S\n]+\[[ xX]\])?(?=\s|$)", re.M)
+_RULE = re.compile(r"[\s|:=*_-]*[-=*_][\s|:=*_-]*")  # a table's |---|---| row, or ---, *** or ===
+_LINK = re.compile(r"!?\[([^\]\n]*)\]\([^()\s]*\)")
+_EMPHASIS = re.compile(r"\*+|_+|~~+")
+_SEP = " · "  # between a table's cells and rows, and the lines of a cell
+
+
+def _emphasis(m):
+    """An emphasis mark gone (**, *, __, _, ~~), the match marks aside, unless it stands alone
+    between spaces (5 * 3) or joins a word (snake_case), or is a long run (a form's ______)."""
+    s, a, b, mark = m.string, m.start(), m.end(), m.group()
+    while a and s[a - 1] in (_OPEN, _CLOSE):
+        a -= 1
+    while b < len(s) and s[b] in (_OPEN, _CLOSE):
+        b += 1
+    before, after = s[a - 1] if a else " ", s[b] if b < len(s) else " "
+    if len(mark) > 3 or (before.isspace() and after.isspace()) or (
+            mark[0] == "_" and before.isalnum() and after.isalnum()):
+        return mark
+    return ""
+
+
+def _rows(text):
+    """Lines of a Markdown table as their cells, _SEP between them and between rows, and
+    between the lines of a cell (<br>, a list's bullets dropped); its |---| rows and other
+    rules (---, ***) are dropped."""
+    out, row = [], False
+    for line in text.split("\n"):
+        if _RULE.fullmatch(line) and ("|" in line or len(line.strip()) >= 3):
+            continue
+        if "|" in line:
+            items = [_BULLET.sub("", item).strip() for cell in line.strip().strip("|").split("|")
+                     for item in _LINE_TAG.split(cell)]
+            line = _SEP.join(i for i in items if i)
+            if row and out and line:
+                out[-1] += _SEP + line
+                continue
+            row = row or bool(line)
+        else:
+            row = False
+        out.append(line)
+    return "\n".join(out)
+
+
+def _balanced(text):
+    """The text with only match marks that open and close in turn."""
+    out, inside = [], False
+    for piece in _MARKS.split(text):
+        if piece in (_OPEN, _CLOSE):
+            if (piece == _OPEN) == inside:
+                continue
+            inside = not inside
+        out.append(piece)
+    return "".join(out) + (_CLOSE if inside else "")
+
+
+def snippet_parts(snippet, start, end):
+    """A search snippet that marks each match between `start` and `end` (db.search_chunks), as
+    plain text: [text, match, text, match, ..., text], always starting and ending with text
+    (perhaps ""), the matches at odd indexes, as JavaScript's str.split(/(re)/) gives them. No
+    Markdown (headings, emphasis, inline code, table pipes and |---| rows, bullets, quotes,
+    links), no HTML (tags become spaces or line breaks, entities their characters) and the
+    white space collapsed, so a page can show the parts as text, the matches highlighted. A
+    passage's own brackets ("[see figure 3]") are text like any other."""
+    marked, inside = [], False
+    for piece in re.split(f"({re.escape(start)}|{re.escape(end)})", snippet):
+        if piece in (start, end):
+            if (piece == start) != inside:
+                marked.append(_OPEN if piece == start else _CLOSE)
+                inside = not inside
+        else:  # entities first, so none can make a mark (or a control character) either
+            marked.append(html.unescape(piece).translate(_DROPPED))
+    cut = _CUT.fullmatch(re.sub(r"\r\n?|\f", "\n", "".join(marked) + (_CLOSE if inside else "")))
+    text = _TAG_HEAD.sub("", _TAG_TAIL.sub("", cut[2]))
+    text = _BULLET.sub("", _HEADING.sub("", _QUOTED.sub("", _FENCE.sub("", text))))
+    text = _BULLET.sub("", _LINE_TAG.sub("\n", _rows(text)))  # what a <br> starts outside a table, too
+    text = _TAG.sub(" ", text)
+    text = _EMPHASIS.sub(_emphasis, _LINK.sub(r"\1", text)).replace("`", "")
+    text = _balanced(text)
+    text = re.sub(rf"{_OPEN}(\s+)", rf"\1{_OPEN}", re.sub(rf"(\s+){_CLOSE}", rf"{_CLOSE}\1", text))
+    text = " ".join(text.replace(_OPEN + _CLOSE, "").split())
+    if text:
+        text = ("… " if cut[1] else "") + text + (" …" if cut[3] else "")
+    parts = [""]
+    for piece in _MARKS.split(text):
+        if piece in (_OPEN, _CLOSE):
+            parts.append("")
+        else:
+            parts[-1] += piece
+    return parts

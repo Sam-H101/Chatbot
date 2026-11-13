@@ -356,6 +356,9 @@ def _process(job):
         with open(os.path.join(db.files_dir(), os.path.basename(job["file_path"])), "rb") as f:
             data = f.read()
         text, meta, analysis, who, note = _read(job, opts, data, progress, on_usage)
+        # Whichever model gave it, the type is tidied and, when it is another spelling of one
+        # the library has, made that one (the user's own edits are theirs: db keeps them).
+        meta = {**meta, "doc_type": doc_type(meta.get("doc_type"), _library_types(job))}
         kind = extract.kind(job["filename"])
         chunks = extract.chunk_text(text)
         # A PDF's text has pages (page 1 too when no page break follows it): each chunk's are
@@ -462,19 +465,30 @@ def _details(meta):
 _FILLER = {"the", "and", "for", "with", "from", "our", "your", "misc", "other", "document", "file", "stuff", "thing"}
 
 
+def _folded(text):
+    """Lower case, accents dropped: as filing and types compare words."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).casefold()
+
+
+def _singular(w):
+    """A lower-case word with its plural made singular (receipts, policies, boxes: receipt,
+    policy, box)."""
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 4 and w.endswith(("sses", "xes", "ches", "shes", "zes")):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    return w
+
+
 def _stems(*texts):
     """The words of these texts as filing compares them: lower case, accents dropped, of 3
     letters or more, plurals made singular (receipts, policies, boxes: receipt, policy, box)."""
     out = set()
     for t in texts:
-        t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c)).casefold()
-        for w in re.findall(r"[^\W\d_]{3,}", t):
-            if len(w) > 4 and w.endswith("ies"):
-                w = w[:-3] + "y"
-            elif len(w) > 4 and w.endswith(("sses", "xes", "ches", "shes", "zes")):
-                w = w[:-2]
-            elif len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
-                w = w[:-1]
+        for w in re.findall(r"[^\W\d_]{3,}", _folded(t)):
+            w = _singular(w)
             if w not in _FILLER:
                 out.add(w)
     return out
@@ -493,6 +507,91 @@ def _related(path, meta):
     doc = _stems(*(str(meta.get(k) or "") for k in ("doc_type", "title", "vendor")), *keywords)
     return any(a == b or (min(len(a), len(b)) >= 4 and (a.startswith(b) or b.startswith(a)))
                for a in _stems(name) for b in doc)
+
+
+# ---- document types: one spelling for one kind of document ----
+
+TYPE_CHARS = 60  # as PATCH /api/documents/<id> takes them
+_QUOTES = "\"'`“”‘’„‚«»‹›"
+_TYPE_LEAD = " -–—•·*_~:;,/|\\#"  # dropped before a type ("- Receipt", "**Receipt**", "# Invoice")
+_TYPE_TRAIL = " .,;:!?…-–—•·*_~/|\\#"  # and after it ("Receipt.", "Service manual /")
+_WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")  # letters, with an apostrophe inside (Owner's)
+
+
+def normalize_doc_type(value):
+    """An analysis's document type, tidied ("" for anything but text): control characters
+    dropped, white space collapsed, quotes, bullets and punctuation around it dropped, at most
+    TYPE_CHARS characters (cut at a word where one ends past half of them), in sentence case.
+    The first word is capitalized and capitalized words after it are lower-cased ("Technical
+    Manual / Service Guide": "Technical manual / service guide"), while acronyms and words with
+    capitals inside keep theirs ("IRS form W-2", "PDF", "iPhone receipt"). A type all in
+    capitals with a word of 4 letters or more is shouting: those words are lower-cased too
+    ("SERVICE MANUAL": "Service manual", "IRS FORM W-2": "IRS form W-2")."""
+    if not isinstance(value, str):
+        return ""
+    t = "".join(c for c in unicodedata.normalize("NFC", value) if c.isspace() or unicodedata.category(c)[0] != "C")
+    t, before = " ".join(t.split()), None
+    while t != before:
+        before, t = t, t.strip(_QUOTES).lstrip(_TYPE_LEAD).rstrip(_TYPE_TRAIL)
+    if len(t) > TYPE_CHARS:
+        cut = t.rfind(" ", 0, TYPE_CHARS + 1)
+        t = t[:cut if cut > TYPE_CHARS // 2 else TYPE_CHARS].rstrip(_TYPE_TRAIL)
+    if not any(c.islower() for c in t) and any(len(w) >= 4 for w in _WORD.findall(t)):
+        t = _WORD.sub(lambda m: m[0].lower() if len(m[0]) >= 4 else m[0], t)
+
+    def case(m):
+        w = m[0]
+        if not re.search(r"[^\W_]", t[:m.start()]):  # the first word: nothing but punctuation before it
+            return w[0].upper() + w[1:] if w.islower() else w
+        return w.lower() if len(w) > 1 and w[0].isupper() and w[1:].islower() else w
+
+    return _WORD.sub(case, t)
+
+
+def _type_key(t):
+    """What two spellings of one type have in common: their letters and digits (case, accents,
+    punctuation and spaces aside), and the set of their words with plurals made singular."""
+    words = re.findall(r"[^\W_]+", re.sub(r"['’]", "", _folded(t)))
+    return "".join(words), frozenset(map(_singular, words))
+
+
+def _same_type(a, b):
+    """Whether keys a and b (_type_key) are of one type: equal letters and digits ("W-2 form",
+    "W2 Form"), or the same words in any order ("Service manual / technical guide", "Technical
+    manual / service guide"; "Receipts", "receipt")."""
+    return bool(a[1]) and (a[0] == b[0] or a[1] == b[1])
+
+
+def doc_type(value, known=()):
+    """The type an analysis gave (normalize_doc_type), or, when it is a spelling of one of the
+    library's types `known` (most used first), that type as the library spells it: itself if
+    written so, else the most used. Old rows keep whatever case they were given."""
+    t = normalize_doc_type(value)
+    key = _type_key(t)
+    same = [k for k in known if k == t or _same_type(key, _type_key(k))]
+    return t if t in same or not same else same[0]
+
+
+def prompt_types(known):
+    """The library's types (most used first) as an analysis is shown them: one spelling of
+    each type, the most used (sections.PROMPT_TYPES of them at most are listed)."""
+    shown = []
+    for k in known:
+        key = _type_key(k)
+        if not any(_same_type(key, s) for _, s in shown):
+            shown.append((k, key))
+        if len(shown) > sections.PROMPT_TYPES:  # one more, for the list to end "…"
+            break
+    return [k for k, _ in shown]
+
+
+def _library_types(job):
+    """The library's document types, most used first (db.doc_types), but those of the documents
+    this job describes anew (a re-read's own, or the copies a Replace deletes): a type being
+    corrected is neither shown to the model nor kept for being its own spelling."""
+    replace = job["kind"] != "reread" and (job["options"] or {}).get("on_duplicate") == "replace"
+    return [t for t, _ in db.doc_types(job["doc_id"] if job["kind"] == "reread" else None,
+                                        job["sha256"] if replace else None)]
 
 
 def _fail(job_id, error):
@@ -696,7 +795,8 @@ def _analyze(backend, model, client, job, text, progress, on_usage):
     hooks = {"on_usage": on_usage, "kept": progress.kept(notes),
              "on_progress": lambda stage, done, total: progress.stage(f"{stage} with {who}", done, total),
              "on_notes": lambda key, got: progress.keep(notes, {key: got}),
-             "folders": db.folder_paths()}  # where it may be filed (sections.analyze)
+             "folders": db.folder_paths(),  # where it may be filed (sections.analyze)
+             "types": prompt_types(_library_types(job))}  # types it may reuse
     try:
         if backend == "ollama":
             return ollama.analyze(None, name, text, model, **hooks)
