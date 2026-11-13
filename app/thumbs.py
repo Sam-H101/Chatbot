@@ -47,7 +47,7 @@ def _render(source, kind):
         finally:
             pdf.close()
     with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as im:
-        if im.format == "JPEG":  # decode at a fraction of the size when that is enough
+        if im.format in extract.JPEG_FORMATS:  # decode at a fraction of the size when that is enough
             im.draft("RGB", (width, 2 * width))
         im = extract.rgb(ImageOps.exif_transpose(im))
     im.thumbnail((width, 2 * width))

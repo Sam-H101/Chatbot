@@ -4275,13 +4275,17 @@ def test_an_upload_goes_into_the_folder_it_was_made_in(client, monkeypatch):
 def test_auto_filing_files_only_confident_matches_of_existing_folders(client, monkeypatch):
     receipts = folder(client, "Receipts")
     bills = folder(client, "Bills", folder(client, "Household"))
-    analysis(monkeypatch, folder=" receipts ", folder_confidence="high")
+    analysis(monkeypatch, folder=" receipts ", folder_confidence="high", doc_type="receipt")
     first = add(client, "r1.txt", b"Tesco receipt one.")
     assert (first["result"]["filed"], first["result"]["folder_id"]) == ("auto", receipts)
     doc = client.get(f"/api/documents/{first['doc_id']}").json
     assert (doc["folder_id"], doc["filed_by"], doc["suggested_folder"]) == (receipts, "auto", None)
-    analysis(monkeypatch, folder="household/BILLS", folder_confidence="high")
+    analysis(monkeypatch, folder="household/BILLS", folder_confidence="high", doc_type="water bill")
     assert add(client, "b1.txt", b"Water bill.")["result"]["folder_id"] == bills          # a path, at any depth
+    analysis(monkeypatch, folder="Household/Bills", folder_confidence="high", doc_type="insurance policy",
+             title="Home insurance policy", keywords=["premium", "cover"])
+    r = add(client, "p1.txt", b"Home insurance policy.")["result"]                       # sure, but not what Bills is for
+    assert (r["filed"], r["folder_id"], r["suggested_folder"], r["suggestion_exists"]) == (None, None, "Household/Bills", True)
     analysis(monkeypatch, folder="Receipts", folder_confidence="low")                    # not sure: a suggestion
     r = add(client, "r2.txt", b"Tesco receipt two.")["result"]
     assert (r["filed"], r["folder_id"], r["suggested_folder"], r["suggestion_exists"]) == (None, None, "Receipts", True)
@@ -4318,6 +4322,106 @@ def test_an_upload_whose_folder_goes_meanwhile_lands_in_its_parent_or_unfiled(cl
     assert (ra["folder_id"], ra["filed"], ra["folder_note"]) == (receipts, "chosen", None)
     assert (rb["folder_id"], rb["filed"], rb["folder_note"]) == (None, None, "Its folder was deleted, so it is in Unfiled")
     assert client.get(f"/api/documents/{rb['doc_id']}").json["folder_id"] is None
+
+
+def test_an_upload_being_read_when_its_folder_goes_follows_the_redirect(client, monkeypatch):
+    """The worker holds the job as it was claimed; a folder deleted while the file is read redirects
+    the job's row, and the save goes where the row says: the parent (move), or Unfiled for a top-level
+    folder, without being auto-filed elsewhere (the delete dialog says where they go)."""
+    from app import db, jobs, llm
+    receipts = folder(client, "Receipts")
+    year, gone = folder(client, "2026", receipts), folder(client, "Gone")
+    doomed = []
+    meta = {"title": "Tesco", "doc_type": "receipt", "summary": "s", "keywords": ["shop"], "folder": "Receipts",
+            "folder_confidence": "high"}                                                  # sure, and a fit for Receipts
+
+    def analyze(c, name, text, model=None, folders=(), **kw):
+        if doomed:                                                                       # the user deletes it meanwhile
+            assert client.delete(f"/api/folders/{doomed.pop()}?contents=move").status_code == 200
+        return meta, "full"
+
+    monkeypatch.setattr(llm, "analyze", analyze)
+    results = []
+    for name, target in (("a.txt", year), ("b.txt", gone)):
+        doomed.append(target)
+        job_id = post(client, name, f"Receipt {name}.".encode(), folder_id=str(target), auto_file="1").json["job"]["id"]
+        jobs.drain()
+        j = db.get_job(job_id)
+        assert j["options"]["auto_file"] is False                                       # made into a folder: never auto-filed
+        results.append({k: j["result"][k] for k in ("folder_id", "filed", "folder_note", "suggested_folder")})
+    assert results == [{"folder_id": receipts, "filed": "chosen", "folder_note": None, "suggested_folder": None},
+                       {"folder_id": None, "filed": None, "folder_note": None, "suggested_folder": "Receipts"}]
+    # Queued, not yet read: the same.
+    other = folder(client, "Other")
+    queued = post(client, "c.txt", b"Receipt C.", folder_id=str(other), auto_file="1").json["job"]["id"]
+    assert client.delete(f"/api/folders/{other}").status_code == 200
+    jobs.drain()
+    assert (db.get_job(queued)["result"]["folder_id"], db.get_job(queued)["result"]["filed"]) == (None, None)
+
+
+def test_auto_switching_to_claude_keeps_a_folder_delete_s_redirect(local, monkeypatch):
+    """Auto falls back to Claude by writing to the job's options: only its own keys, so the folder a
+    delete redirected the job to meanwhile stays, for the save and for a retry."""
+    from app import ollama
+    receipts = folder(local, "Receipts")
+    year = folder(local, "2026", receipts)
+
+    def analyze(*a, **kw):                                                               # the local analysis
+        assert local.delete(f"/api/folders/{year}").status_code == 200                  # the folder goes meanwhile
+        raise ollama.OllamaError("qwen3.5:9b: model not found")
+
+    monkeypatch.setattr(ollama, "analyze", analyze)
+    job = add(local, "a.txt", b"Receipt A.", folder_id=str(year), model="auto")
+    assert job["status"] == "done" and "local model failed" in job["result"]["switched"]
+    assert (job["options"]["folder_id"], job["options"]["fallback"], job["options"]["auto_file"]) == (
+        receipts, "analyze", False)
+    assert "local model failed" in job["options"]["switched"]
+    assert (job["result"]["folder_id"], job["result"]["filed"], job["result"]["folder_note"]) == (receipts, "chosen", None)
+
+
+def test_set_job_options_changes_only_its_keys(client):
+    from app import db
+    job_id = post(client, folder_id="", auto_file="0").json["job"]["id"]
+    assert not db.set_job_options(job_id, fallback="read")                               # queued, not running
+    assert db.set_job_options(job_id, when=("queued",), fallback="read", switched="it 'failed' (\"x\")")
+    assert db.get_job(job_id)["options"] == {"on_duplicate": "", "claude_pages": "scanned", "folder_id": None,
+                                             "auto_file": False, "fallback": "read", "switched": "it 'failed' (\"x\")"}
+
+
+def test_auto_filing_needs_a_folder_named_for_the_document():
+    """A model sure of a folder files a document there only when the folder's name is what the
+    document is or is about; otherwise the folder is only suggested."""
+    from app.jobs import _details
+
+    def sure(path, **meta):
+        return _details({"folder": path, "folder_confidence": "high", **meta})["confidence"]
+
+    assert sure("Receipts", doc_type="receipt") == "high"
+    assert sure("Receipts/2026", doc_type="till receipt") == "high"                     # a year names nothing: Receipts does
+    assert sure("Household/Bills", doc_type="utility bill") == "high"
+    assert sure("Tractor", doc_type="manual", keywords=["KIOTI DK20", "tractor"]) == "high"
+    assert sure("Statements", title="Electric Service Statement") == "high"
+    assert sure("Policies", doc_type="insurance policy") == "high"                       # plurals aside
+    assert sure("Billing", doc_type="bill") == "high"                                    # endings aside
+    assert sure("Cafés", vendor="Café Nero") == "high"                                   # accents aside
+    assert sure("Bills", doc_type="Insurance Policy", title="HOME INSURANCE POLICY", keywords=["premium", "cover"]) == "low"
+    assert sure("Tractor/Manuals", doc_type="notes", title="Barn maintenance notes", keywords=["barn", "tractor shed"]) == "low"
+    assert sure("Other Documents", doc_type="other document") == "low"                   # filler words match nothing
+    assert sure("Cards", doc_type="car insurance") == "low"                              # short words match only whole
+    assert sure("Receipts", doc_type="receipt", keywords="not a list") == "high"
+    assert sure("Receipts", keywords=[1, None, "receipt"]) == "high"
+    assert _details({"folder": "Receipts", "folder_confidence": "low", "doc_type": "receipt"})["confidence"] == "low"
+
+
+def test_amounts_with_thousands_separators_and_currency_codes():
+    from app.jobs import _details
+    amounts = {"1,234.56": 1234.56, "£1,234.56": 1234.56, "$12,000.00": 12000.0, "12,000,000": 12000000.0,
+               "-1,234.50": -1234.5, "GBP 42.10": 42.1, "42.10 GBP": 42.1, "eur 5": 5.0, "1,234": None, "£2,000": None,
+               "1,23,456.00": None, "1,234,56": None, "abc": None, "about 40": None, "GBPX 4": None}
+    assert {k: _details({"total_amount": k})["total_amount"] for k in amounts} == amounts
+    currency = {("GBP 42.10", ""): "GBP", ("42.10 usd", ""): "USD", ("42.10 usd", "EUR"): "EUR", ("£12.50", ""): "GBP",
+                ("€3", ""): "EUR", ("$5", ""): None, ("¥500", ""): None, ("12", ""): None, ("1,234", "GBP"): None}
+    assert {k: _details({"total_amount": k[0], "currency": k[1]})["currency"] for k in currency} == currency
 
 
 def test_replacing_a_copy_keeps_its_folder_and_what_the_user_changed(client, monkeypatch):
@@ -4488,6 +4592,30 @@ def test_a_photo_is_read_by_the_local_vision_model(local, tmp_path):
     assert local.get(f"/api/documents/{png['doc_id']}/file").mimetype == "image/png"
 
 
+def test_a_phone_jpeg_carrying_more_pictures_is_a_photo(local, tmp_path):
+    """Pillow calls a JPEG with an MPF second picture (an iPhone's HDR gain map, many Android and camera
+    JPEGs) MPO. It is a JPEG: accepted, stored and served as one, and its first picture is read."""
+    from PIL import Image, ImageDraw
+    from app import extract, ollama
+    first = Image.new("RGB", (3000, 1000), "white")
+    ImageDraw.Draw(first).rectangle((10, 10, 600, 300), fill="black")
+    buf = io.BytesIO()
+    first.save(buf, format="MPO", save_all=True, append_images=[Image.new("RGB", (300, 100), "gray")])
+    data = buf.getvalue()
+    assert data[:3] == b"\xff\xd8\xff" and Image.open(io.BytesIO(data)).format == "MPO"
+    assert extract.check("IMG_2042.jpg", data) == "image/jpeg"
+    job = add(local, "IMG_2042.jpg", data)
+    assert job["status"] == "done", job
+    (vision,) = [c for c in local.calls if c["messages"][-1].get("images")]
+    sent = Image.open(io.BytesIO(base64.b64decode(vision["messages"][-1]["images"][0])))
+    assert vision["model"] == ollama.VISION_MODEL and sent.format == "JPEG" and sent.size == (2000, 667)
+    doc = local.get(f"/api/documents/{job['doc_id']}").json
+    assert (doc["kind"], doc["mime"]) == ("image", "image/jpeg")
+    assert local.get(f"/api/documents/{doc['id']}/file").mimetype == "image/jpeg"
+    thumb = local.get(doc["thumb"])
+    assert thumb.status_code == 200 and Image.open(io.BytesIO(thumb.data)).size == (400, 133)
+
+
 def test_claude_reads_a_photo_from_an_image_block(client, monkeypatch):
     from types import SimpleNamespace as NS
     from PIL import Image
@@ -4638,6 +4766,41 @@ def test_markdown_files_are_indexed_and_previewed_as_written(client):
     old = db.add_document("old.md", ["# Old\n\nNotes."], {"title": "Old"}, "full")
     assert client.get(f"/api/documents/{old}/text").json == {"text": "# Old\n\nNotes.", "truncated": False,
                                                             "source": "chunks", "kind": "markdown", "bytes": 13}
+    # A file saved with a BOM (Windows PowerShell 5.1, Visual Studio): neither indexed nor previewed with it,
+    # so its first line is still a heading.
+    bom = "﻿# Barn notes\n\n- Grease the pins\n".encode()
+    doc_id = add(client, "barn.md", bom)["doc_id"]
+    t = client.get(f"/api/documents/{doc_id}/text").json
+    assert (t["text"], t["bytes"]) == ("# Barn notes\n\n- Grease the pins\n", len(bom))
+    assert db.document_text(doc_id).startswith("# Barn notes")
+    assert client.get(f"/api/documents/{doc_id}/file").data == bom                       # the original as it was
+
+
+def test_folders_go_twenty_levels_deep_at_most(client):
+    """Each listed folder carries its whole path: a depth without limit would let one request make the
+    folder listing huge."""
+    from app import db
+    chain, parent = [], None
+    for i in range(db.FOLDER_DEPTH):
+        parent = folder(client, f"L{i}", parent)
+        chain.append(parent)
+    r = client.post("/api/folders", json={"name": "Deeper", "parent_id": parent})
+    assert r.status_code == 400 and r.json["error"] == "Folders go 20 levels deep at most"
+    assert client.patch(f"/api/folders/{parent}", json={"name": "Renamed"}).status_code == 200   # renaming is fine
+    doc = add(client)["doc_id"]
+    path = [f"P{i}" for i in range(db.FOLDER_DEPTH + 1)]
+    r = client.post("/api/documents/move", json={"ids": [doc], "path": "/".join(path)})
+    assert r.status_code == 400 and r.json["error"] == "A folder path has 20 levels at most"
+    with pytest.raises(db.TooDeep):
+        db.ensure_path(path)
+    r = client.post("/api/documents/move", json={"ids": [doc], "path": "/".join(path[:-1])})
+    assert r.status_code == 200 and len(r.json["created"]) == 20
+    top = folder(client, "Top")
+    folder(client, "Child", top)
+    r = client.patch(f"/api/folders/{top}", json={"parent_id": chain[-2]})               # 19 levels, then Top and Child
+    assert r.status_code == 400 and r.json["error"] == "Folders go 20 levels deep at most"
+    assert client.patch(f"/api/folders/{top}", json={"parent_id": chain[-3]}).status_code == 200
+    assert max(len(f["path"]) for f in client.get("/api/folders").json) == 20
 
 
 def test_a_question_can_be_limited_to_folders(client):

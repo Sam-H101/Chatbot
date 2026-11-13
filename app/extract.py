@@ -27,8 +27,12 @@ CHUNK_CHARS = 1500
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif")
 MARKDOWN_EXTS = (".md", ".markdown")
 # Pillow's name of each format accepted, and the type the original is stored and served as:
-# that of the bytes, never what the browser said.
-IMAGE_FORMATS = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp", "HEIF": "image/heic"}
+# that of the bytes, never what the browser said. MPO is a JPEG carrying more pictures after
+# the first (an iPhone's HDR gain map or depth map, many Android and camera JPEGs): browsers
+# show it as the JPEG it is, and only its first picture is read.
+IMAGE_FORMATS = {"JPEG": "image/jpeg", "MPO": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp",
+                 "HEIF": "image/heic"}
+JPEG_FORMATS = ("JPEG", "MPO")  # decoded at a fraction of their size when that is enough (draft)
 # The most pixels a photo may have, read from its header before anything is decoded: a
 # decompression bomb is refused at the door, and a phone's 48 MP photo still passes.
 MAX_MEGAPIXELS = 50
@@ -86,7 +90,7 @@ def extract_text(filename, data):
         )
     else:
         try:
-            text = data.decode("utf-8")
+            text = data.decode("utf-8-sig")  # a BOM (Windows PowerShell, Visual Studio) is not text
         except UnicodeDecodeError:
             raise Unsupported("Unsupported file: expected PDF, DOCX or UTF-8 text") from None
     return text.replace(PAGE_BREAK, "\n")
@@ -159,7 +163,7 @@ def prepare_image(data, max_side):
     """A photo as a vision model is sent it: upright (EXIF), RGB, its longest side at most
     `max_side` pixels, as JPEG (quality 90) bytes."""
     with Image.open(io.BytesIO(data)) as im:
-        if im.format == "JPEG":  # decode at a fraction of the size when that is enough
+        if im.format in JPEG_FORMATS:  # decode at a fraction of the size when that is enough
             im.draft("RGB", (max_side, max_side))
         im = rgb(ImageOps.exif_transpose(im))
     im.thumbnail((max_side, max_side))

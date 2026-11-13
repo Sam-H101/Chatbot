@@ -8,7 +8,7 @@ const lib = { folders: new Map(), docs: new Map(), kids: new Map(), docsIn: new 
 // kids: 'root' | folder id -> [folder ids, by name]; docsIn: 'unfiled' | folder id -> [document ids, newest first]
 const view = { mode: 'chat', place: { type: 'root' }, doc: null, q: '', qScope: 'here', flat: false,
   sort: store.get('docsSort') || 'added:desc', relevance: true, layout: store.get('docsView') === 'list' ? 'list' : 'grid',
-  filters: { types: new Set(), from: '', to: '', amount: false, due: false, suggested: null }, selecting: false,
+  filters: { types: new Set(), from: '', to: '', amount: false, due: false, suggested: null, models: new Set(), partial: false }, selecting: false,
   order: [], focusKey: null, server: { key: '', docs: [], hits: [] } };
 const sel = { ids: new Set(), anchor: null };  // documents only, never folders
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
@@ -164,13 +164,6 @@ function pathText(fid) {
   return f?.names ? f.names.join(' › ') : lib.loaded ? 'a deleted folder' : 'a folder';
 }
 const folderTotal = id => lib.loaded && lib.folders.has(id) ? lib.folders.get(id).total : null;
-// How many documents a question would search now (null while the library isn't listed yet).
-function scopeCount() {
-  if (!lib.loaded) return null;
-  const ids = new Set(scope.docs.filter(id => lib.docs.has(id)));
-  for (const f of scope.folders) if (lib.folders.has(f)) for (const d of subtreeDocs(f)) ids.add(d);
-  return ids.size;
-}
 // An existing folder for a path like "Household/Bills" (each level compared ignoring case), or null.
 function findPath(path) {
   let key = 'root', id = null;
@@ -243,6 +236,7 @@ function checkPlace() {
 function resetPlaceState() {
   view.q = '';
   $('dq').value = '';
+  view.qScope = 'here';  // each place searches itself first, as its search box says
   view.relevance = true;
   sel.ids.clear();
   sel.anchor = null;
@@ -592,24 +586,40 @@ function sortDocs(docs) {
     return c ? c * sign : collator.compare(docTitle(a), docTitle(b));
   });
 }
-const filtersOn = () => { const f = view.filters; return f.types.size + (f.from || f.to ? 1 : 0) + f.amount + f.due + (f.suggested ? 1 : 0); };
+const filtersOn = () => { const f = view.filters; return f.types.size + (f.from || f.to ? 1 : 0) + f.amount + f.due + (f.suggested ? 1 : 0) + f.models.size + f.partial; };
+// Read by and analysis: so the documents a local model read, or analyzed only in part, can be
+// selected together and re-read with another model.
+const readBy = d => d.model || '';
+const notFull = d => d.analysis !== 'full';  // partial, none (failed), or '' from before analysis was recorded
 function passes(d, f = view.filters) {
   if (f.types.size && !f.types.has(norm(d.doc_type || ''))) return false;
+  if (f.models.size && !f.models.has(readBy(d))) return false;
+  if (f.partial && !notFull(d)) return false;
   if ((f.from || f.to) && (!d.document_date || (f.from && d.document_date < f.from) || (f.to && d.document_date > f.to))) return false;
   if (f.amount && d.total_amount == null) return false;
   if (f.due && !d.due_date) return false;
   if (f.suggested && !(isUnfiled(d) && d.suggested_folder && (f.suggested === true || norm(d.suggested_folder) === norm(f.suggested)))) return false;
   return true;
 }
-// One sum per currency, never converted: "£182.40 + €12.00" (three currencies, then "+n").
+// One sum per currency, never converted: "£182.40 + €12.00" (three currencies, then "+n"). Amounts
+// read without a currency count as the others' when those all have one and the same (a model left
+// it out of one of several dollar bills): `assumed` names it, for the tooltip.
 function totals(docs) {
   const by = new Map();
-  let n = 0;
-  for (const d of docs) if (d.total_amount != null) { n++; by.set(d.currency || '', (by.get(d.currency || '') || 0) + d.total_amount); }
+  let n = 0, bare = 0;
+  for (const d of docs) if (d.total_amount != null) { n++; bare += !d.currency; by.set(d.currency || '', (by.get(d.currency || '') || 0) + d.total_amount); }
   if (!n) return null;
+  let assumed = null;
+  if (bare && by.size === 2) {
+    assumed = [...by.keys()].find(Boolean);
+    by.set(assumed, by.get(assumed) + by.get(''));
+    by.delete('');
+  }
   const parts = [...by].sort((a, b) => b[1] - a[1]).map(([c, v]) => fmtAmount(v, c));
-  return { n, text: parts.slice(0, 3).join(' + ') + (parts.length > 3 ? ` +${parts.length - 3}` : '') };
+  return { n, bare, assumed, text: parts.slice(0, 3).join(' + ') + (parts.length > 3 ? ` +${parts.length - 3}` : '') };
 }
+const totalsTitle = t => `Sum of the ${plural(t.n, 'document')} with an amount, as read from them. Different currencies are not converted.`
+  + (t.assumed ? ` ${t.bare === 1 ? 'One amount was' : `${t.bare} amounts were`} read without a currency and ${t.bare === 1 ? 'is' : 'are'} counted as ${t.assumed}, like the others.` : '');
 function countText() {
   const p = view.place;
   if (!lib.loaded) return '';
@@ -622,6 +632,7 @@ function countText() {
   const f = lib.folders.get(p.id);
   if (!f) return '';
   const k = lib.kids.get(p.id).length;
+  if (view.flat && k) return `${plural(f.total, 'document')}, subfolders included`;  // as the listing shows them
   return [plural(f.count, 'document'), k ? plural(k, 'folder') : ''].filter(Boolean).join(' · ');
 }
 
@@ -682,7 +693,7 @@ function renderHead(L) {
   $('dcounttext').textContent = L.searching || filtersOn() ? `${plural(L.docs.length, 'document')} shown` + (filtersOn() && !L.searching ? ` of ${L.unfiltered}` : '') : countText();
   const t = totals(L.docs);
   $('dtotal').textContent = t ? ` · Total ${t.text}` : '';
-  $('dtotal').title = t ? `Sum of the ${plural(t.n, 'document')} with an amount, as read from them. Different currencies are not converted.` : '';
+  $('dtotal').title = t ? totalsTitle(t) : '';
   const sub = p.type === 'folder' && lib.kids.get(p.id)?.length > 0;
   $('dflatbox').hidden = !sub;
   $('dflat').checked = view.flat;
@@ -701,8 +712,8 @@ $('dflat').onchange = e => { view.flat = e.target.checked; renderDocs(); };
 
 function renderTools(L) {
   const p = view.place, name = placeName(p), scoped = p.type === 'folder' || p.type === 'unfiled';
-  $('dq').placeholder = p.type === 'folder' ? `Search ${name}…` : p.type === 'unfiled' ? 'Search Unfiled…'
-    : p.type === 'all' ? 'Search all documents…' : 'Search the library…';
+  $('dq').placeholder = scoped && view.qScope === 'all' ? 'Search everywhere…' : p.type === 'folder' ? `Search ${name}…`
+    : p.type === 'unfiled' ? 'Search Unfiled…' : p.type === 'all' ? 'Search all documents…' : 'Search the library…';
   $('dscope').hidden = !scoped;
   const [here, all] = $('dscope').querySelectorAll('button');
   here.textContent = p.type === 'unfiled' ? 'Unfiled' : 'This folder';
@@ -809,6 +820,8 @@ function renderChips() {
   if (f.amount) chip('with an amount', () => { f.amount = false; });
   if (f.due) chip('has a due date', () => { f.due = false; });
   if (f.suggested) chip(f.suggested === true ? 'has a folder suggestion' : `suggested: ${f.suggested.split('/').join(' › ')}`, () => { f.suggested = null; });
+  for (const m of f.models) chip(`read by: ${m || 'not recorded'}`, () => f.models.delete(m));
+  if (f.partial) chip('not fully analyzed', () => { f.partial = false; });
   if (chips.length) chips.push(btn('Clear filters', () => { clearFilters(); renderDocs(); }, { cls: 'chip clear' }));
   box.replaceChildren(...chips);
 }
@@ -817,7 +830,8 @@ function dateRangeText(from, to) {
   if (from && to && from.endsWith('-01-01') && to.endsWith('-12-31') && y(from) === y(to)) return y(from);
   return [from ? fmtDate(from) : '…', to ? fmtDate(to) : '…'].join(' to ');
 }
-function clearFilters() { const f = view.filters; f.types.clear(); f.from = f.to = ''; f.amount = f.due = false; f.suggested = null; }
+function clearFilters() { const f = view.filters; f.types.clear(); f.from = f.to = ''; f.amount = f.due = false; f.suggested = null; f.models.clear(); f.partial = false; }
+const noFilters = () => ({ types: new Set(), from: '', to: '', amount: false, due: false, suggested: null, models: new Set(), partial: false });
 
 function renderTip() {
   const p = view.place, box = $('dtip');
@@ -1314,6 +1328,7 @@ function syncSelection() {
   if (foot) {
     const docs = (n ? [...sel.ids] : view.order).map(id => lib.docs.get(id)).filter(Boolean), t = totals(docs);
     foot.textContent = n ? `Selected: ${n}${t ? ` · ${t.text}` : ''}` : `${plural(docs.length, 'document')}${t ? ` · Total ${t.text}` : ''}`;
+    foot.title = t ? totalsTitle(t) : '';
   }
   $('dtools').hidden = on;
   $('dselbar').hidden = !on;
@@ -1609,15 +1624,28 @@ async function moveDocs(ids, folderId, { path = null, quiet = false } = {}) {
   const dest = pathText(r.folder_id);
   const msg = r.created?.length ? `Created '${lib.folders.get(r.folder_id)?.name || dest}' and moved ${what} into it` : `Moved ${what} to ${dest}`;
   announce(msg);
-  if (!quiet) toast(msg, { action: ['Undo', () => undoMove(r.from)] });
+  if (!quiet) toast(msg, { action: ['Undo', () => undoMove(r.from, r.created)] });
   return r;
 }
-async function undoMove(from) {
+// Each document back where it was; folders the move made (`created`, from the top down) go too,
+// deepest first, if nothing has been put in them since.
+async function undoMove(from, created = []) {
   const back = new Map();
   for (const [id, f] of Object.entries(from)) { const k = f ?? 'null'; if (!back.has(k)) back.set(k, []); back.get(k).push(+id); }
   try {
     for (const [k, ids] of back) await send('/api/documents/move', { ids, folder_id: k === 'null' ? null : +k });
-    toast(`Moved ${plural(Object.keys(from).length, 'document')} back`);
+    let removed = 0;
+    if (created?.length) {
+      const list = await api('/api/folders'), gone = new Set();
+      for (const id of [...created].reverse()) {
+        const f = list.find(x => x.id === id);
+        if (!f || f.total_count || list.some(x => x.parent_id === id && !gone.has(x.id))) continue;
+        await api(`/api/folders/${id}?contents=move`, { method: 'DELETE' });
+        gone.add(id);
+        removed++;
+      }
+    }
+    toast(`Moved ${plural(Object.keys(from).length, 'document')} back${removed ? ` and removed the ${removed === 1 ? 'folder' : 'folders'} made for ${Object.keys(from).length === 1 ? 'it' : 'them'}` : ''}`);
   } catch (err) { toast(err.message, { error: true }); }
   lib.load();
 }
@@ -1796,9 +1824,27 @@ function placeMenu(key, anchor, at = null) {
        { label: 'Ask all documents', icon: 'chat', onclick: () => askAbout({}) }];
   openMenu({ anchor, at, title: placeName(treePlace(key)), items });
 }
+// The menu of a document that is one of several selected acts on them all, as file managers' do and
+// as the selection bar does; each item says how many.
+function selectionMenuItems() {
+  const ids = [...sel.ids].filter(id => lib.docs.has(id)), n = ids.length, can = rereadableOf(ids);
+  return [
+    { label: `Ask about these ${n}`, icon: 'chat', onclick: () => askAbout({ docs: ids }) },
+    { label: `Move ${n} documents to…`, icon: 'move', onclick: () => moveDialog(ids) },
+    { label: can.length ? `Re-read ${can.length}…` : 'Re-read…', icon: 'reread', disabled: !can.length,
+      title: can.length < n ? `${n - can.length} of them can't be re-read: their originals weren't kept` : '', onclick: () => openReread(can, ids) },
+    { label: 'New folder from these', icon: 'plus', onclick: () => openGroup(ids) },
+    '-',
+    { label: `Delete ${n} documents`, icon: 'trash', danger: true, sure: `Click again to delete ${n}`, onclick: () => deleteDocs(ids) },
+  ];
+}
 function itemMenu(key, anchor, at = null) {
-  if (key[0] === 'f') folderMenu(+key.slice(1), anchor, at);
-  else if (key[0] === 'd') { const d = lib.docs.get(+key.slice(1)); if (d) openMenu({ anchor, at, title: docTitle(d), subtitle: d.filename, items: docMenuItems(d.id) }); }
+  if (key[0] === 'f') { folderMenu(+key.slice(1), anchor, at); return; }
+  if (key[0] !== 'd') return;
+  const id = +key.slice(1), d = lib.docs.get(id);
+  if (!d) return;
+  if (sel.ids.has(id) && sel.ids.size > 1) openMenu({ anchor, at, title: `${sel.ids.size} documents selected`, items: selectionMenuItems() });
+  else openMenu({ anchor, at, title: docTitle(d), subtitle: d.filename, items: docMenuItems(d.id) });
 }
 
 // ---- dialogs ----
@@ -2111,7 +2157,9 @@ function drawFolderDelete(note = '') {
 $('fdgo').onclick = async () => {
   if (!fd) return;
   const { id, f, mode, total } = fd;
-  const inside = view.place.type === 'folder' && subtree(id).has(view.place.id);
+  // The place shown goes with the folder: it, or with its documents deleted any folder inside it too
+  // (moving its contents up keeps those, at the parent).
+  const inside = view.place.type === 'folder' && (mode === 'delete' ? subtree(id).has(view.place.id) : view.place.id === id);
   $('fdgo').disabled = true;
   let r;
   try {
@@ -2127,7 +2175,12 @@ $('fdgo').onclick = async () => {
   fd = null;
   $('fdelview').close();
   const parent = r.parent_id;
-  if (inside) { view.place = parent != null ? { type: 'folder', id: parent } : { type: 'root' }; view.doc = null; nav(hashFor(view.place), 'replace'); store.set('docsAt', hashFor(view.place)); }
+  if (inside) {  // to where its contents went; an open document stays open if it moved there with them
+    view.place = parent != null ? { type: 'folder', id: parent } : { type: 'root' };  // Library lists Unfiled too
+    if (mode === 'delete') view.doc = null;
+    nav(hashFor(view.place, view.doc), 'replace', view.doc != null && history.state?.detail ? { detail: true } : {});
+    store.set('docsAt', hashFor(view.place));
+  }
   await lib.load();
   const where = parent != null ? pathText(parent) : 'Unfiled';
   let msg = `Deleted '${f.name}'.`;
@@ -2221,14 +2274,15 @@ $('gvform').onsubmit = async e => {
   $('groupview').close();
   if (parent != null) { treeOpen.add(parent); saveTree(); }
   const r = await moveDocs(ids, f.id, { quiet: true });
-  if (r) toast(`Created '${f.name}' and moved ${plural(ids.length, 'document')} into it`, { action: ['Undo', () => undoMove(r.from)] });
+  if (r) toast(`Created '${f.name}' and moved ${plural(ids.length, 'document')} into it`, { action: ['Undo', () => undoMove(r.from, [f.id])] });
 };
 
 // Filters: client-side, for the session, shown as chips.
 let fdraft = null;
 function openFilter() {
   const f = view.filters;
-  fdraft = { types: new Set(f.types), from: f.from, to: f.to, amount: f.amount, due: f.due, suggested: f.suggested };
+  fdraft = { types: new Set(f.types), from: f.from, to: f.to, amount: f.amount, due: f.due, suggested: f.suggested,
+    models: new Set(f.models), partial: f.partial };
   drawFilter();
   openDialog($('filterview'));
   $('fbody').querySelector('button, input')?.focus();
@@ -2287,11 +2341,25 @@ function drawFilter() {
   };
   secC.append(check('Only with an amount', 'amount'), check('Has a due date', 'due'),
     check('Has a folder suggestion', 'suggested', () => f.suggested, v => { f.suggested = v ? (typeof f.suggested === 'string' ? f.suggested : true) : null; }));
-  body.replaceChildren(secT, secD, secC);
+  // Read by: to find what a model read, select it all and re-read it with another.
+  const models = new Map();
+  for (const d of docs) models.set(readBy(d), (models.get(readBy(d)) || 0) + 1);
+  for (const m of f.models) if (!models.has(m)) models.set(m, 0);
+  const secR = el('div', 'fsec'), mchips = el('div', 'chips');
+  secR.append(el('span', 'label', 'Read by'));
+  for (const [m, n] of [...models].sort((a, b) => collator.compare(a[0], b[0]))) {
+    const c = btn(`${m || 'not recorded'} · ${n}`, () => { if (f.models.has(m)) f.models.delete(m); else f.models.add(m); drawFilter(); body.querySelector(`[data-m="${CSS.escape(m)}"]`)?.focus(); }, { cls: 'chip' });
+    c.dataset.m = m;
+    c.setAttribute('aria-pressed', String(f.models.has(m)));
+    mchips.append(c);
+  }
+  if (!models.size) mchips.append(el('span', 'muted', 'No documents here yet.'));
+  secR.append(mchips, check('Not fully analyzed (partly, not at all, or before analyses were recorded)', 'partial'));
+  body.replaceChildren(secT, secD, secC, secR);
   const n = docs.filter(d => passes(d, f)).length;
   $('fgo').textContent = `Show ${plural(n, 'document')}`;
 }
-$('fclear').onclick = () => { fdraft = { types: new Set(), from: '', to: '', amount: false, due: false, suggested: null }; drawFilter(); };
+$('fclear').onclick = () => { fdraft = noFilters(); drawFilter(); };
 $('fgo').onclick = () => {
   Object.assign(view.filters, fdraft);
   $('filterview').close();
@@ -2315,8 +2383,10 @@ $('avfolder').onclick = () => { $('addview').close(); newFolder(view.place.type 
 // ---- the detail panel ----
 const extra = new Map();      // id -> {sha, pages, copies}, from GET /api/documents/<id>
 const textCache = new Map();  // id -> {sha, max, data}, from GET /api/documents/<id>/text
-const forgetText = id => { textCache.delete(id); extra.delete(id); };
 let panelFor = null, panelStale = false, previewNode = null, previewKey = '';
+// A job finished with this document (a re-read, say): its text is read again, and an open preview
+// is drawn again with the next render, though its file, and so its key, is the same.
+const forgetText = id => { textCache.delete(id); extra.delete(id); if (panelFor === id) previewKey = ''; };
 async function loadText(d, max = 200000) {
   const c = textCache.get(d.id);
   if (c && c.sha === d.sha256 && c.max >= max) return c.data;
@@ -2654,12 +2724,12 @@ function detailsSection(d) {
     const cur = text('currency', d.currency, { max: 3, list: 'curlist', cls: 'cur', placeholder: 'GBP' });
     cur.setAttribute('aria-label', 'Currency');
     amt.onchange = () => {
-      const raw = amt.value.replace(/[\s£$€¥]/g, '');
-      if (!raw) { amt.classList.remove('bad'); amtErr.textContent = ''; patchDoc(d.id, { total_amount: null }, saved); return; }
-      if (!/^-?\d{1,12}([.,]\d{1,4})?$/.test(raw)) { amt.classList.add('bad'); amtErr.textContent = 'An amount like 1234.56'; return; }
+      const v = parseAmount(amt.value);
+      if (v === null) { amt.classList.remove('bad'); amtErr.textContent = ''; patchDoc(d.id, { total_amount: null }, saved); return; }
+      if (typeof v === 'string') { amt.classList.add('bad'); amtErr.textContent = v; return; }
       amt.classList.remove('bad');
       amtErr.textContent = '';
-      patchDoc(d.id, { total_amount: parseFloat(raw.replace(',', '.')) }, saved);
+      patchDoc(d.id, { total_amount: v }, saved);
     };
     cur.oninput = () => { const p = cur.selectionStart; cur.value = cur.value.toUpperCase(); cur.setSelectionRange(p, p); };
     cur.onchange = () => {
@@ -2696,6 +2766,22 @@ function detailsSection(d) {
   return frag2;
 }
 const moneyOpen = new Set();
+// A total as typed: a number, null for none, or what is wrong with it (a string). A dot is the
+// decimal point, and so is a comma when there is no dot ("42,10"). Commas grouping thousands are
+// dropped where they can't be decimals: before a dot ("1,234.56", "£2,000.00") or more than one
+// ("12,000,000"). A lone comma before three digits ("1,500") could be either, so it is asked
+// about, as the server's reading of an analysis leaves such an amount out (jobs._details).
+function parseAmount(typed) {
+  let raw = String(typed).replace(/[\s£$€¥]/g, '');
+  if (!raw) return null;
+  if (/^-?\d{1,3}(,\d{3})+(\.\d{1,4})?$/.test(raw) && (raw.includes('.') || raw.split(',').length > 2)) raw = raw.replace(/,/g, '');
+  if (/^-?\d{1,12},\d{3}$/.test(raw)) {
+    const whole = raw.replace(',', ''), part = parseFloat(raw.replace(',', '.'));
+    return `Is that ${whole} or ${part.toFixed(2)}? Write ${whole}, or use a dot for decimals`;
+  }
+  if (!/^-?\d{1,12}([.,]\d{1,4})?$/.test(raw)) return 'An amount like 1234.56';
+  return parseFloat(raw.replace(',', '.'));
+}
 function aboutSection(d, x) {
   const s = el('div', 'dpsec'), dl = el('dl', 'about');
   const row = (k, v) => { const dd = el('dd'); dd.append(v); dl.append(el('dt', '', k), dd); };

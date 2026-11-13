@@ -10,7 +10,7 @@ function mdRender(src, opts) {
   let text = String(src == null ? '' : src);
   const cut = text.length > LIMIT;
   if (cut) text = text.slice(0, LIMIT);
-  text = text.replace(/\r\n?/g, '\n');
+  text = text.replace(/^﻿/, '').replace(/\r\n?/g, '\n');  // a BOM (Windows editors) would hide a first heading
   const SVG = 'http://www.w3.org/2000/svg';
   const PUNCT = new Set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~');
   const frag = document.createDocumentFragment();

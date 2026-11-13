@@ -581,7 +581,7 @@ def document_text_view(doc_id):
         with open(f["path"], "rb") as fh:
             raw = fh.read(most * 4 + 4)  # enough for `most` characters of any UTF-8
         size = os.path.getsize(f["path"])
-        text = raw.decode("utf-8", errors="replace")
+        text = raw.decode("utf-8-sig", errors="replace")  # without the BOM some Windows editors start a file with
         return jsonify(text=text[:most], truncated=len(raw) < size or len(text) > most, source="file",
                        kind=doc["kind"], bytes=size)
     text = extract.plain(db.document_text(doc_id))
@@ -678,7 +678,7 @@ def documents_move():
     if ("folder_id" in body) == ("path" in body):
         raise BadChoice("Send a folder_id (null for Unfiled) or a path, not both")
     if "path" in body:
-        out = db.move_documents(ids, path=db.clean_path(body["path"]))
+        out = db.move_documents(ids, path=db.clean_path(body["path"], most=db.FOLDER_DEPTH))
     else:
         out = db.move_documents(ids, folder_id=_row_id(body["folder_id"], "folder_id"))
     return jsonify({**out, "from": {str(k): v for k, v in out["from"].items()}})

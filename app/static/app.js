@@ -561,10 +561,10 @@ function showJob(row, j) {
     let outcome = '', buttons = [], wait = 4000;
     if (j.kind === 'upload' && j.doc_id) {
       if (r.folder_note) { outcome = r.folder_note; buttons = [show]; }
-      else if (r.filed === 'auto') {
+      else if (r.filed === 'auto') {  // stays until hidden: someone who dropped files and walked away sees where they went
         outcome = frag('Filed in ', [pathText(r.folder_id)], ' automatically');
-        buttons = [show, ['Undo', 'Move it to Unfiled', () => moveDocs([j.doc_id], null, { undo: true }).then(() => dropRow(row))]];
-        wait = 10000;
+        buttons = [show, ['Undo', 'Move it to Unfiled', () => moveDocs([j.doc_id], null).then(ok => ok && dropRow(row))]];
+        wait = 0;
       } else if (r.filed === 'kept') {
         outcome = `Replaced · stays in ${pathText(r.folder_id)}`;
         buttons = [show];
@@ -585,7 +585,7 @@ function showJob(row, j) {
               [r.analysis && r.analysis !== 'full' ? `Analysis: ${r.analysis}` : ''],
               [r.unit_fixes ? `${fixesText(r.unit_fixes)}: litre/gallon misprints, corrected in answers` : ''], [est]],
       buttons, x: ['Hide', () => dropRow(row)] });
-    if (before !== 'done' && !r.switched) hideLater(row, wait);
+    if (before !== 'done' && !r.switched && wait) hideLater(row, wait);
   }
 }
 
@@ -1049,9 +1049,10 @@ async function openChat(id, picked = false) {
       $('chatModel').value = c.model;
       store.set('chatModel', c.model);
     }
-    // doc_ids [] with no folders: everything chosen for it was deleted.
+    // doc_ids [] with no folders: everything chosen for it was deleted. folder_ids is a list (now
+    // empty) when folders were chosen, null when none were.
     const gone = Array.isArray(c.doc_ids) && !c.doc_ids.length && !c.folder_ids?.length;
-    setScope({ docs: c.doc_ids || [], folders: c.folder_ids || [] }, gone ? 1 : 0, false);
+    setScope({ docs: c.doc_ids || [], folders: c.folder_ids || [] }, gone ? 1 : 0, Array.isArray(c.folder_ids));
     pruneScope();
   }
   drawChat(c);
@@ -1295,12 +1296,8 @@ async function ask(question) {
   };
   try {
     if (scopeGone) throw new Error(GONE);  // never every document unasked
-    // A folder with nothing in it: said here, without sending (the server says so too).
-    if (scope.folders.length && !scope.docs.length && scopeCount() === 0) {
-      const names = scope.folders.map(folderName);
-      throw new Error(names.length === 1 ? `${names[0]} has no documents yet. Add some, or ✕ to ask all documents.`
-        : `These folders have no documents yet: ${names.join(', ')}. Add some, or ✕ to ask all documents.`);
-    }
+    // A folder with nothing in it is the server's to say (it looks at the folder now): this page's
+    // listing may be older than an upload made into it from another tab or device.
     const req = { question, model: $('chatModel').value, ...(scope.docs.length ? { doc_ids: scope.docs } : {}),
                   ...(scope.folders.length ? { folder_ids: scope.folders } : {}), ...(chat ? { conversation_id: chat.id } : {}) };
     asking = question;

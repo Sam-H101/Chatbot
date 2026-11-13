@@ -500,7 +500,9 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
     Unfiled if not (with a note); else, uploaded into Unfiled with `auto_file` on and a
     "high" `confidence`, the existing folder the path `suggestion` names ("auto"; folders
     are never made here); else Unfiled with the suggestion kept for the user to accept.
-    The job's result gains folder_id, filed, suggested_folder, suggestion_exists and
+    With `job`, folder_id and auto_file are those its row holds now, not the caller's: a
+    folder deleted while the job was being read redirected it (_retarget_uploads). The
+    job's result gains folder_id, filed, suggested_folder, suggestion_exists and
     folder_note."""
     if data is not None:
         sha, size = sha or file_hash(data), len(data)
@@ -531,6 +533,10 @@ def add_document(filename, chunks, meta, analysis, model="", data=None, mime=Non
                         if newest["folder_id"] not in folders.rows:  # Unfiled: a re-read's rule, never moved
                             place.update(folder_id=None, filed_by=None, suggested_folder=suggestion)
                         filed = "kept"
+                if job:
+                    stored = con.execute("SELECT options FROM jobs WHERE id=?", (job[0],)).fetchone()
+                    opts = json.loads(stored[0]) if stored and stored[0] else {}
+                    folder_id, auto_file = opts.get("folder_id", folder_id), bool(opts.get("auto_file", auto_file))
                 if not old:
                     if folder_id is not None:
                         if folder_id in folders.rows:
@@ -806,6 +812,10 @@ def delete_documents(ids):
 # folder inside itself, no document in a deleted folder) without foreign keys.
 
 FOLDER_NAME_CHARS = 100
+# Levels of folders, the top level counting as one: each listed folder carries its whole path,
+# so an unbounded depth (one request with a path of thousands of levels) would make the folder
+# listing grow with its square.
+FOLDER_DEPTH = 20
 _KEEP = object()  # update_folder: leave as it is
 
 
@@ -824,6 +834,11 @@ class MissingFolder(FolderError, LookupError):
 
 class FolderCycle(FolderError):
     def __init__(self, message="A folder can't go inside itself or one of its own folders"):
+        super().__init__(message)
+
+
+class TooDeep(FolderError):
+    def __init__(self, message=f"Folders go {FOLDER_DEPTH} levels deep at most"):
         super().__init__(message)
 
 
@@ -967,12 +982,15 @@ def _insert_folder(con, name, parent_id):
 
 def add_folder(name, parent_id=None):
     """Make a folder in `parent_id` (None: the top level) and return it. BadFolderName,
-    MissingFolder (the parent), FolderConflict."""
+    MissingFolder (the parent), TooDeep, FolderConflict."""
     name = clean_folder_name(name)
     with files_lock:
         with connect() as con:
-            if parent_id is not None and not _folder_exists(con, parent_id):
-                raise MissingFolder()
+            if parent_id is not None:
+                if not _folder_exists(con, parent_id):
+                    raise MissingFolder()
+                if len(_ancestors(con, parent_id)) >= FOLDER_DEPTH:
+                    raise TooDeep()
             _conflict(con, parent_id, name)
             folder_id = _insert_folder(con, name, parent_id)
             return _folder_list(con, folder_id)[0]
@@ -985,10 +1003,20 @@ def _ancestors(con, folder_id):
         " WHERE f.parent_id IS NOT NULL) SELECT id FROM up", (folder_id,))}
 
 
+def _height(con, folder_id):
+    """Levels of folders from this one down to its deepest, itself counting as one (counted
+    no further than one past FOLDER_DEPTH)."""
+    return con.execute(
+        "WITH RECURSIVE sub(id, depth) AS (SELECT ?, 1 UNION SELECT f.id, sub.depth + 1 FROM folders f"
+        " JOIN sub ON f.parent_id = sub.id WHERE sub.depth <= ?) SELECT max(depth) FROM sub",
+        (folder_id, FOLDER_DEPTH)).fetchone()[0]
+
+
 def update_folder(folder_id, name=_KEEP, parent_id=_KEEP):
     """Rename a folder and/or move it into `parent_id` (None: the top level), and return it.
     A rename that only changes case is allowed. MissingFolder (it, or the new parent),
-    FolderCycle (into itself or one of its own folders), BadFolderName, FolderConflict."""
+    FolderCycle (into itself or one of its own folders), TooDeep (its deepest folder would
+    be more than FOLDER_DEPTH levels down), BadFolderName, FolderConflict."""
     with files_lock:
         with connect() as con:
             row = con.execute("SELECT name, parent_id FROM folders WHERE id=?", (folder_id,)).fetchone()
@@ -999,8 +1027,11 @@ def update_folder(folder_id, name=_KEEP, parent_id=_KEEP):
             if parent_id is not None:
                 if not _folder_exists(con, parent_id):
                     raise MissingFolder()
-                if folder_id in _ancestors(con, parent_id):
+                above = _ancestors(con, parent_id)
+                if folder_id in above:
                     raise FolderCycle()
+                if parent_id != row["parent_id"] and len(above) + _height(con, folder_id) > FOLDER_DEPTH:
+                    raise TooDeep()
             _conflict(con, parent_id, name, but=folder_id)
             if (name, parent_id) != (row["name"], row["parent_id"]):
                 try:
@@ -1056,7 +1087,10 @@ def scope_folders(folder_ids):
 
 def _ensure_path(con, segments):
     """Walk a folder path from the top level, matching each level ignoring case, and make the
-    folders missing from it. Returns (its folder id, ids of the folders made)."""
+    folders missing from it. Returns (its folder id, ids of the folders made). TooDeep for
+    a path of more than FOLDER_DEPTH levels."""
+    if len(segments) > FOLDER_DEPTH:
+        raise TooDeep()
     parent, created = None, []
     for raw in segments:
         name = clean_folder_name(raw)
@@ -1125,10 +1159,13 @@ def _forget_folders(con, ids):
 
 def _retarget_uploads(con, ids, folder_id):
     """Uploads not saved yet (queued, waiting, running, or failed and so retryable) whose
-    destination is one of these folders go to `folder_id` instead (None: Unfiled)."""
+    destination is one of these folders go to `folder_id` instead (None: Unfiled). They
+    were made into a folder, so auto-filing is turned off for them: one sent on to Unfiled
+    stays there, as the delete dialog says, rather than being filed somewhere else."""
     marks = ",".join("?" * len(HOLDING_JOBS))
     return con.execute(
-        f"UPDATE jobs SET options=json_set(options, '$.folder_id', ?), updated_at=datetime('now')"
+        f"UPDATE jobs SET options=json_set(options, '$.folder_id', ?, '$.auto_file', json('false')),"
+        f" updated_at=datetime('now')"
         f" WHERE kind='upload' AND status IN ({marks}) AND json_extract(options, '$.folder_id')"
         f" IN (SELECT value FROM json_each(?))", (folder_id, *HOLDING_JOBS, json.dumps(list(ids)))).rowcount
 
@@ -1273,6 +1310,18 @@ def update_job(job_id, when=("running",), **fields):
     with connect() as con:
         return con.execute(f"UPDATE jobs SET {sets}updated_at=datetime('now') WHERE id=? AND status IN ({marks})",
                            (*fields.values(), job_id, *when)).rowcount > 0
+
+
+def set_job_options(job_id, when=("running",), **values):
+    """Set these keys of a job's options, leaving the others as the row holds them now (a
+    folder delete may have changed its destination since the job was claimed). False if
+    its status isn't one of `when`."""
+    sets = "".join(", ?, json(?)" for _ in values)
+    marks = ",".join("?" * len(when))
+    args = [x for k, v in values.items() for x in (f"$.{k}", json.dumps(v))]
+    with connect() as con:
+        return con.execute(f"UPDATE jobs SET options=json_set(IFNULL(options, '{{}}'){sets}), updated_at=datetime('now')"
+                           f" WHERE id=? AND status IN ({marks})", (*args, job_id, *when)).rowcount > 0
 
 
 def job_status(job_id):

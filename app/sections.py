@@ -47,9 +47,9 @@ META_SCHEMA = {
         "currency": {"type": "string", "description": "ISO 4217 code of total_amount (GBP, EUR, USD...), or \"\""},
         "due_date": {"type": "string", "description": "Bills and invoices: the payment due date as YYYY-MM-DD; "
                      "otherwise \"\""},
-        "folder": {"type": "string", "description": "Where to file it: one of the listed folder paths if it clearly "
-                   "belongs there, otherwise a short new category (1-3 words, plural noun, e.g. Receipts), never the "
-                   "document's own title; \"\" if unsure"},
+        "folder": {"type": "string", "description": "Where to file it: one of the listed folder paths if that folder "
+                   "is named for what the document is or is about, otherwise a short new category (1-3 words, plural "
+                   "noun, e.g. Receipts), never the document's own title; \"\" if unsure"},
         "folder_confidence": {"type": "string", "enum": ["high", "low"]},
     },
     "required": ["title", "doc_type", "summary", "keywords", "document_date", "vendor", "total_amount", "currency",
@@ -67,12 +67,17 @@ DETAILS_GUIDANCE = (
 # shows them to the model: told only there, qwen3.5:9b wrote "3 November 2026" for a date and
 # filed a receipt as "Household/Bills/Receipts" beside an existing "Receipts". Told here, it
 # wrote 2026-11-03, chose the listed folder that fit (the deepest one, Receipts/2026, where
-# there was one), and gave "" for a manual with no folder to fit.
+# there was one), and gave "" for a manual with no folder to fit. Asked only whether a folder
+# "clearly fits", it was sure a home insurance policy fitted Bills and barn notes fitted
+# Tractor/Manuals, so a folder must be named for what the document is or is about (jobs._related
+# checks that before anything is filed).
 FIELD_RULES = (
     "Write dates as YYYY-MM-DD (3 November 2026 is 2026-11-03) and total_amount as digits with a dot for decimals "
-    "(1234.50).\nfolder: where to file it. If one of the existing folders below clearly fits, copy its path exactly as "
-    "listed. Otherwise give a short new category (1-3 words, plural noun, e.g. Receipts), never the document's own "
-    "title; \"\" if unsure. folder_confidence: high only when you are sure.")
+    "(1234.50).\nfolder: where to file it. If one of the existing folders below is named for what this document is "
+    "or what it is about, copy its path exactly as listed; a folder that could merely hold it does not fit (a "
+    "warranty is not a receipt). Otherwise give a short new category naming what it is (1-3 words, plural noun, e.g. "
+    "Receipts), never the document's own title; \"\" if unsure. folder_confidence: high only when a listed folder is "
+    "named for this kind of document or its subject; low for a new category or when unsure.")
 NOTES_SCHEMA = {
     "type": "object",
     "properties": {

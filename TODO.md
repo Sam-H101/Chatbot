@@ -394,6 +394,29 @@ Everything below is committed (as of 2026-11-12, the Documents view included); n
   and the detail's five-button bar fitting at 320 px and hiding while a field has focus. Found and fixed on the way:
   the list's sticky header sat over the first row (a scrolling wrapper), the Markdown nesting cap allowed 7 levels,
   the phone-only Uploads box and scope toggle showed on desktop, the Add box overflowed with the model picker
+- 2026-11-12: Review fixes for the documents and folders overhaul. An upload being read when its folder was deleted
+  landed in Unfiled: the worker saved with the options it had claimed the job with. `add_document` now reads the
+  job's folder and `auto_file` from its row inside its transaction, and Auto's switch to Claude writes only its own
+  keys (`db.set_job_options`, `json_set`) instead of the whole stale dict. Uploads redirected by a folder delete get
+  `auto_file` false, so one sent to Unfiled is no longer auto-filed elsewhere. Auto-filing also needs the folder to be
+  named for the document (`jobs._related`: a word of the folder's name matches its type, title, vendor or keywords,
+  plurals, endings and accents aside), and the prompt says so; `qwen3.5:9b` had filed a home insurance policy into
+  Bills and barn notes into Tractor/Manuals. An auto-filed upload's row stays until hidden. Amounts: "1,234.56",
+  "12,000,000", "GBP 42.10" and "42.10 GBP" are read (a code or £/€ gives a missing currency); the detail's Total
+  takes the same forms and asks about "1,500" instead of saving 1.5. Phone JPEGs that Pillow opens as MPO (iPhone gain
+  maps, Android and camera JPEGs) are accepted as JPEGs. Folders go 20 levels deep at most (one request had made
+  3,000 and a 33 MB folder listing). A UTF-8 BOM is dropped when indexing and previewing (`utf-8-sig`, and in
+  `md.js`). The page: the ⋯/right-click menu of one of several selected documents acts on them all; Undo of a move
+  removes the folders it made if still empty; deleting a folder in move mode no longer leaves a surviving subfolder
+  being viewed; "Everywhere" resets in each place and the box says "Search everywhere…"; the count follows Include
+  subfolders; a finished re-read redraws the open preview; an amount read without a currency counts as the others'
+  when they share one (the tooltip says so); the filter gains Read by and Not fully analyzed; the empty-folder check
+  is left to the server (the page's listing could be older); a saved conversation whose folder was deleted says
+  "Chosen folder deleted". README's stale "Not done yet" line replaced. 251 tests pass (7 new, 1 changed for the name
+  check). Staging, real models: 17 API checks (the redirect mid-read, auto-filing of 5 files, an MPO receipt read by
+  minicpm-v4.6, a BOM file, depth, empty folder) and 27 Playwright checks pass (1440 light, 1024 and 390/320 dark),
+  screenshots looked at; the only console entry is the empty folder's intended 400. No finding was rejected; the old
+  table's Read by and Analysis columns came back as filters rather than columns
 
 ## To do
 

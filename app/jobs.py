@@ -375,11 +375,10 @@ def _process(job):
         if job["kind"] == "reread":
             db.replace_document(job["doc_id"], chunks, meta, analysis, label(*who), units=check, job=(job_id, result),
                                 pages=pages, vectors=vecs, details=info, suggestion=info["folder"])
-        else:
+        else:  # its folder and auto_file: as its row holds them when it is saved (a folder delete redirects it)
             db.add_document(job["filename"], chunks, meta, analysis, label(*who), sha=job["sha256"],
                             size=job["file_size"], mime=job["mime"], replace=opts.get("on_duplicate") == "replace",
                             units=check, job=(job_id, result), pages=pages, vectors=vecs, details=info,
-                            folder_id=opts.get("folder_id"), auto_file=bool(opts.get("auto_file")),
                             suggestion=info["folder"], confidence=info["confidence"])
         status = "done"
     except AwaitConfirmation:
@@ -406,6 +405,8 @@ def _process(job):
 
 
 _AMOUNT = re.compile(r"-?\d{1,12}([.,]\d{1,4})?")
+_GROUPED = re.compile(r"-?\d{1,3}(,\d{3})+(\.\d{1,4})?")  # commas grouping thousands: 1,234.56 or 12,000,000
+_SIGNS = {"£": "GBP", "€": "EUR"}  # the currency a sign names for certain ($ and ¥ stand for several)
 
 
 def _details(meta):
@@ -413,23 +414,35 @@ def _details(meta):
     {document_date, vendor, total_amount, currency, due_date, folder, confidence}, None for
     anything missing or not what it should be. Older readings and test fakes lack the keys.
     Dates must be real YYYY-MM-DD dates (1900-2100). An amount is digits with a dot, or a
-    comma when there is no dot, for decimals (currency signs and spaces dropped); a comma
-    before exactly three digits could be a thousands separator ("1,234"), so it is left
-    out, as is "1.234,50". The currency, three letters, is kept only with an amount. The
-    folder is a path of at most 3 clean names (db.clean_folder_name: bad levels dropped);
-    its confidence is "high" only when the model said so."""
+    comma when there is no dot, for decimals (currency signs and spaces dropped). Commas
+    grouping thousands are dropped where they can't be decimals: before a dot ("1,234.56")
+    or more than one ("12,000,000"). A lone comma before exactly three digits could be
+    either ("1,234"), so that amount is left out, as is "1.234,50". A currency code written
+    with the amount ("GBP 42.10", "42.10 GBP") is taken off it. The currency, three letters,
+    is kept only with an amount; with none given, the code written with the amount, or a
+    sign that names one currency (£, €), gives it. The folder is a path of at most 3 clean
+    names (db.clean_folder_name: bad levels dropped); its confidence is "high" only when
+    the model said so and the folder is named for what the document is (_related)."""
     def text(key):
         value = meta.get(key, "")
         if isinstance(value, (int, float)) and not isinstance(value, bool):  # an amount given as a number
             value = str(value)
         return value.strip() if isinstance(value, str) else ""
 
-    raw = "".join(c for c in text("total_amount") if not c.isspace() and unicodedata.category(c) != "Sc")
+    written, code = text("total_amount"), ""
+    if m := re.fullmatch(r"([A-Za-z]{3})\s*([^A-Za-z]+)", written):
+        code, written = m[1], m[2]
+    elif m := re.fullmatch(r"([^A-Za-z]+?)\s*([A-Za-z]{3})", written):
+        written, code = m[1], m[2]
+    signs = {_SIGNS[c] for c in written if c in _SIGNS}
+    raw = "".join(c for c in written if not c.isspace() and unicodedata.category(c) != "Sc")
+    if _GROUPED.fullmatch(raw) and ("." in raw or raw.count(",") > 1):
+        raw = raw.replace(",", "")
     amount = None
     if _AMOUNT.fullmatch(raw) and not re.search(r",\d{3}$", raw):
         value = float(raw.replace(",", "."))
         amount = value if math.isfinite(value) and abs(value) < 1e12 else None
-    currency = text("currency").upper()
+    currency = text("currency").upper() or code.upper() or (next(iter(signs)) if len(signs) == 1 else "")
     vendor = " ".join(text("vendor").split())[:200].strip()
     folder = []
     for segment in text("folder").split("/"):
@@ -437,10 +450,49 @@ def _details(meta):
             folder.append(db.clean_folder_name(segment))
         except db.BadFolderName:
             continue
+    path = "/".join(folder[:3]) or None
+    sure = meta.get("folder_confidence") == "high" and path is not None and _related(path, meta)
     return {"document_date": db.parse_date(text("document_date")), "due_date": db.parse_date(text("due_date")),
             "vendor": vendor or None, "total_amount": amount,
             "currency": currency if amount is not None and re.fullmatch(r"[A-Z]{3}", currency) else None,
-            "folder": "/".join(folder[:3]) or None, "confidence": "high" if meta.get("folder_confidence") == "high" else "low"}
+            "folder": path, "confidence": "high" if sure else "low"}
+
+
+# Words that name no kind of document or subject, so a folder can't be matched by them.
+_FILLER = {"the", "and", "for", "with", "from", "our", "your", "misc", "other", "document", "file", "stuff", "thing"}
+
+
+def _stems(*texts):
+    """The words of these texts as filing compares them: lower case, accents dropped, of 3
+    letters or more, plurals made singular (receipts, policies, boxes: receipt, policy, box)."""
+    out = set()
+    for t in texts:
+        t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c)).casefold()
+        for w in re.findall(r"[^\W\d_]{3,}", t):
+            if len(w) > 4 and w.endswith("ies"):
+                w = w[:-3] + "y"
+            elif len(w) > 4 and w.endswith(("sses", "xes", "ches", "shes", "zes")):
+                w = w[:-2]
+            elif len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+                w = w[:-1]
+            if w not in _FILLER:
+                out.add(w)
+    return out
+
+
+def _related(path, meta):
+    """Whether a folder the analysis is sure of is named for what the document is or is about:
+    a word of its name (that of its last level with letters, so Receipts names "Receipts/2026")
+    matches one of the document's type, title, vendor or keywords, plurals and endings aside
+    (receipts and receipt, bill and billing). Being sure isn't enough on its own: qwen3.5:9b,
+    sure of itself, filed a home insurance policy into Bills and barn notes into Tractor/Manuals,
+    folders that could merely hold them. Such a suggestion is kept for the user instead."""
+    name = next((s for s in reversed(path.split("/")) if re.search(r"[^\W\d_]", s)), "")
+    keywords = meta.get("keywords")
+    keywords = [str(k) for k in keywords] if isinstance(keywords, list) else [str(keywords or "")]
+    doc = _stems(*(str(meta.get(k) or "") for k in ("doc_type", "title", "vendor")), *keywords)
+    return any(a == b or (min(len(a), len(b)) >= 4 and (a.startswith(b) or b.startswith(a)))
+               for a in _stems(name) for b in doc)
 
 
 def _fail(job_id, error):
@@ -513,8 +565,9 @@ def _read(job, opts, data, progress, on_usage):
         except ollama.OllamaError as e:
             if not key:
                 raise
-            opts.update(fallback="read" if text is None else "analyze", switched=f"local model failed ({e})")
-            if not db.update_job(job["id"], options=opts):
+            switch = {"fallback": "read" if text is None else "analyze", "switched": f"local model failed ({e})"}
+            opts.update(switch)
+            if not db.set_job_options(job["id"], **switch):  # only these: its folder may have changed since
                 raise Cancelled()
     return with_claude(llm.MODEL, text)
 
