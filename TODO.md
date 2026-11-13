@@ -441,12 +441,26 @@ Everything below is committed (as of 2026-11-12, the Documents view included); n
   shows why). 251 tests pass. Staging: before/after screenshots at 1600, 1024, 880, 390 and 320 px in both themes
   looked at, and a Playwright flow (create a folder, upload three files, move one, ask about the folder with
   `qwen3.5:9b`, the scope dialog, selection and upload on a phone) passed
+- 2026-11-13: Deployed the documents and folders overhaul (97b6e3c) to the live app, after backing up the library to
+  `/data/metabase-before-folders-20261112.db` and tagging the previous image `chatbot-chatbot:before-folders`. Created
+  folders Tractor, Receipts and Bills through the API and moved the 14 manuals into Tractor. Live checks passed: a
+  generated receipt photo was read by minicpm-v4.6 (vendor, date, $42.17 USD) and auto-filed into Receipts; a
+  hostile .md upload previewed safely; a Tractor-scoped streamed answer cited Tractor documents; thumbnails, search,
+  usage and backups work; Playwright at 1280 and 390 px in both themes had no console errors; the LAN address answers.
+  All test data was removed. A read-only UX pass found no breakage but these follow-ups (not fixed yet): search
+  snippet highlighting splits on a "[" inside a passage (docs.js); snippets show raw markdown/`<br>`; keyboard focus
+  drops to the page after sorting a list column, opening a detail panel at tablet/phone widths, opening an empty
+  folder, and "Ask about this folder" on touch widths; placeholder icons repeat a clipped document type; long types
+  hide the date on cards and are cut without an ellipsis in the detail panel; type capitalisation is inconsistent and
+  the library has six near-duplicate manual types; a folder tile hides its count while focused; the floating "+ Add"
+  button covers the last card or row on phones and at 768 px; clearing the scope chip on a phone focuses the question
+  box (pops the keyboard); a few light-theme labels are just under 4.5:1 contrast; 320 px truncations; wording nits
+  ("and Unfiled" when it is empty, "and its subfolders" when there are none), Back focusing the first folder, two
+  Move buttons in the detail panel.
 
 ## To do
 
-- Deploy the documents and folders overhaul (the backend commit a964259 and the Documents view after it) to the live
-  app. Neither is deployed yet. The live library's 14 documents will show in Library as Unfiled with typed icons
-  (they have no kept originals, so no thumbnails); the first-run tip and "New folder from these" file them.
+- Fix the UX follow-ups from the 2026-11-13 read-only pass (see the log), then redeploy.
 - Install the port proxy task once, from an elevated PowerShell (README, "Reach it from the LAN").
 - Decide the backup time zone: nightly backups run at 03:00 UTC (10 or 11 p.m. Eastern) unless `TZ` is set in `.env`
   (e.g. `TZ=America/New_York`, then `docker compose up -d backup`).
@@ -457,19 +471,19 @@ Everything below is committed (as of 2026-11-12, the Documents view included); n
   re-read or opened, and they have no page numbers: uploading a manual again (and deleting its old copy) gives it both.
 - Once the new version has proven itself, delete the pre-deploy copies: `/data/metabase-before-enhancements-20261112.db`
   in the volume (97 MB) and `~/chatbot-predeploy/` in WSL.
-- Before pushing: ae11627, 42a0a88, c31bf23, 3e9eb52 and 7a86b66 end with a `Co-Authored-By: Claude` trailer. Removing
-  it means rewording those commits (a history rewrite of 2ca20b9..master), which needs the owner's go-ahead.
-- Push, when wanted.
-- Done: the enhancement plan is deployed (see the log). The Windows NVIDIA driver is 582.78 and Ollama runs on the GPU
+- Push, when wanted (no commit carries an AI attribution trailer; those were reworded before anything was pushed).
+- Done: the enhancement plan and the documents and folders overhaul are deployed (see the log). The Windows NVIDIA driver is 582.78 and Ollama runs on the GPU
   (GTX 1080 Ti). The UI has been checked in a browser, light and dark, at phone widths (Playwright, see the log).
   Everything is committed.
 
 ## Left on the machine
 
-- Containers `chatbot-chatbot-1` (the enhancement plan, deployed 2026-11-12), `chatbot-backup-1` and `chatbot-ollama-1`
+- Containers `chatbot-chatbot-1` (the documents and folders overhaul, deployed 2026-11-13), `chatbot-backup-1` and `chatbot-ollama-1`
   are running inside WSL `vostok`, with `restart: unless-stopped`; the library is in volume `chatbot_metabase`, the
   nightly snapshots in `chatbot_backups`.
-- A way back: the old code is tagged `chatbot-chatbot:894b984` and runs on the migrated library. In the repo folder in
+- A way back from the folders overhaul: the previous version is tagged `chatbot-chatbot:before-folders` (use it in the
+  command below in place of `894b984`); the library from just before that deploy is `/data/metabase-before-folders-20261112.db`.
+- A way back to before the enhancement plan: the old code is tagged `chatbot-chatbot:894b984` and runs on the migrated library. In the repo folder in
   WSL: `docker compose stop chatbot backup`, then `docker run -d --name chatbot-rollback --restart unless-stopped
   --network chatbot_default -p 0.0.0.0:8000:8000 -v chatbot_metabase:/data --env-file .env chatbot-chatbot:894b984`.
   Copies of the library from just before the deploy are in the volume (`/data/metabase-before-enhancements-20261112.db`)
