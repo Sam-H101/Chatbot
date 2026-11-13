@@ -646,7 +646,11 @@ function sendFile(path, body, onProgress) {
 // target: {folder_id: id or null (Unfiled), auto_file}; uploadTarget() (docs.js) is where the
 // page is: the folder shown in Documents, else Unfiled.
 async function uploadAll(files, target = uploadTarget()) {
-  for (const f of files) await uploadOne(f, '', null, target);
+  for (const [i, f] of files.entries()) {
+    const done = uploadOne(f, '', null, target);  // its row is in the queue once this returns
+    if (!i && typeof revealUploads === 'function') revealUploads();
+    await done;
+  }
 }
 
 // onDuplicate: '' (the server answers 409 if the file is already in the library),
@@ -778,6 +782,7 @@ function setScope(next, gone = 0, goneFolders = false) {
   store.set('chatScopeGone', gone ? String(gone) : '');
   store.set('chatScopeGoneF', gone && goneFolders ? '1' : '');
   showScope();
+  if (typeof renderTree === 'function') renderTree();  // the tree marks the folders asked about
 }
 
 function scopeTitle() {
@@ -791,11 +796,12 @@ function scopeTitle() {
 }
 
 function showScope() {
-  const on = !scopeAll(), b = $('scopebtn'), text = scopeText();
+  const on = !scopeAll(), b = $('scopebtn'), text = scopeText(), one = !scopeGone && scope.folders.length === 1 && !scope.docs.length;
   $('scopechip').classList.toggle('on', on);
   $('scopechip').classList.toggle('gone', !!scopeGone);
+  $('question').placeholder = one ? `Ask about ${folderName(scope.folders[0])}…` : 'Ask about your documents…';
   b.replaceChildren();
-  if (!scopeGone && scope.folders.length === 1 && !scope.docs.length) b.append(icon('folder'));
+  if (one) b.append(icon('folder'));
   b.append(text);
   b.title = scopeTitle();
   b.setAttribute('aria-label', `Ask ${text}. ${b.title}`);
@@ -1121,7 +1127,7 @@ function emptyState() {
     box.append(el('h2', '', 'Ask your documents anything.'), hint);
   }
   const ideas = el('div', 'ideas');
-  for (const t of IDEAS) ideas.append(Object.assign(el('button', '', t), { type: 'button', onclick: () => ask(t) }));
+  for (const t of f != null ? [`Summarise everything in ${folderName(f)}`, ...IDEAS.slice(1)] : IDEAS) ideas.append(Object.assign(el('button', '', t), { type: 'button', onclick: () => ask(t) }));
   box.append(ideas);
   $('log').replaceChildren(box);
 }

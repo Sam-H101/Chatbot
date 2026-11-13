@@ -163,6 +163,12 @@ function pathText(fid) {
   const f = lib.folders.get(fid);
   return f?.names ? f.names.join(' › ') : lib.loaded ? 'a deleted folder' : 'a folder';
 }
+// One line's worth of a path: the last two folders, after "… ›" when it is deeper. The full path
+// goes in the title.
+function shortPath(fid) {
+  const f = fid != null && lib.folders.get(fid);
+  return f?.names && f.names.length > 2 ? `… › ${f.names.slice(-2).join(' › ')}` : pathText(fid);
+}
 const folderTotal = id => lib.loaded && lib.folders.has(id) ? lib.folders.get(id).total : null;
 // An existing folder for a path like "Household/Bills" (each level compared ignoring case), or null.
 function findPath(path) {
@@ -329,10 +335,12 @@ function uploadTarget() {
 }
 function syncInto() {
   const t = uploadTarget(), f = t.folder_id != null && lib.folders.get(t.folder_id);
-  $('intoname').textContent = f ? pathText(f.id) : `Unfiled${t.auto_file ? ' · auto-file' : ''}`;
+  $('intoname').textContent = f ? shortPath(f.id) : `Unfiled${t.auto_file ? ' · auto-file' : ''}`;
+  $('into').title = f ? pathText(f.id) : '';
   $('autoFileBox').hidden = !!f;
   $('staynote').hidden = !f;
   $('staynote').textContent = f ? `Uploads here stay in ${f.name}` : '';
+  $('staynote').title = f ? `Uploads here stay in ${f.name}` : '';
   $('avtitle').textContent = `Add to ${f ? f.name : 'Unfiled'}`;
 }
 $('autoFile').checked = autoFileOn();
@@ -392,7 +400,9 @@ function renderTree() {
   const t = $('tree'), focused = t.contains(document.activeElement) ? document.activeElement.closest('.tnode')?.dataset.key : null;
   if (!lib.loaded) { t.replaceChildren(el('li', 'tnote', lib.error ? `Couldn't load: ${lib.error}` : 'Loading…')); return; }
   const cur = view.mode === 'docs' ? placeKey(view.place) : null;
-  const node = o => treeNode(o, cur);
+  // In Chat, the folders questions are limited to are marked.
+  const asked = new Set(view.mode !== 'docs' && !scopeGone ? scope.folders : []);
+  const node = o => { const li = treeNode(o, cur); if (asked.has(o.folder)) li.classList.add('inscope'); return li; };
   const root = node({ key: 'root', label: 'Library', ic: 'home', level: 1, count: lib.docs.size, drop: 'root', expanded: true, fixed: true });
   const group = el('ul');
   group.setAttribute('role', 'group');
@@ -442,13 +452,14 @@ function treeNode({ key, label, ic, level, count, drop, expanded, title, folder,
   if (title) row.title = title;
   const chev = el('span', 'chev' + (expanded === undefined || fixed ? ' none' : ''));
   chev.append(icon('chev'));
-  row.append(chev, icon(ic), el('span', 'tname', label), el('span', 'tcount', String(count)));
-  if (dot) row.append(el('span', 'tdot'));
+  const n = el('span', 'tcount', String(count));
+  if (dot) n.append(el('span', 'tdot'));
+  row.append(chev, icon(ic), el('span', 'tname', label), n);
   const askLabel = folder != null ? `Ask about ${label}` : key === 'unfiled' ? `Ask about the ${plural(count, 'Unfiled document')}` : 'Ask all documents';
   const ask = btn('', null, { cls: 'tbtn ask', aria: askLabel, title: askLabel, icon: 'chat' });
   const more = btn('', null, { cls: 'tbtn more', aria: `More for ${label}`, title: 'More actions', icon: 'more' });
   ask.tabIndex = more.tabIndex = -1;
-  if (key === 'unfiled' && !count) ask.disabled = true;
+  if ((key === 'unfiled' || folder != null) && !count) { ask.disabled = true; ask.title = `${label} has no documents yet`; }
   row.append(ask, more);
   if (folder != null && fine.matches) row.draggable = true;
   li.append(row);
@@ -664,12 +675,12 @@ function renderHead(L) {
       return li;
     };
     const items = [crumb('Library', { type: 'root' }, 'root')];
-    const keep = S ? 1 : 3;
+    const keep = S ? 1 : 5;
     let shown = chain;
     if (chain.length > keep + (S ? 1 : 0)) {  // the middle folds into "…"
       const hidden = chain.slice(S ? 0 : 1, chain.length - (S ? 1 : 2));
       shown = S ? chain.slice(-1) : [chain[0], ...chain.slice(-2)];
-      const li = el('li'), more = btn('…', () => openMenu({ anchor: more, title: 'Folders above', items: hidden.map(f => ({ label: f.name, icon: 'folder', onclick: () => openPlace({ type: 'folder', id: f.id }) })) }), { aria: 'More folders above', title: hidden.map(f => f.name).join(' › ') });
+      const li = el('li'), more = btn('…', () => openMenu({ anchor: more, title: 'Folders above', items: hidden.map((f, i) => ({ label: f.name, icon: 'folder', indent: i, onclick: () => openPlace({ type: 'folder', id: f.id }) })) }), { aria: 'More folders above', title: hidden.map(f => f.name).join(' › ') });
       li.append(more);
       const at = S ? 0 : 1;
       shown.forEach((f, i) => { if (i === at) items.push(li); items.push(crumb(f.name, { type: 'folder', id: f.id }, 'f' + f.id)); });
@@ -690,9 +701,17 @@ function renderHead(L) {
     ask.title = 'Questions search these documents only; documents added to Unfiled later aren\'t included';
     ask.disabled = !n;
   } else { long.textContent = 'Ask all documents'; short.textContent = 'Ask all'; ask.title = 'Questions search every document'; }
+  if (p.type === 'folder' && lib.loaded && !folderTotal(p.id)) {  // the server would refuse: nothing to search
+    ask.disabled = true;
+    ask.title = `${placeName(p)} has no documents yet`;
+  }
+  ask.setAttribute('aria-label', long.textContent);  // a narrow phone shows only the icon
   $('dcounttext').textContent = L.searching || filtersOn() ? `${plural(L.docs.length, 'document')} shown` + (filtersOn() && !L.searching ? ` of ${L.unfiltered}` : '') : countText();
   const t = totals(L.docs);
-  $('dtotal').textContent = t ? ` · Total ${t.text}` : '';
+  // Library lists only the Unfiled documents, so its total is theirs. No-break spaces keep the dot
+  // with the count, and the total in one piece, when the line wraps.
+  const nb = String.fromCharCode(0xa0);
+  $('dtotal').textContent = t ? `${nb}· ${p.type === 'root' && !L.searching ? `Unfiled${nb}total` : 'Total'}${nb}${t.text}` : '';
   $('dtotal').title = t ? totalsTitle(t) : '';
   const sub = p.type === 'folder' && lib.kids.get(p.id)?.length > 0;
   $('dflatbox').hidden = !sub;
@@ -732,6 +751,8 @@ function renderTools(L) {
   $('dsortshort').textContent = rel ? 'Relevance' : `${SHORT_SORT[k]} ${arrow}`;
   $('dsort').setAttribute('aria-label', rel ? 'Sorted by relevance. Change the sort' : `Sorted by ${SORTS[k][0].toLowerCase()}, ${SORTS[k][dir === 'desc' ? 2 : 1].toLowerCase()}. Change the sort`);
   for (const b of $('dlayout').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.v === view.layout));
+  // A place with nothing in it (an empty folder, say): no Filter, Sort, layout or Select to try.
+  $('dtools').classList.toggle('bare', lib.loaded && !L.unfiltered && !L.folders.length && !L.searching && !filtersOn());
 }
 
 // Search: an instant match here on every keystroke, then the server's (titles and text) after a pause.
@@ -868,7 +889,7 @@ function renderSuggest() {
   const rows = (suggestAll ? list : list.slice(0, 3)).map(g => {
     const fid = findPath(g.path), where = g.path.split('/').join(' › '), n = g.ids.length;
     const row = el('div', 'finding sugrow'), what = el('span', 'what');
-    what.append(el('b', '', where), fid == null ? ' · new folder' : '', ` · ${plural(n, 'document')}`);
+    what.append(el('span', 'label', 'Suggested'), el('b', '', where), fid == null ? ' · new folder' : '', ` · ${plural(n, 'document')}`);
     row.append(what,
       btn(fid == null ? `Create and move ${n}` : `Move ${n}`, () => fid == null ? moveDocs(g.ids, null, { path: g.path }) : moveDocs(g.ids, fid),
         { cls: 'primary', title: fid == null ? `Create ${where} and move ${plural(n, 'document')} into it` : `Move ${plural(n, 'document')} to ${where}` }),
@@ -931,6 +952,7 @@ function folderTile(f, match = false) {
   const t = el('div', 'tile' + (match ? ' match' : ''));
   t.setAttribute('role', 'listitem');
   t.tabIndex = -1;
+  t.title = f.names.join(' › ');
   t.dataset.nav = 'f' + f.id;
   t.dataset.drop = 'f' + f.id;
   t.setAttribute('aria-label', `Folder ${f.name}, ${plural(f.total, 'document')}${match ? `, in ${f.names.slice(0, -1).join(' › ') || 'Library'}` : ''}`);
@@ -978,7 +1000,7 @@ function docCard(d, L) {
   if (d.total_amount != null || d.vendor || due) {
     const a = el('div', 'camt');
     if (d.total_amount != null) a.append(el('span', 'amt', fmtAmount(d.total_amount, d.currency)));
-    if (d.vendor) a.append(el('span', 'vend', d.vendor));
+    if (d.vendor && !norm(docTitle(d)).startsWith(norm(d.vendor))) a.append(el('span', 'vend', d.vendor));  // not twice
     if (due) a.append(el('span', 'due' + (due.soon ? ' soon' : ''), due.text));
     body.append(a);
   }
@@ -988,7 +1010,11 @@ function docCard(d, L) {
   if (chip) badges.append(chip);
   if (String(d.analysis || '').startsWith('none')) { const na = el('span', 'na', 'Not analyzed'); na.title = d.analysis; badges.append(na); }
   body.append(badges);
-  if (L.showPath) body.append(el('div', 'cpath', `in ${pathText(isUnfiled(d) ? null : d.folder_id)}`));
+  if (L.showPath) {
+    const fid = isUnfiled(d) ? null : d.folder_id, cp = el('div', 'cpath', `in ${shortPath(fid)}`);
+    cp.title = `in ${pathText(fid)}`;
+    body.append(cp);
+  }
   c.append(th, body);
   return c;
 }
@@ -1052,8 +1078,10 @@ function renderList(L) {
         if (S && p.type === 'root') tiles.prepend(allTile());
         parts.push(group(folders.length ? 'Folders' : '', tiles));
       }
-      const label = p.type === 'root' ? (folders.length ? `Unfiled · ${unfiledIds().length}` : 'Documents')
-        : p.type === 'all' ? `All documents · ${lib.docs.size}` : `Documents · ${L.docs.length}`;
+      // The count of what is listed under it (after filters), and the uploads on their way in.
+      const coming = ghosts.length ? ` · ${ghosts.length} uploading` : '';
+      const label = (p.type === 'root' ? (folders.length ? `Unfiled · ${L.docs.length}` : 'Documents')
+        : p.type === 'all' ? `All documents · ${L.docs.length}` : `Documents · ${L.docs.length}`) + coming;
       const hideUnfiled = p.type === 'root' && folders.length && !L.unfiltered && !ghosts.length;
       if (!hideUnfiled && (L.docs.length || ghosts.length)) {
         const lab = document.createDocumentFragment();
@@ -1067,8 +1095,9 @@ function renderList(L) {
       if (L.unfiltered && filtersOn()) parts.push(noMatches());
       else if (p.type === 'unfiled') parts.push(emptyState2('Everything is filed.', '', [], 'check'));
       else if (p.type === 'folder' && !folders.length) {
-        const name = placeName(p);
-        parts.push(emptyState2(`${name} is empty.`, 'Add files here, drop them here, or move documents in: select them, then Move to…',
+        const name = placeName(p);  // a long name is in the title just above: not again in a big heading
+        parts.push(emptyState2(name.length > 24 ? 'This folder is empty.' : `${name} is empty.`,
+          S ? 'Add files here, or move documents in: select them, then Move to…' : 'Add files here, drop them here, or move documents in: select them, then Move to…',
           [btn('Add files', () => $('file').click(), { cls: 'primary', icon: 'upload' }), btn('New folder inside', () => newFolder(p.id), { icon: 'plus' })]));
       } else if (p.type === 'all') parts.push(emptyLibrary());
     }
@@ -1209,7 +1238,8 @@ function docRow(d, L) {
   b.append(marked(docTitle(d), L.words));
   b.title = docTitle(d);
   const small = el('small');
-  small.append(el('span', 'fn', d.filename));
+  if (docTitle(d) !== d.filename) small.append(el('span', 'fn', d.filename));  // not the title again
+  else if (d.vendor) small.append(el('span', 'fn', d.vendor));
   if (d.unit_fixes) small.append(unitBadge(d.id, d.unit_fixes, false));
   const chip = suggestionChip(d);
   if (chip) small.append(chip);
@@ -1219,14 +1249,18 @@ function docRow(d, L) {
   nt.append(b, small);
   const nc = el('span', 'ncell');
   nc.append(tn, nt);
-  const path = btn(pathText(isUnfiled(d) ? null : d.folder_id), e => { e.stopPropagation(); openPlace(isUnfiled(d) ? { type: 'unfiled' } : { type: 'folder', id: d.folder_id }); }, { cls: 'pathbtn' });
+  const fid = isUnfiled(d) ? null : d.folder_id;
+  const path = btn(shortPath(fid), e => { e.stopPropagation(); openPlace(fid == null ? { type: 'unfiled' } : { type: 'folder', id: fid }); },
+    { cls: 'pathbtn', title: pathText(fid) });
   path.tabIndex = -1;
+  const type = el('span', 'ell', d.doc_type || '—');
+  if (d.doc_type) type.title = d.doc_type;
   const date = cell('c-date nowrap', d.document_date ? fmtDate(d.document_date) : '—');
   const due = (isBill(d) || d.due_date) && dueInfo(d.due_date);
   if (due) { date.append(el('br'), el('span', 'due' + (due.soon ? ' soon' : ''), due.text)); }
   const added = cell('c-added nowrap', fmtAdded(d.uploaded_at));
   added.title = fmtAdded(d.uploaded_at, true);
-  tr.append(cell('csel', box), cell('c-name', nc), cell('c-folder', path), cell('c-type', d.doc_type || '—'), date,
+  tr.append(cell('csel', box), cell('c-name', nc), cell('c-folder', path), cell('c-type', type), date,
     cell('c-amt num', d.total_amount != null ? fmtAmount(d.total_amount, d.currency) : '—'), added,
     cell('c-size num', d.has_file ? fmtSize(d.file_size) : '—'), cell('cmore', moreButton(docTitle(d))));
   return tr;
@@ -1357,7 +1391,7 @@ function bulkButtons(n) {
     const tip = n && can < n
       ? `${n - can} of the selected documents ${n - can > 1 ? 'were' : 'was'} uploaded before originals were kept, so ${n - can > 1 ? 'they' : 'it'} can't be re-read`
       : 'Read the kept originals again with a model of your choice. Each keeps its folder.';
-    const del = b(delArmed ? `Really delete ${n}?` : `Delete ${n}`, delArmed ? 'Sure?' : 'Delete', 'trash', () => bulkDelete(), { cls: 'del' + (delArmed ? ' sure' : ''), disabled: !n });
+    const del = b(delArmed ? `Really delete ${n}?` : `Delete ${n}`, delArmed ? `Delete ${n}?` : 'Delete', 'trash', () => bulkDelete(), { cls: 'del' + (delArmed ? ' sure' : ''), disabled: !n });
     del.dataset.del = '1';
     const list = [
       b(n === 1 ? 'Ask about it' : `Ask about ${n}`, 'Ask', 'chat', () => askAbout({ docs: [...sel.ids] }), { disabled: !n, title: 'Questions search only the selected documents' }),
@@ -1426,6 +1460,15 @@ $('dselall').onclick = selectAll;
 const selecting = () => (coarse.matches || isS.matches) && (sel.ids.size > 0 || view.selecting);
 
 $('dlist').addEventListener('mousedown', e => { if (e.shiftKey && e.target.closest('[data-nav]')) e.preventDefault(); });  // no text selection
+// Selecting on a phone: a tap on a card's suggestion chip, unit badge or folder link selects the
+// card like a tap anywhere else on it, and never files, opens or navigates.
+$('dlist').addEventListener('click', e => {
+  const b = e.target.closest('button.sug, button.ubadge, button.pathbtn'), item = b?.closest('[data-nav^="d"]');
+  if (!item || !selecting()) return;
+  e.stopPropagation();
+  e.preventDefault();
+  toggleSel(+item.dataset.nav.slice(1));
+}, true);
 // Whatever item gets focus (Tab, a click, a script) becomes the listing's one tab stop.
 $('dlist').addEventListener('focusin', e => {
   const item = e.target.closest('[data-nav]');
@@ -1706,7 +1749,7 @@ function moveDialog(ids, anchor) {
 let menuState = null;
 function openMenu({ anchor = null, at = null, title = '', subtitle = '', items }) {
   const d = $('menusheet');
-  if (d.open) d.close();
+  if (d.open) { menuState?.anchor?.removeAttribute('aria-expanded'); menuState = null; d.close(); }
   d.replaceChildren(el('div', 'mgrab'));
   const head = el('div', 'mhead'), ht = el('div'), b = el('b', '', title || 'Actions');
   b.id = 'menutitle';
@@ -1731,6 +1774,7 @@ function openMenu({ anchor = null, at = null, title = '', subtitle = '', items }
     } else if (it.icon) item.append(icon(it.icon));
     const lab = el('span', '', it.label);
     item.append(lab);
+    if (it.indent) item.style.paddingLeft = `calc(10px + ${it.indent} * 14px)`;  // a path, one level per step
     if (it.title) item.title = it.title;
     item.disabled = !!it.disabled;
     item.onclick = () => {
@@ -1748,6 +1792,7 @@ function openMenu({ anchor = null, at = null, title = '', subtitle = '', items }
   }
   d.append(head, list, btn('Cancel', () => d.close(), { cls: 'mcancel' }));
   menuState = { anchor, picked: false };
+  anchor?.setAttribute('aria-expanded', 'true');  // also keeps its card or row highlighted meanwhile
   d.style.left = d.style.top = '';
   d.showModal();
   if (!isS.matches) {
@@ -1766,8 +1811,10 @@ function openMenu({ anchor = null, at = null, title = '', subtitle = '', items }
 }
 $('menusheet').addEventListener('click', e => { if (e.target === $('menusheet')) $('menusheet').close(); });
 $('menusheet').addEventListener('close', () => {
+  if ($('menusheet').open) return;  // reopened for another menu before this event came: that one's state stays
   const s = menuState;
   menuState = null;
+  s?.anchor?.removeAttribute('aria-expanded');
   if (!s || document.querySelector('dialog[open]')) return;
   const a = document.activeElement;
   if (s.picked && a && a !== document.body && a.isConnected) return;  // the item moved focus on
@@ -1787,6 +1834,7 @@ $('menusheet').addEventListener('keydown', e => {
   else if (typeAhead(e, items, x => x.textContent, document.activeElement)) e.preventDefault();
 });
 
+const fileSubtitle = d => d.filename !== docTitle(d) ? d.filename : '';  // a menu's file name, unless it is the title
 function docMenuItems(id) {
   const d = lib.docs.get(id);
   if (!d) return [];
@@ -1795,7 +1843,7 @@ function docMenuItems(id) {
     d.has_file ? { label: 'Open original ↗', icon: 'external', onclick: () => window.open(`/api/documents/${id}/file`, '_blank', 'noopener') } : null,
     { label: 'Ask about this', icon: 'chat', onclick: () => askAbout({ docs: [id] }) },
     { label: 'Move to…', icon: 'move', onclick: () => moveDialog([id]) },
-    { label: 'Rename…', icon: 'page', onclick: () => openDoc(id, { title: true }) },
+    { label: 'Rename…', icon: 'pencil', onclick: () => openDoc(id, { title: true }) },
     { label: 'Re-read…', icon: 'reread', disabled: !d.has_file, title: d.has_file ? '' : "The original wasn't kept, so it can't be re-read", onclick: () => openReread([id], [id]) },
     '-',
     { label: 'Delete', icon: 'trash', danger: true, sure: 'Click again to delete', onclick: () => deleteDocs([id]) },
@@ -1808,7 +1856,7 @@ function folderMenu(id, anchor, at, here = false) {
     here ? null : { label: 'Open', icon: 'folder-open', onclick: () => openPlace({ type: 'folder', id }, { focus: true }) },
     { label: 'Ask about this folder', icon: 'chat', onclick: () => askAbout({ folders: [id] }) },
     { label: 'New folder inside', icon: 'plus', onclick: () => newFolder(id) },
-    { label: 'Rename…', icon: 'page', onclick: () => renameFolder(id) },
+    { label: 'Rename…', icon: 'pencil', onclick: () => renameFolder(id) },
     { label: 'Move to…', icon: 'move', onclick: () => pickFolder({ mode: 'folder', folder: id }).then(t => { if (t !== undefined) moveFolder(id, t); }) },
     '-',
     { label: 'Delete folder…', icon: 'trash', danger: true, onclick: () => deleteFolder(id) },
@@ -1844,7 +1892,7 @@ function itemMenu(key, anchor, at = null) {
   const id = +key.slice(1), d = lib.docs.get(id);
   if (!d) return;
   if (sel.ids.has(id) && sel.ids.size > 1) openMenu({ anchor, at, title: `${sel.ids.size} documents selected`, items: selectionMenuItems() });
-  else openMenu({ anchor, at, title: docTitle(d), subtitle: d.filename, items: docMenuItems(d.id) });
+  else openMenu({ anchor, at, title: docTitle(d), subtitle: fileSubtitle(d), items: docMenuItems(d.id) });
 }
 
 // ---- dialogs ----
@@ -2459,7 +2507,7 @@ function renderPanel() {
   h2.tabIndex = -1;
   h2.setAttribute('aria-label', `Details of ${docTitle(d)}${i >= 0 ? `, ${i + 1} of ${view.order.length}` : ''}`);
   const back = btn(`‹ ${placeName(view.place)}`, closeDoc, { cls: 'back', aria: `Back to ${placeName(view.place)}` });
-  const more = btn('', e => openMenu({ anchor: e.currentTarget, title: docTitle(d), subtitle: d.filename, items: docMenuItems(d.id).filter(it => it?.label !== 'Show details') }),
+  const more = btn('', e => openMenu({ anchor: e.currentTarget, title: docTitle(d), subtitle: fileSubtitle(d), items: docMenuItems(d.id).filter(it => it?.label !== 'Show details') }),
     { cls: 'icon', aria: 'More actions', title: 'More actions', icon: 'more' });
   const close = btn('', closeDoc, { cls: 'icon close', aria: 'Close the details', title: 'Close (Esc)', icon: 'close' });
   head.append(back, prev, next, h2, el('span', 'grow'), more, close);
@@ -2477,6 +2525,7 @@ function renderPanel() {
   title.value = docTitle(d);
   title.dataset.field = 'title';
   title.maxLength = 300;
+  title.title = docTitle(d);  // in full, where a long one ends in "…"
   title.setAttribute('aria-label', 'Title');
   const terr = el('span', 'err'), saved = el('span', 'saved t');
   terr.setAttribute('role', 'alert');
@@ -2500,7 +2549,7 @@ function renderPanel() {
   else {
     const f = lib.folders.get(d.folder_id), chain = [];
     for (let c = f, n = 0; c && n < 64; c = lib.folders.get(c.parent_id), n++) chain.unshift(c);
-    chain.forEach((c, k) => { if (k) fl.append(el('span', 'sep', '›')); fl.append(btn(c.name, () => openPlace({ type: 'folder', id: c.id }), { cls: 'open' })); });
+    chain.forEach((c, k) => { if (k) fl.append(el('span', 'sep', '›')); fl.append(btn(c.name, () => openPlace({ type: 'folder', id: c.id }), { cls: 'open', title: pathText(c.id) })); });
   }
   fl.append(btn('Move…', () => moveDialog([d.id]), { cls: 'mv' }));
   tsec.append(title, terr, saved, actions(d, 'top'), file, fl);
@@ -2517,26 +2566,26 @@ function renderPanel() {
     p1.append('Suggested folder: ', el('b', '', where));
     const row = el('div', 'row');
     row.append(btn(exists ? `Move to ${where}` : nested ? `Create ${where} and move` : `Move to new folder '${where}'`,
-      () => applySuggestion(d.id, d.suggested_folder), { cls: 'primary' }),
+      () => applySuggestion(d.id, d.suggested_folder), { cls: 'suggest' }),  // outlined: Ask about this is the panel's one primary
       btn('Dismiss', () => patchDoc(d.id, { suggestion: 'dismiss' })));
     card.append(p1, row);
     sec.append(card);
     body.append(sec);
   }
   body.append(detailsSection(d), aboutSection(d, x));
-  p.replaceChildren(head, body, actions(d, 'bar'));
+  p.replaceChildren(head, body, actions(d, 'dock'));
   syncPanelJob();
   body.scrollTop = scrollTop;
   if (focusField) p.querySelector(`[data-field="${focusField}"]`)?.focus({ preventScroll: true });
 }
 
 function actions(d, where) {
-  const box = el('div', `dacts ${where}`), bar = where === 'bar';
+  const box = el('div', `dacts ${where}`), bar = where === 'dock';  // dock: a phone's bottom bar
   const del = btn('Delete', null, { cls: 'del', icon: 'trash', title: 'Delete this document' });
   del.onclick = () => {
     if (!del.classList.contains('sure')) {  // a second click within 3 s
       del.classList.add('sure');
-      del.lastChild.textContent = bar ? 'Sure?' : 'Delete?';
+      del.lastChild.textContent = 'Delete?';
       setTimeout(() => { if (del.isConnected) { del.classList.remove('sure'); del.lastChild.textContent = 'Delete'; } }, 3000);
       return;
     }
@@ -2660,16 +2709,22 @@ function preview(d, x) {
   const tb = el('div', 'textbox fade'), more = btn('Show more', null, { cls: 'open' });
   more.hidden = true;
   tb.textContent = 'Loading…';
+  let cut = false;  // the server sent only the start
   const load = async (max = 4000) => {
     let t;
     try { t = await loadText(d, max); } catch { tb.replaceChildren(fail(() => load(max))); return; }
     tb.textContent = t.text || '(no text)';
-    tb.classList.toggle('fade', t.truncated);
+    cut = t.truncated;
     tb.classList.toggle('all', max > 4000);
-    more.hidden = !t.truncated || max > 4000;
+    // Taller than the box counts too: 900 characters can be more than its 18 lines. (The panel is
+    // in the page by now: this runs after an await.)
+    const hidden = !tb.classList.contains('all') && (cut || tb.scrollHeight > tb.clientHeight + 1);
+    tb.classList.toggle('fade', hidden);
+    more.hidden = !hidden;
     if (max > 4000 && t.truncated) box.append(el('span', 'muted small', 'Showing the first 200,000 characters. Open the file for the rest.'));
   };
-  more.onclick = () => load(200000);
+  // More from the server when it cut the text; otherwise the rest is here already.
+  more.onclick = () => { if (cut) load(200000); else { tb.classList.add('all'); tb.classList.remove('fade'); more.hidden = true; } };
   load();
   box.append(tb, more);
   return box;
@@ -2716,11 +2771,13 @@ function detailsSection(d) {
   field('Document date', 'document_date', dd);
   const showMoney = isBill(d) || d.vendor || d.total_amount != null || d.due_date || moneyOpen.has(d.id);
   if (showMoney) {
-    const vendor = text('vendor', d.vendor, { max: 200 });
+    const vendor = text('vendor', d.vendor, { max: 200, placeholder: 'Add vendor' });
     vendor.onchange = () => patchDoc(d.id, { vendor: vendor.value.trim() || null }, saved);
     field('Vendor', 'vendor', vendor);
     const amtErr = err(), row = el('div', 'amtrow');
-    const amt = text('total_amount', d.total_amount != null ? String(d.total_amount) : '', { mode: 'decimal', placeholder: '0.00' });
+    // 42.1 shows as 42.10; more decimals than two, as read, stay.
+    const shown = n => n == null ? '' : Number.isInteger(Math.round(n * 100 * 1e6) / 1e6) ? n.toFixed(2) : String(n);
+    const amt = text('total_amount', shown(d.total_amount), { mode: 'decimal', placeholder: 'Add amount' });
     const cur = text('currency', d.currency, { max: 3, list: 'curlist', cls: 'cur', placeholder: 'GBP' });
     cur.setAttribute('aria-label', 'Currency');
     amt.onchange = () => {
@@ -3028,7 +3085,7 @@ function drawScope() {
     box.checked = on;
     box.disabled = !!above;
     box.onchange = () => { if (box.checked) sv.folders.add(f.id); else sv.folders.delete(f.id); drawScope(); list.querySelector(`[data-sf="${f.id}"] input`)?.focus(); };
-    txt.append(el('b', '', f.name), el('small', '', [path, plural(f.total, 'document'), above ? `in ${above.name}` : 'whole folder, including documents added later'].filter(Boolean).join(' · ')));
+    txt.append(el('b', '', f.name), el('small', '', [path, plural(f.total, 'document'), above ? `in ${above.name}` : ''].filter(Boolean).join(' · ')));
     lab.append(box, icon('folder'), txt);
     li.dataset.sf = f.id;
     li.append(chev, lab);
@@ -3045,7 +3102,7 @@ function drawScope() {
     box.disabled = !!above;
     box.onchange = () => { if (box.checked) sv.docs.add(d.id); else sv.docs.delete(d.id); drawScope(); list.querySelector(`[data-sd="${d.id}"] input`)?.focus(); };
     txt.append(el('b', '', docTitle(d)), el('small', '', [path, d.filename, d.doc_type, above ? `in ${above.name}` : ''].filter(Boolean).join(' · ')));
-    lab.append(box, txt);
+    lab.append(box, icon(d.kind === 'image' ? 'image' : 'page'), txt);  // its name in line with the folders' names
     li.dataset.sd = d.id;
     li.append(chev, lab);
     rows.push(li);
@@ -3117,4 +3174,12 @@ function docsStart() {
   });
   ro.observe($('dtools'));
   ro.observe($('dselbar'));
+  // Once the toolbar sticks, a rule under it separates it from what scrolls beneath.
+  $('dmain').addEventListener('scroll', () => $('dtools').classList.toggle('stuck', $('dmain').scrollTop > $('dhead').offsetHeight - 1), { passive: true });
+}
+// A phone shows no queue beside the listing: files just added open the Uploads box, in view.
+function revealUploads() {
+  if (!isS.matches || view.mode !== 'docs') return;
+  $('uploads').open = true;
+  if (!$('uploads').hidden) $('uploads').scrollIntoView({ block: 'nearest' });
 }

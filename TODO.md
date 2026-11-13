@@ -417,6 +417,30 @@ Everything below is committed (as of 2026-11-12, the Documents view included); n
   minicpm-v4.6, a BOM file, depth, empty folder) and 27 Playwright checks pass (1440 light, 1024 and 390/320 dark),
   screenshots looked at; the only console entry is the empty folder's intended 400. No finding was rejected; the old
   table's Read by and Analysis columns came back as filters rather than columns
+- 2026-11-12: Visual polish of Documents (desktop and phone design reviews). Fixed: the `.small` text class also
+  sized six dialogs to 12 px (now `dialog.form.compact`); the move picker, upload queue and cards could be widened
+  by one long name, hiding the queue's ✕, the picker's "(current)" and card titles (one-column grids with
+  `minmax(0, 1fr)`); the list's Folder and Type cells stay on one line ("… › 2026 › Spring", the path in the title);
+  a short text taller than its preview box now fades with Show more; the tree's Ask/⋯ take no room until shown and
+  only on the focused row, the suggestions dot sits on the count; hover, the open card and a card whose menu is open
+  look different (the menu's button has `aria-expanded`); the suggestion strip says "Suggested" with its buttons
+  after the text; Library's total is "Unfiled total" and group labels count what is shown and the uploads coming;
+  an empty folder's Ask is off and its toolbar bare; brand row and header share one rule; tidier key details
+  (42.10, "Add amount"/"Add vendor" placeholders, labels level with fields); Chat marks the folders asked about,
+  its box says "Ask about Tractor…", its first idea names the folder; dark hovers and menus stand out; the phone's
+  scope toggle, title (two lines), touch targets (44 px, inputs 16 px against iOS zoom), detail bar (no longer a
+  pill: `.dacts.bar` collided with the progress `.bar`), armed Delete legible in dark (`--accent-ink` on `--bad`),
+  a sticky toolbar's rule (`.stuck` was never set), the Uploads box opening when files are added; and a tap on a
+  suggestion chip while selecting now selects the card instead of filing it (it had moved a document). The chat
+  prompt asks for plain text, so answers carry no `**`. Rejected, as the spec says otherwise: the detail's order
+  (preview first) and its repeated Open/Move actions, the short dialogs as phone sheets (full screen), the
+  Unfiled count line's wording, the Add box's model picker behind an Options disclosure, Due date hidden on
+  receipts, the folder tiles' two-line names (52 px tiles), a textarea for the title (an input; it now ends in
+  "…"), dimming photo thumbnails in dark (PDFs only), crumbs under 32 px or hidden at depth 1, the suggestions
+  strip inside the Unfiled group, and word-start-only search marks (the filter matches inside words, so the mark
+  shows why). 251 tests pass. Staging: before/after screenshots at 1600, 1024, 880, 390 and 320 px in both themes
+  looked at, and a Playwright flow (create a folder, upload three files, move one, ask about the folder with
+  `qwen3.5:9b`, the scope dialog, selection and upload on a phone) passed
 
 ## To do
 

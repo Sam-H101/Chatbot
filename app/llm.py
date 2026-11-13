@@ -108,7 +108,8 @@ SYSTEM = os.environ.get("SYSTEM_PROMPT") or (
     "their summaries instead. If none of this contains the answer, say so. If the answer is "
     "a figure or specification (a capacity, pressure, torque, clearance, dimension, interval, "
     "part number or the like), stop there rather than give a typical or estimated value; "
-    "anything else you may answer from general knowledge, saying that you do. Be concise."
+    "anything else you may answer from general knowledge, saying that you do. Be concise. "
+    "Write plain text: the answer is shown as written, so no Markdown such as ** or #."
 )
 # Follows the excerpts only when some of them have pages, its example made from the first
 # that has. In the system prompt, it had a local model (qwen3.5:9b) give excerpts without
