@@ -179,12 +179,27 @@ def join_pages(pages):
     return PAGE_BREAK.join(p.replace(PAGE_BREAK, "\n") for p in pages)
 
 
+# Control characters that aren't white space (form feeds, line breaks and tabs are).
+_CONTROLS = {c: None for c in (*range(0x09), *range(0x0e, 0x1c), *range(0x7f, 0xa0)) if not chr(c).isspace()}
+# pdfium joins a word that a hyphen split at the end of a line and gives "\x02" for that hyphen
+# ("hy\x02draulic"). Indexed so, the word was two ("hy", "draulic") and search never found it.
+# The hyphen goes, except after a one-letter part ("O-ring") or beside a digit ("DK45-series"):
+# those are the word's own.
+_OWN_HYPHEN = re.compile(r"(?<!\w)(\w)\x02|(?<=\d)\x02|\x02(?=\d)")
+
+
+def _text_layer(page):
+    """A page's text layer, its words whole again and no control characters."""
+    text = page.get_textpage().get_text_bounded()
+    return _OWN_HYPHEN.sub(lambda m: (m[1] or "") + "-", text).translate(_CONTROLS)
+
+
 def pdf_texts(data):
     """The embedded text layer of every page: no OCR, so scanned pages come back
     (nearly) empty. Quick, since nothing is rendered."""
     pdf = pypdfium2.PdfDocument(data)
     try:
-        return [page.get_textpage().get_text_bounded() for page in pdf]
+        return [_text_layer(page) for page in pdf]
     finally:
         pdf.close()
 
@@ -209,7 +224,7 @@ def pdf_pages(data, min_chars=MIN_PAGE_CHARS, scale=RENDER_SCALE, skip=()):
     pdf = pypdfium2.PdfDocument(data)
     try:
         for n, page in enumerate(pdf, 1):
-            text = page.get_textpage().get_text_bounded()
+            text = _text_layer(page)
             png = None
             if n not in skip and is_scan(text, min_chars):
                 buf = io.BytesIO()
@@ -316,13 +331,17 @@ def plain(text):
 # a bullet or **bold** is still seen around a match.
 _OPEN, _CLOSE = chr(0xFDD0), chr(0xFDD1)
 # Dropped from the text with them: control characters that aren't white space, such as the \x02
-# pdfium gives for a hyphen that split a word at the end of a line ("facto\x02ry-set").
-_DROPPED = {c: None for c in (ord(_OPEN), ord(_CLOSE), *range(0x09), *range(0x0e, 0x1c), *range(0x7f, 0xa0))
-            if not chr(c).isspace()}
+# pdfium gave for a hyphen that split a word at the end of a line ("facto\x02ry-set"), which
+# documents read before _text_layer still have.
+_DROPPED = {ord(_OPEN): None, ord(_CLOSE): None, **_CONTROLS}
 _MARKS = re.compile(f"([{_OPEN}{_CLOSE}])")
-_TAG_NAMES = r"(?i:br|hr|p|div|span|font|table|thead|tbody|tr|td|th|ul|ol|li|b|i|u|s|em|strong|sup|sub|small|img|a|h[1-6])"
-_LINE_TAG = re.compile(r"<\s*/?\s*(?i:br|hr|p|div|tr|li|h[1-6])\b[^<>]*>")  # tags that end a line
-_TAG = re.compile(rf"<!--.*?-->|</?{_OPEN}?[A-Za-z][^<>]*>", re.S)
+# Only these are tags; any other <...> is text: a manual's figure caption ("<Power flow diagram>",
+# "<The Condition of not Engaged the Diff. Lock Gear>"), a key ("<ENTER>"), a grade ("<SAE 10W-30>").
+# A name of one letter is a tag in lower case only, so a label such as "<A>" or "<B> side" stays.
+_TAG_NAMES = r"(?:(?i:br|hr|div|span|font|table|thead|tbody|tr|td|th|ul|ol|li|em|strong|sup|sub|small|img|h[1-6])|[abipsu])"
+_NAME_END = rf"(?=[\s/>{_OPEN}{_CLOSE}])"  # "<li>", not "<Li-ion battery>"
+_LINE_TAG = re.compile(rf"<\s*/?\s*(?:(?i:br|hr|div|tr|li|h[1-6])|p){_NAME_END}[^<>]*>")  # tags that end a line
+_TAG = re.compile(rf"<!--.*?-->|</?{_OPEN}?{_TAG_NAMES}{_CLOSE}?{_NAME_END}[^<>]*>", re.S)
 # A tag the snippet's window cut in two: its end at the start ("br> Brake"), its start at the end.
 _TAG_TAIL = re.compile(rf"^\s*/?{_OPEN}?{_TAG_NAMES}{_CLOSE}?(?:\s+[A-Za-z-]+=[^<>]*)?\s*/?>")
 _TAG_HEAD = re.compile(rf"<{_OPEN}?/?{_OPEN}?{_TAG_NAMES}{_CLOSE}?(?:\s[^<>]*)?\s*$")
@@ -339,7 +358,8 @@ _SEP = " · "  # between a table's cells and rows, and the lines of a cell
 
 def _emphasis(m):
     """An emphasis mark gone (**, *, __, _, ~~), the match marks aside, unless it stands alone
-    between spaces (5 * 3) or joins a word (snake_case), or is a long run (a form's ______)."""
+    between spaces (5 * 3), joins a word (snake_case) or two numbers or words with one star
+    (5*3, an approval number's e11*89/173*2000), or is a long run (a form's ______)."""
     s, a, b, mark = m.string, m.start(), m.end(), m.group()
     while a and s[a - 1] in (_OPEN, _CLOSE):
         a -= 1
@@ -347,7 +367,7 @@ def _emphasis(m):
         b += 1
     before, after = s[a - 1] if a else " ", s[b] if b < len(s) else " "
     if len(mark) > 3 or (before.isspace() and after.isspace()) or (
-            mark[0] == "_" and before.isalnum() and after.isalnum()):
+            (mark[0] == "_" or mark == "*") and before.isalnum() and after.isalnum()):
         return mark
     return ""
 

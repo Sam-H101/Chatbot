@@ -806,10 +806,12 @@ $('dq').onkeydown = e => {
   if ($('dq').value) clearSearch(); else focusList();
 };
 function clearSearch() {
+  const inList = $('dlist').contains(document.activeElement);  // Escape from a result (a passage's Show document)
   $('dq').value = '';
   view.q = '';
   view.relevance = true;
   renderDocs();
+  if (inList && !$('dlist').contains(document.activeElement)) focusPlace();  // its item is gone with the results
 }
 async function serverSearch() {
   const k = searchKey(), q = view.q.trim(), p = view.place;
@@ -1620,6 +1622,13 @@ $('dlist').addEventListener('keydown', e => {
   }
   if (done) e.preventDefault();
 });
+// The heading has focus in a place with nothing to list (an empty folder): up a level from there too.
+$('dtitle').addEventListener('keydown', e => {
+  const up = e.key === 'Backspace' || (e.key === 'ArrowUp' && e.altKey);
+  if (!up || e.ctrlKey || e.metaKey) return;
+  e.preventDefault();
+  goUp();
+});
 // With the detail column open (L), it shows the document the arrow keys moved to, once they pause;
 // focus stays in the listing so the keys keep browsing.
 let followTimer = null;
@@ -1802,8 +1811,9 @@ async function deleteDocs(ids) {
   render();
   toast(`Deleted ${what}`);
   announce(`Deleted ${what}`);
-  view.focusKey = nextId != null ? 'd' + nextId : null;
-  focusPlace();
+  // On to the next document (else the one before it); the place's tab stop when none is left.
+  const next = nextId != null && $('dlist').querySelector(`[data-nav="d${nextId}"]`);
+  if (next) next.focus(); else focusPlace();
   lib.load();
 }
 function moveDialog(ids, anchor) {
@@ -2295,6 +2305,8 @@ $('fdgo').onclick = async () => {
     store.set('docsAt', hashFor(view.place));
   }
   await lib.load();
+  const a = document.activeElement;  // the ⋯ or tree row the dialog gave focus back to went with the folder
+  if (view.mode === 'docs' && (!a || a === document.body || !a.isConnected)) focusPlace();
   const where = parent != null ? pathText(parent) : 'Unfiled';
   let msg = `Deleted '${f.name}'.`;
   if (mode === 'delete') msg += r.deleted_documents ? ` ${plural(r.deleted_documents, 'document')} deleted.` : '';

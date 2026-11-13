@@ -654,6 +654,7 @@ label.ck.danger { color: var(--bad); }
 .fsec .chips { gap: 6px; }
 .fsec .chip { font-size: 12px; padding: 6px 10px; }
 .fsec .chip[aria-pressed="true"] { border-color: var(--accent); background: var(--sel); color: var(--accent-text); font-weight: 600; }
+.fsec .chip[aria-pressed="true"]:hover:not(:disabled) { color: var(--accent-text); }  /* plain accent on --sel is under 4.5:1 */
 .daterow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .daterow label { display: flex; gap: 6px; align-items: center; font-size: 13px; }
 .daterow input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
@@ -901,8 +902,9 @@ body.hasbar #toast { bottom: 100px; }
   button.chip.src { padding: 7px 9px; }
   .scopechip button { padding-block: 7px; }
   button.ubadge, button.sug { padding: 5px 9px; margin: 2px 0; }
-  /* 45 px to touch, the pill as it was: the hit area reaches into the space above and below */
-  button.ubadge { position: relative; }
+  /* 45 px to touch, the pill as it was: the hit area reaches into the space above and below, over
+     the lines next to it (a phone row's file name and type, themselves positioned) */
+  button.ubadge { position: relative; z-index: 1; }
   button.ubadge::after { content: ""; position: absolute; inset: -11px -3px; }  /* from inside its border: 23 + 22 */
   .trow { height: 44px; }
   .trow .tbtn { display: grid; width: 36px; height: 36px; }

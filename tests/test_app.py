@@ -181,6 +181,28 @@ def test_snippet_parts_take_markdown_and_html_out(client):
     assert parts("a {   } b {} c\f\fd") == ["a b c d"]                                            # empty matches: text
     assert parts("facto\x02ry-set\x00 &#1; tab\there\x85") == ["factory-set tab here"]           # control characters
     assert parts("") == [""] and parts("<br>") == [""]
+    # Only HTML's tags are tags: a manual's captions in angle brackets (the live library's) are text, matches too.
+    assert parts("OFF.\n\n<Power {flow} {diagram}>\n(1) PTO Clutch") == [
+        "OFF. <Power ", "flow", " ", "diagram", "> (1) PTO Clutch"]
+    assert parts("### TURNING\n\n<The {Condition} of not Engaged the Diff. Lock Gear>\n\nThe power") == [
+        "TURNING <The ", "Condition", " of not Engaged the Diff. Lock Gear> The power"]
+    assert parts("Press <{ENTER}> to save; oil <SAE 10W-30>; <Li-ion> pack; <A> side<br/>x") == [
+        "Press <", "ENTER", "> to save; oil <SAE 10W-30>; <Li-ion> pack; <A> side x"]
+    assert parts("<td colspan=2>{a}</td> <b>see</b> <B> side<p class=x>c</p>") == ["", "a", " see <B> side c"]
+    assert parts("torque 5*3 N.m on the {bolt}, e11*89/173*2000, *{key}*") == [   # one star between: not emphasis
+        "torque 5*3 N.m on the ", "bolt", ", e11*89/173*2000, ", "key", ""]
+
+
+def test_a_pdfs_line_end_hyphens_are_joined(local):
+    """pdfium gives "\\x02" for a hyphen that split a word at the end of a line and joins the
+    lines: indexed so, "hydraulic" was two words and search never found it."""
+    from app import db, extract
+    pdf = text_pdf(["Return it to the oil hy-", "draulic circuit; check the O-", "ring first."])
+    assert extract.pdf_texts(pdf) == ["Return it to the oil hydraulic circuit; check the O-ring first."]
+    job = add(local, "manual.pdf", pdf)
+    assert "\x02" not in db.document_text(job["doc_id"])
+    (hit,) = search_parts(local, "hydraulic")
+    assert hit["snippet_parts"][1] == "hydraulic" and "O-ring" in hit["snippet"]
 
 
 def test_match_marks_are_never_text(client):

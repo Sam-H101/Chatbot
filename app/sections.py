@@ -34,9 +34,9 @@ META_SCHEMA = {
     "type": "object",
     "properties": {
         "title": {"type": "string"},
-        "doc_type": {"type": "string", "description": "What kind of document it is: one of the listed existing "
-                     "types, copied exactly, if one fits; otherwise a short general type (1-3 words, e.g. Receipt, "
-                     "Service manual), never the document's own title"},
+        "doc_type": {"type": "string", "description": "What kind of document it is: a short general type (1-3 "
+                     "words, e.g. Receipt, Service manual, Maintenance log), never the document's own title; a "
+                     "listed existing type, copied exactly, only if this is the same kind of document"},
         "summary": {"type": "string", "description": "2-3 sentences"},
         "keywords": {"type": "array", "items": {"type": "string"},
                      "description": "5-12 search terms: topics, names, entities"},
@@ -67,11 +67,14 @@ PROMPT_TYPES, PROMPT_TYPE_CHARS = 40, 1200
 # "Technical Manual / Service Guide", "Service Manual / Technical Guide", "service manual",
 # "manual", "Owner's Manual" and one's title ("Wiring Diagram and Electric System"). Shown the
 # library's types, a model can reuse one; jobs.doc_type then tidies what it gives and maps
-# another spelling of an existing type onto that type.
+# another spelling of an existing type onto that type. Told to copy a listed type "if one fits",
+# qwen3.5:9b typed a tractor maintenance log "Service manual" (and filed it with the manuals):
+# the list is for the spelling of the same kind of document.
 TYPE_RULES = (
-    "doc_type: what kind of document this is. If one of the existing document types below fits, copy it exactly "
-    "as listed. Otherwise give a short general type of 1-3 words (e.g. Receipt, Bill, Invoice, Service manual, "
-    "Owner's manual, Wiring diagram), never the document's own title.")
+    "doc_type: what kind of document this is, as a short general type of 1-3 words (e.g. Receipt, Bill, Invoice, "
+    "Service manual, Owner's manual, Maintenance log, Wiring diagram), never the document's own title. The "
+    "existing document types below are for spelling: copy one exactly only if this is the same kind of document. "
+    "A different kind gets its own type: a log, record, notes, letter or receipt is not a manual.")
 DETAILS_GUIDANCE = (
     "Fill document_date, vendor, total_amount, currency and due_date only with values the document itself states; "
     "leave a field empty if unsure, and never guess an ambiguous date (03/04/2026). Manuals, letters and papers have "
