@@ -1,7 +1,7 @@
 """Thumbnails of kept originals: page 1 of a PDF, or a photo scaled down, as WebP. Made by
 the job that reads an upload (jobs.py), or when first asked for (get: documents uploaded
 before thumbnails, or whose thumbnail was removed). Kept in db.thumbs_dir() by the
-original's hash, so copies of one file share them, and outside files_dir(), so backups
+original's hash, so copies of one file share them, and apart from the originals (storage.py), so backups
 (which mirror the originals) skip them: they can always be made again. Removed with their
 original (db._remove)."""
 import io
@@ -13,7 +13,7 @@ import threading
 import pypdfium2
 from PIL import Image, ImageOps
 
-from . import db, extract
+from . import db, extract, storage
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +102,8 @@ def try_make(sha, source, kind):
 
 
 def get(sha, file_path, kind, size):
-    """The path of a thumbnail, made now if it is missing; None when it can't be made."""
+    """The path of a thumbnail, made now from the stored original `file_path` if it is
+    missing; None when it can't be made (or the original is gone)."""
     target = path(sha, size)
     if os.path.exists(target):
         return target
@@ -110,7 +111,11 @@ def get(sha, file_path, kind, size):
         return None
     with thumbs_lock:
         if not os.path.exists(target):  # else made while this request waited
-            try_make(sha, os.path.join(db.files_dir(), os.path.basename(file_path)), kind)
+            try:
+                source = storage.source(storage.name(file_path))
+            except FileNotFoundError:
+                return None
+            try_make(sha, source, kind)
     return target if os.path.exists(target) else None
 
 

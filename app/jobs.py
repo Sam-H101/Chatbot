@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import re
-import sqlite3
 import threading
 import time
 import unicodedata
@@ -16,7 +15,7 @@ import unicodedata
 import anthropic
 import pypdfium2
 
-from . import db, extract, llm, ollama, sections, thumbs, units, vectors
+from . import db, extract, llm, ollama, sections, storage, thumbs, units, vectors
 
 log = logging.getLogger(__name__)
 
@@ -58,9 +57,9 @@ _wake, _stop = threading.Event(), threading.Event()
 _thread = None
 _start_lock = threading.Lock()
 _current, _current_lock = None, threading.Lock()  # (job id, thread id) of the job being read (interrupt)
-# Seconds between tries to mark a job failed while the database stays locked (_fail).
+# Seconds between tries to mark a job failed while the database is unreachable (_fail).
 FAIL_RETRY_SECONDS = (2, 10, 30)
-# When this process started (UTC, as SQLite's datetime('now')): answers begun before it and
+# When this process started (UTC, as the database's utc_now()): answers begun before it and
 # never finished were cut off by a restart (recover).
 STARTED = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
@@ -128,7 +127,7 @@ def remember_key(job_id, key):
 
 def prune_keys():
     """Forget the keys of jobs that won't run again: cancelled, ended, or never committed
-    (SQLite gives that id to the next job, which must not spend this key). Under
+    (its key must not linger in memory). Under
     files_lock, which the routes hold while they keep a key for a job they are about to
     commit or queue, so no key on its way in is dropped."""
     with db.files_lock:
@@ -295,7 +294,7 @@ def interrupt():
         try:
             if _current and db.job_status(_current[0]) != "running":
                 ollama.abort(_current[1])
-        except sqlite3.Error:
+        except db.Error:
             log.warning("Could not check whether job %d still runs", _current[0], exc_info=True)
 
 
@@ -353,8 +352,7 @@ def _process(job):
         log_usage([priced(*call)], job_id=job_id)
 
     try:
-        with open(os.path.join(db.files_dir(), os.path.basename(job["file_path"])), "rb") as f:
-            data = f.read()
+        data = storage.get(storage.name(job["file_path"]))
         text, meta, analysis, who, note = _read(job, opts, data, progress, on_usage)
         # Whichever model gave it, the type is tidied and, when it is another spelling of one
         # the library has, made that one (the user's own edits are theirs: db keeps them).
@@ -603,7 +601,7 @@ def _fail(job_id, error):
         try:
             db.update_job(job_id, status="failed", stage="Failed", error=error)
             return
-        except sqlite3.OperationalError as e:
+        except db.OperationalError as e:
             if wait is None:
                 raise
             log.warning("Could not mark job %d failed (%s); trying again in %d s", job_id, e, wait)

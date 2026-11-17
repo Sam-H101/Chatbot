@@ -1,5 +1,6 @@
-# The test suite on every push and pull request. Tests use fakes for Claude and Ollama, so
-# they need no API key, GPU, Docker or network once the packages are installed.
+# The test suite on every push and pull request, as it runs locally: in Docker, against a real
+# Postgres (with pgvector) and Azurite (docker-compose.test.yml). Tests use fakes for Claude
+# and Ollama, so they need no API key or GPU.
 name: tests
 
 on:
@@ -12,14 +13,9 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-          cache: pip
-      # The app's requirements plus what the tests add (the same as the local test run).
-      - run: pip install -r requirements.txt pytest pillow
-      # python -m puts the repo on the path, so the tests can import the app package.
-      - run: python -m pytest -q
+      - run: docker compose -f docker-compose.test.yml run --rm --build tests
+      - if: always()
+        run: docker compose -f docker-compose.test.yml down -v

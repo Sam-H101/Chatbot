@@ -9,19 +9,21 @@ import re
 import threading
 from urllib.parse import urlsplit
 
+import io
+
 import anthropic
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory, stream_with_context
 from werkzeug.routing import IntegerConverter
 
-from . import auth, db, extract, jobs, llm, ollama, thumbs, vectors
+from . import auth, db, extract, jobs, llm, ollama, storage, thumbs, vectors
 
 log = logging.getLogger(__name__)
 
 
 class RowId(IntegerConverter):
-    """<id:...> in routes. SQLite ids are 64-bit, so a larger number names no row: it
+    """<id:...> in routes. Ids are 64-bit (bigint), so a larger number names no row: it
     becomes 0, which no row has either, and the route answers its usual 404 instead of
-    overflowing inside sqlite3."""
+    overflowing in the database."""
     def to_python(self, value):
         n = int(value)
         return n if n < 2**63 else 0
@@ -319,7 +321,7 @@ def _int_arg(name, default, low, high):
 
 
 def _row_id(value, what):
-    """An id from a JSON body: a whole number (None for none). One too large for SQLite names
+    """An id from a JSON body: a whole number (None for none). One too large for a bigint names
     no row: it becomes 0, which none has either, so the usual 404 follows (RowId)."""
     if value is None:
         return None
@@ -514,7 +516,7 @@ def job_retry(job_id):
             return jsonify(error="Not found"), 404
         if j["status"] != "failed":
             return jsonify(error="Only a failed job can be retried"), 409
-        if not os.path.isfile(os.path.join(db.files_dir(), os.path.basename(j["file_path"]))):
+        if not storage.exists(storage.name(j["file_path"])):
             return jsonify(error="The original file is no longer stored; upload it again"), 409
         if j["model"].startswith("claude:") and not _has_key():
             raise MissingKey()
@@ -537,7 +539,10 @@ def document_file(doc_id):
     if mime == "text/markdown" or extract.kind(f["filename"]) == "markdown":
         mime = "text/plain"  # shown as it is written; the page renders it, sanitized
     inline = mime in INLINE_TYPES
-    resp = send_file(f["path"], mimetype=mime, as_attachment=not inline, download_name=f["filename"], max_age=0)
+    # A local file is sent from disk; one in S3 or Azure is read into memory and sent from
+    # here, so it gets the same headers (and the login) rather than a link to the bucket.
+    body = f["path"] or io.BytesIO(storage.get(f["name"]))
+    resp = send_file(body, mimetype=mime, as_attachment=not inline, download_name=f["filename"], max_age=0)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     if inline and mime != "application/pdf":
         resp.headers["Content-Security-Policy"] = SANDBOX_CSP
@@ -554,7 +559,7 @@ def document_thumb(doc_id):
     size = request.args.get("size", "card")
     if size not in thumbs.SIZES:
         raise BadChoice("size must be 'card' or 'large'")
-    f = db.stored_file(doc_id)
+    f = db.stored_file(doc_id, check=False)  # a thumbnail made already needs no look at the store
     kind = f and extract.kind(f["filename"])
     if not f or not f["sha256"] or kind not in thumbs.KINDS or thumbs.failed(f["sha256"]):
         return jsonify(error="No thumbnail"), 404
@@ -563,7 +568,7 @@ def document_thumb(doc_id):
     if request.if_none_match.contains_weak(tag):
         resp = Response(status=304)
     else:
-        target = thumbs.get(sha, f["path"], kind, size)
+        target = thumbs.get(sha, f["name"], kind, size)
         if not target:
             return jsonify(error="No thumbnail"), 404
         resp = send_file(target, mimetype="image/webp", conditional=False, etag=False)
@@ -586,9 +591,8 @@ def document_text_view(doc_id):
         return jsonify(error="Not found"), 404
     f = db.stored_file(doc_id) if doc["kind"] in ("markdown", "text") else None
     if f:
-        with open(f["path"], "rb") as fh:
-            raw = fh.read(most * 4 + 4)  # enough for `most` characters of any UTF-8
-        size = os.path.getsize(f["path"])
+        raw = storage.get(f["name"], most * 4 + 4)  # enough for `most` characters of any UTF-8
+        size = storage.size(f["name"])
         text = raw.decode("utf-8-sig", errors="replace")  # without the BOM some Windows editors start a file with
         return jsonify(text=text[:most], truncated=len(raw) < size or len(text) > most, source="file",
                        kind=doc["kind"], bytes=size)
@@ -827,7 +831,7 @@ def delete_instruction(rule_id):
 
 
 def _id_list(raw, error):
-    """Ids from a JSON body, as given ([] when absent); those too large for SQLite are left
+    """Ids from a JSON body, as given ([] when absent); those too large for a bigint are left
     out, as they can't name a row."""
     if raw is None:
         return [], []

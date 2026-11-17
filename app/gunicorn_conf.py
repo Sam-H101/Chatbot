@@ -1,22 +1,19 @@
 """gunicorn hooks (the settings are flags in the Dockerfile's CMD)."""
-_lock = None  # the library's lock, held by the master for as long as the app runs
-
-
-def on_starting(server):
-    """Hold the library's lock (db.lock_library) while the app runs, so a restore refuses to
-    swap the database under it. Waits while a restore holds it."""
-    global _lock
-    from app import db
-    try:
-        _lock = db.lock_library()
-    except OSError as e:  # a filesystem without flock: a restore then can't tell the app runs
-        server.log.warning("Could not lock the library (%s): a restore can't tell that the app is running", e)
+_lock = None  # the connection holding the library's lock, for as long as the worker runs
 
 
 def post_worker_init(worker):
-    """Start the job worker as soon as the app is up, so jobs a restart cut off carry on
+    """Hold the library's advisory lock (db.hold_app_lock) while the worker runs, so a restore
+    refuses to replace the library under it; waits while a restore holds it. Taken in the
+    worker, not the master: a connection opened before the fork would be shared with it.
+    Then start the job worker as soon as the app is up, so jobs a restart cut off carry on
     without waiting for someone to open the page. Requests also start it (main.py)."""
-    from app import jobs
+    global _lock
+    from app import db, jobs
+    try:
+        _lock = db.hold_app_lock()
+    except db.Error as e:  # the database is down: a restore then can't tell the app runs
+        worker.log.warning("Could not take the library's lock (%s): a restore can't tell that the app is running", e)
     try:
         jobs.start()
     except Exception:  # say the database stays locked: the first request tries again

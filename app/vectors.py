@@ -1,8 +1,9 @@
 """Search by meaning. Each chunk gets an embedding from a small local model (Ollama's
-OLLAMA_EMBED_MODEL, qwen3-embedding:0.6b), stored as float32 in chunk_vectors. A question
-is embedded too, and the chunks nearest it in meaning (cosine) are blended with the keyword
-search (FTS5) by reciprocal rank fusion: "hydraulic oil capacity" then also finds the
-passage that says "transmission fluid ... 38 litres", which shares none of its words.
+OLLAMA_EMBED_MODEL, qwen3-embedding:0.6b), stored in chunk_vectors as a pgvector vector
+with an HNSW index (db.nearest_chunks). A question is embedded too, and the chunks nearest
+it in meaning (cosine) are blended with the keyword search (Postgres full-text search) by
+reciprocal rank fusion: "hydraulic oil capacity" then also finds the passage that says
+"transmission fluid ... 38 litres", which shares none of its words.
 
 Best effort throughout. When Ollama or the embedding model is unavailable, search is by
 keywords only, an upload is added without vectors, and the job worker embeds whatever is
@@ -13,10 +14,7 @@ stop embedding for as long, and the backfill sets that passage aside, so it can'
 the rest of the library. Flask-free, like jobs.py."""
 import logging
 import os
-import threading
 import time
-
-import numpy as np
 
 from . import db, extract, ollama
 
@@ -51,8 +49,6 @@ MIN_CHARS = 100
 # qwen3-embedding matches a question best when told the task; passages are embedded as they are.
 QUERY = "Instruct: Given a question, retrieve passages from the user's documents that answer it\nQuery: {}"
 
-_cache = None        # ((db.index_version(), model), (chunk ids, document ids, unit-length vectors) or None)
-_cache_lock = threading.Lock()
 _paused = {}         # "questions" | "passages" -> (time.monotonic() it ends, why), until a call works again
 _singly = set()      # documents whose batch failed: the backfill sends them a passage per call
 _aside = {}          # chunk id -> time.monotonic() before which the backfill passes it over
@@ -99,8 +95,8 @@ def status():
 
 
 def _embed(texts, kind="embed", on_usage=None):
-    """Vectors of texts as chunk_vectors keeps them (float32 bytes)."""
-    return [np.asarray(v, dtype="<f4").tobytes() for v in ollama.embed(texts, kind=kind, on_usage=on_usage)]
+    """Vectors of texts, each a list of floats, as db stores them."""
+    return [[float(x) for x in v] for v in ollama.embed(texts, kind=kind, on_usage=on_usage)]
 
 
 def _log(calls, doc_id=None):
@@ -164,7 +160,7 @@ def backfill(batches=4):
             rows = rows[:1]
         calls = []
         try:
-            blobs = _embed([extract.plain(text) for _, _, text in rows], on_usage=lambda *call: calls.append(call))
+            vectors = _embed([extract.plain(text) for _, _, text in rows], on_usage=lambda *call: calls.append(call))
         except Exception as e:
             if len(rows) > 1:  # perhaps more than one call can do in EMBED_TIMEOUT: try this document a chunk a call
                 _singly.add(doc)
@@ -173,7 +169,7 @@ def backfill(batches=4):
             _failed("passages", e)
             break
         _worked("passages")
-        kept = db.store_vectors(model, [(cid, text, blob) for (cid, _, text), blob in zip(rows, blobs)])
+        kept = db.store_vectors(model, [(cid, text, v) for (cid, _, text), v in zip(rows, vectors)])
         _log(calls, doc if kept else None)  # none kept: the document went meanwhile
         if not kept:
             break
@@ -183,62 +179,16 @@ def backfill(batches=4):
     return done
 
 
-def _vectors():
-    """Every vector from the current model as unit-length rows of one matrix, with their
-    chunk and document ids: loaded once, and again after chunks or vectors change
-    (db.index_version). None when there are none."""
-    global _cache
-    key = (db.index_version(), ollama.EMBED_MODEL)  # read first: a change while loading reloads next time
-    cached = _cache
-    if cached and cached[0] == key:
-        return cached[1]
-    with _cache_lock:  # one load at a time
-        if _cache and _cache[0] == key:
-            return _cache[1]
-        # Loaded into arrays sized up front, row by row, and normalized in place, the old ones
-        # let go first: a load takes about the room of the vectors once (50,000 chunks: 205
-        # MB), not three times (four to reload).
-        _cache = None
-        rows = db.all_vectors(key[1], MIN_CHARS)
-        try:  # closed however it ends: the read transaction would hold up writers
-            most, n, matrix = next(rows), 0, None
-            ids, docs = np.empty(most, dtype=np.int64), np.empty(most, dtype=np.int64)
-            for cid, doc, blob in rows:
-                v = np.frombuffer(blob, dtype="<f4")
-                if matrix is None:
-                    matrix = np.empty((most, len(v)), dtype=np.float32)
-                elif len(v) != matrix.shape[1]:  # another size than the first: not comparable
-                    continue
-                ids[n], docs[n], matrix[n] = cid, doc, v
-                n += 1
-        finally:
-            rows.close()
-        held = None
-        if n:
-            matrix = matrix[:n]
-            norms = np.sqrt(np.einsum("ij,ij->i", matrix, matrix))[:, None]  # no squared copy, as linalg.norm makes
-            norms[norms == 0] = 1
-            matrix /= norms
-            held = ids[:n], docs[:n], matrix
-        _cache = (key, held)
-    return held
-
-
 def _nearest(question, n, floor, doc_ids=None, on_usage=None):
     """The `n` chunks nearest the question in meaning (cosine), nearest first, as [(chunk
     id, similarity)], none less similar than `floor` (None: however far); only in the
-    documents `doc_ids`, if given. [] when there are no vectors to compare it with or it
-    can't be embedded."""
+    documents `doc_ids`, if given. [] when there are no vectors to compare it with (the
+    question isn't embedded then) or it can't be embedded."""
     if not ready():
         return []
-    held = _vectors()
-    if held is None:
-        return []
-    ids, docs, matrix = held
-    if doc_ids is not None:
-        keep = np.isin(docs, np.asarray(list(doc_ids), dtype=np.int64))
-        ids, matrix = ids[keep], matrix[keep]
-    if not len(ids):
+    model = ollama.EMBED_MODEL
+    size = db.vector_size(model, MIN_CHARS, doc_ids)
+    if size is None:
         return []
     try:
         (q,) = ollama.embed([QUERY.format(question)], kind="embed-query", on_usage=on_usage)
@@ -246,20 +196,12 @@ def _nearest(question, n, floor, doc_ids=None, on_usage=None):
         _failed("questions", e)
         return []
     _worked("questions")
-    q = np.asarray(q, dtype=np.float32)
-    if q.shape != (matrix.shape[1],):
-        log.warning("A question's embedding has %s values, the stored ones %d", q.shape, matrix.shape[1])
+    if len(q) != size:
+        log.warning("A question's embedding has %d values, the stored ones %d", len(q), size)
         return []
-    scores = matrix @ (q / (float(np.linalg.norm(q)) or 1.0))
-    if floor is not None:
-        near = scores >= floor
-        ids, scores = ids[near], scores[near]
-    k = min(n, len(scores))
-    if not k:
-        return []
-    top = np.argpartition(-scores, k - 1)[:k]
-    top = top[np.argsort(-scores[top], kind="stable")]
-    return list(zip(ids[top].tolist(), scores[top].tolist()))
+    if not any(q):
+        return []  # no direction: as near to everything as to nothing
+    return db.nearest_chunks(model, q, n, floor, MIN_CHARS, doc_ids)
 
 
 def search(question, limit, doc_ids=None, on_usage=None):

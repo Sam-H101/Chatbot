@@ -1,0 +1,53 @@
+# The test suite, against a real Postgres (with pgvector) and Azurite (Azure Blob Storage's
+# emulator); S3 is faked in-process (moto). The same here and in CI:
+#
+#     docker compose -f docker-compose.test.yml run --rm --build tests [pytest args]
+#     docker compose -f docker-compose.test.yml down -v
+#
+# Each test gets a schema of its own in the one database, dropped after it.
+name: chatbot-test
+
+services:
+  tests:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.13-slim
+        WORKDIR /srv
+        RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client \
+            && rm -rf /var/lib/apt/lists/*
+        COPY requirements.txt requirements-test.txt ./
+        RUN pip install --no-cache-dir -r requirements.txt -r requirements-test.txt
+    volumes:
+      - .:/srv
+    working_dir: /srv
+    environment:
+      - TEST_DATABASE_URL=postgresql://chatbot:chatbot@postgres:5432/chatbot
+      - TEST_AZURITE=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      - PYTHONDONTWRITEBYTECODE=1
+    entrypoint: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      azurite:
+        condition: service_started
+
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg17
+    environment:
+      - POSTGRES_USER=chatbot
+      - POSTGRES_PASSWORD=chatbot
+      - POSTGRES_DB=chatbot
+    # Throwaway data: no need to wait for the disk.
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatbot -d chatbot"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--skipApiVersionCheck", "--loose"]

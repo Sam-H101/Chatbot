@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import secrets
-import tempfile
 import threading
 import time
 from datetime import timedelta
@@ -54,27 +53,13 @@ def setup(app):
 
 
 def secret_key():
-    """SECRET_KEY, or else a random key made once and kept beside the database (mode 600), so a
-    restart doesn't log everyone out. Deleting the file logs everyone out at the next restart."""
+    """SECRET_KEY, or else a random key made once and kept in the database (db.setting), so a
+    restart doesn't log everyone out. Deleting it (DELETE FROM settings WHERE key='secret_key')
+    logs everyone out at the next restart."""
     key = os.environ.get("SECRET_KEY", "")
     if key:
         return key
-    folder = os.path.dirname(db.DB_PATH) or "."
-    path = os.path.join(folder, "secret_key")
-    try:
-        with open(path) as f:
-            key = f.read().strip()
-    except FileNotFoundError:
-        key = ""
-    if len(key) < 32:  # none yet, or a write cut short
-        os.makedirs(folder, exist_ok=True)
-        key = secrets.token_hex(32)
-        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".secret_key.")  # mkstemp makes it mode 600
-        with os.fdopen(fd, "w") as f:
-            f.write(key)
-        os.replace(tmp, path)
-        log.info("Made a new session key in %s", path)
-    return key
+    return db.setting("secret_key", lambda: secrets.token_hex(32))
 
 
 class Sessions(SecureCookieSessionInterface):

@@ -7,10 +7,10 @@ import pytest
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    from app import auth, db, jobs, llm, main, ollama, thumbs, vectors
-    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
-    monkeypatch.setattr(db, "THUMBS_DIR", "")  # thumbnails go to tmp_path / "thumbs"
+def client(pg, tmp_path, monkeypatch):
+    # pg (conftest.py): a schema of its own, originals in tmp_path / "files", thumbnails in
+    # tmp_path / "thumbs".
+    from app import auth, jobs, llm, main, ollama, thumbs, vectors
     monkeypatch.setattr(thumbs, "_failed", set())
     monkeypatch.setattr(auth, "PASSWORD", "")  # no login, unless a test sets a password (guarded)
     # No embedding model unless a test brings one (fake_embedder): search is by keywords, and
@@ -19,8 +19,6 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(vectors, "_paused", {})
     monkeypatch.setattr(vectors, "_singly", set())
     monkeypatch.setattr(vectors, "_aside", {})
-    monkeypatch.setattr(vectors, "_cache", None)
-    monkeypatch.setattr(db, "FILES_DIR", "")  # originals go to tmp_path / "files"
     monkeypatch.setattr(main, "BACKEND", "claude")
     # No worker thread: tests run the queue themselves (jobs.drain), see upload() below.
     monkeypatch.setattr(jobs, "BACKGROUND", False)
@@ -146,9 +144,9 @@ def search_parts(client, q):
 def test_search_snippets_are_plain_text_in_parts(client):
     add(client, "brakes.md", BRAKE_PAGE.encode())
     (hit,) = search_parts(client, "figure")
-    assert hit["snippet_parts"] == [
-        "… TROUBLESHOOTING Symptom · Provable Causes · Solution · Pedal travel too long · Pedal free play incorrectly "
-        "adjusted · Brake disc worn · Adjust; replace [see ", "figure", " 3] Check …"]               # its "[" is text
+    assert hit["snippet_parts"] == [                                                          # about 24 words round it
+        "… free play incorrectly adjusted · Brake disc worn · Adjust; replace [see ", "figure",
+        " 3] Check the hydraulic fluid & the pedal before driving."]                              # its "[" is text
     (hit,) = search_parts(client, "brake")
     parts = hit["snippet_parts"]
     assert parts[1::2] == ["BRAKE", "BRAKE", "Brake"] and parts[0] == "CHAPTER 7 "
@@ -156,8 +154,8 @@ def test_search_snippets_are_plain_text_in_parts(client):
     assert not any(s in text for s in ("#", "|", "<br>", "- Brake", "---")), text                 # no Markdown or HTML
     assert "incorrectly adjusted · Brake disc" in text                                          # a cell's lines apart
     (hit,) = search_parts(client, "hydraulic")                                                  # a match in **bold**
-    assert hit["snippet_parts"] == ["… long · Pedal free play incorrectly adjusted · Brake disc worn · Adjust; replace "
-                                    "[see figure 3] Check the ", "hydraulic", " fluid & the pedal before driving."]
+    assert hit["snippet_parts"] == ["… Brake disc worn · Adjust; replace [see figure 3] Check the ", "hydraulic",
+                                    " fluid & the pedal before driving."]
     (hit,) = search_parts(client, "chapter")
     assert hit["snippet_parts"][:2] == ["", "CHAPTER"]                                          # a match first: "" before it
     assert hit["snippet"].startswith("[CHAPTER] 7 BRAKE BRAKE 7-3 1. TROUBLESHOOTING Symptom · ")
@@ -1156,8 +1154,10 @@ def test_gunicorn_starts_the_job_worker_at_boot(local, monkeypatch):
     db.claim_next_job()                                                                    # running when it stopped
     monkeypatch.setattr(jobs, "BACKGROUND", True)
     monkeypatch.setattr(jobs, "_thread", None)
+    monkeypatch.setattr(gunicorn_conf, "_lock", None)
     try:
         gunicorn_conf.post_worker_init(SimpleNamespace(log=None))                          # no request at all
+        assert gunicorn_conf._lock is not None                                             # holding the library's lock
         for _ in range(200):
             if db.job_status(job_id) == "done":
                 break
@@ -1165,21 +1165,30 @@ def test_gunicorn_starts_the_job_worker_at_boot(local, monkeypatch):
         assert db.job_status(job_id) == "done"
     finally:
         jobs.stop()
+        if gunicorn_conf._lock:
+            gunicorn_conf._lock.close()
 
 
-def test_old_database_gains_model_column(tmp_path, monkeypatch):
+def migrated(tmp_path, schema, name="live.db"):
+    """An older release's SQLite library (`schema`: its SQL, rows and all) moved into this
+    test's Postgres schema by app.migrate, as the live library is. Returns what it copied."""
     import sqlite3
-    from app import db
-    path = tmp_path / "old.db"
+    from app import migrate
+    path = tmp_path / name
     con = sqlite3.connect(path)
-    con.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, filename TEXT NOT NULL, uploaded_at TEXT NOT NULL "
-                "DEFAULT (datetime('now')), char_count INTEGER NOT NULL, title TEXT NOT NULL DEFAULT '', doc_type "
-                "TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', keywords TEXT NOT NULL DEFAULT '', "
-                "analysis TEXT NOT NULL DEFAULT '')")
-    con.execute("INSERT INTO documents (filename, char_count) VALUES ('old.txt', 5)")
+    con.executescript(schema)
     con.commit()
     con.close()
-    monkeypatch.setattr(db, "DB_PATH", str(path))
+    return migrate.migrate(str(path))
+
+
+def test_old_database_gains_model_column(pg, tmp_path):
+    from app import db
+    migrated(tmp_path, "CREATE TABLE documents (id INTEGER PRIMARY KEY, filename TEXT NOT NULL, uploaded_at TEXT NOT NULL"
+                       " DEFAULT (datetime('now')), char_count INTEGER NOT NULL, title TEXT NOT NULL DEFAULT '', doc_type"
+                       " TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', keywords TEXT NOT NULL DEFAULT '',"
+                       " analysis TEXT NOT NULL DEFAULT '');"
+                       " INSERT INTO documents (filename, char_count) VALUES ('old.txt', 5);")
     doc = db.list_documents()[0]
     assert doc["model"] == "" and doc["sha256"] is None and doc["has_file"] is False
 
@@ -1257,14 +1266,8 @@ OLD_SCHEMAS["42a0a88"] = OLD_SCHEMAS["ae11627"] + SCHEMA_42A0A88_EXTRA
 
 
 @pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())
-def test_library_from_before_kept_files_still_works(client, tmp_path, monkeypatch, schema):
-    import sqlite3
-    from app import db
-    path = tmp_path / "live.db"
-    con = sqlite3.connect(path)
-    con.executescript(schema)
-    con.close()
-    monkeypatch.setattr(db, "DB_PATH", str(path))
+def test_library_from_before_kept_files_still_works(client, tmp_path, schema):
+    migrated(tmp_path, schema)
     doc = client.get("/api/documents").json[0]
     assert doc["title"] == "Tractor manual" and doc["model"] == "qwen3.5:9b"
     assert doc["has_file"] is False and doc["sha256"] is None and doc["file_size"] is None
@@ -1291,20 +1294,11 @@ def test_library_from_before_kept_files_still_works(client, tmp_path, monkeypatc
 def test_documents_from_before_unit_checks_get_one(client, tmp_path, monkeypatch, schema):
     """The live library's documents have no unit check: the worker runs it once at start,
     from their stored chunks (no model), and the list of one is worked out when asked."""
-    import sqlite3
     import time
     from app import db, jobs
-    path = tmp_path / "live.db"
-    con = sqlite3.connect(path)
-    con.executescript(schema)
     kioti = "| Capacity | Transmission fluid | 38.0 ℓ |\n|---|---|---|\n| | | 40.1 U.S.gal. |"
-    con.execute("INSERT INTO documents (id, filename, char_count, title) VALUES (2, 'Chapter 6.pdf', ?, 'KIOTI')",
-                (len(kioti),))
-    con.execute("INSERT INTO chunks (id, doc_id, idx, text) VALUES (2, 2, 0, ?)", (kioti,))
-    con.execute("INSERT INTO chunks_fts (rowid, text) VALUES (2, ?)", (kioti,))
-    con.commit()
-    con.close()
-    monkeypatch.setattr(db, "DB_PATH", str(path))
+    migrated(tmp_path, schema + f"INSERT INTO documents (id, filename, char_count, title) VALUES (2, 'Chapter 6.pdf',"
+                                f" {len(kioti)}, 'KIOTI'); INSERT INTO chunks (id, doc_id, idx, text) VALUES (2, 2, 0, '{kioti}');")
     assert [d["unit_fixes"] for d in client.get("/api/documents").json] == [None, None]   # not checked yet
     r = client.get("/api/documents/2/units").json                                        # worked out when asked
     assert r["has_file"] is False and r["pdf"] is False and [(f["page"], f["kind"], f["printed"]) for f in r["findings"]] == [
@@ -1489,12 +1483,11 @@ def test_claude_calls_report_their_usage():
     assert seen[0][1:] == ("claude", "claude-haiku-5-5", {"input": 1200, "output": 300, "cache_read": 0, "cache_write": 50})
 
 
-def test_refused_claude_chat_is_logged_and_reported(tmp_path, monkeypatch):
+def test_refused_claude_chat_is_logged_and_reported(pg, monkeypatch):
     """A refusal is billed for its input, so it gets a usage row, and the page gets a
     readable error instead of an HTML 500."""
     from types import SimpleNamespace as NS
-    from app import db, jobs, llm, main
-    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    from app import jobs, llm, main
     monkeypatch.setattr(jobs, "BACKGROUND", False)
     usage = NS(input_tokens=4000, output_tokens=0, cache_read_input_tokens=0, cache_creation_input_tokens=0)
     monkeypatch.setattr(llm, "client_for", lambda key: fake_claude(NS(stop_reason="refusal", usage=usage, content=[])))
@@ -1555,8 +1548,10 @@ def test_usage_report_totals_per_model_and_day(client):
     ], doc_id=None)
     with db.connect() as con:
         con.execute("INSERT INTO usage (created_at, kind, backend, model, input_tokens, cost_usd) VALUES "
-                    "(datetime('now', '-1 day'), 'chat', 'claude', 'claude-opus-5-5', 100, 0.5),"
-                    "(datetime('now', '-40 days'), 'chat', 'claude', 'claude-opus-5-5', 999, 5.0)")
+                    "(to_char(now() AT TIME ZONE 'UTC' - interval '1 day', 'YYYY-MM-DD HH24:MI:SS'), 'chat', 'claude',"
+                    " 'claude-opus-5-5', 100, 0.5),"
+                    "(to_char(now() AT TIME ZONE 'UTC' - interval '40 days', 'YYYY-MM-DD HH24:MI:SS'), 'chat', 'claude',"
+                    " 'claude-opus-5-5', 999, 5.0)")
     r = client.get("/api/usage").json                                                    # 30 days by default
     assert r["days"] == 30 and r["total"]["calls"] == 4
     assert r["total"]["input_tokens"] == 1000 + 10_000 + 700 + 100 and r["total"]["cache_read_tokens"] == 2000
@@ -1580,11 +1575,10 @@ def test_usage_report_when_nothing_was_logged(client):
 def test_a_failed_usage_write_does_not_fail_the_request(client, monkeypatch):
     """Usage logging is best effort: a busy database must not throw away a paid answer,
     report a stored upload as failed, or hide why a read failed."""
-    import sqlite3
     from app import db, jobs
 
     def locked(*a, **kw):
-        raise sqlite3.OperationalError("database is locked")
+        raise db.OperationalError("the database is unreachable")
 
     monkeypatch.setattr(db, "add_usage", locked)
     r = client.post("/api/chat", json={"question": "hi"}, headers=H)
@@ -1607,20 +1601,19 @@ def test_usage_rows_lose_their_link_when_the_document_goes(local):
     assert [r["doc_id"] for r in _usage_rows()] == [None, None]                          # still logged
 
 
-def test_first_requests_at_once_bring_the_schema_up_to_date(tmp_path, monkeypatch):
-    """The page loads documents and instructions in parallel. On a new database and on
-    one from before kept files, every one of those first requests must succeed."""
-    import sqlite3
+def test_first_requests_at_once_bring_the_schema_up_to_date(pg, monkeypatch):
+    """The page loads documents and instructions in parallel. On a new database every one of
+    those first requests must succeed: the schema is made once, under an advisory lock."""
     import threading
+    import psycopg
     from app import db
-    errors = []
-    for n in range(40):
-        path = tmp_path / f"{n}.db"
-        if n % 2:
-            con = sqlite3.connect(path)
-            con.executescript(SCHEMA_894B984)
-            con.close()
-        monkeypatch.setattr(db, "DB_PATH", str(path))
+    errors, schemas = [], []
+    for n in range(12):
+        schema = f"{pg}_{n}"
+        with psycopg.connect(db.DATABASE_URL, autocommit=True) as c:
+            c.execute(f"CREATE SCHEMA {schema}")
+        schemas.append(schema)
+        monkeypatch.setattr(db, "DB_SCHEMA", schema)
         gate = threading.Barrier(4)
 
         def hit(fn):
@@ -1637,7 +1630,13 @@ def test_first_requests_at_once_bring_the_schema_up_to_date(tmp_path, monkeypatc
         for t in threads:
             t.join()
         with db.connect() as con:
-            assert {"sha256", "file_path", "file_size", "mime"} <= {r[1] for r in con.execute("PRAGMA table_info(documents)")}
+            assert {"sha256", "file_path", "file_size", "mime", "fts"} <= {r[0] for r in con.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema()"
+                " AND table_name = 'documents'")}
+    db.close_pool()
+    with psycopg.connect(db.DATABASE_URL, autocommit=True) as c:
+        for schema in schemas:
+            c.execute(f"DROP SCHEMA {schema} CASCADE")
     assert errors == []
 
 
@@ -1663,7 +1662,7 @@ def test_a_copy_still_queued_or_being_read_counts_as_a_duplicate(client):
 
 
 def test_a_failed_insert_leaves_no_file_behind(client, tmp_path, monkeypatch):
-    import sqlite3
+    import contextlib
     from app import db, llm
     files = tmp_path / "files"
     monkeypatch.setattr(llm, "analyze", lambda c, name, text, model=None, **kw: (
@@ -1675,25 +1674,17 @@ def test_a_failed_insert_leaves_no_file_behind(client, tmp_path, monkeypatch):
     assert not any(files.glob("*"))
     real = db.connect
 
-    class CommitFails:  # the rows are written, then the commit fails (say the database is locked)
-        def __init__(self):
-            self.con = real()
+    @contextlib.contextmanager
+    def commit_fails():  # the rows are written, then the commit fails (say the connection drops)
+        with real() as con:
+            yield con
+            con.raw.rollback()
+            raise db.OperationalError("the connection was lost")
 
-        def __getattr__(self, name):
-            return getattr(self.con, name)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            self.con.rollback()
-            if exc[0] is None:
-                raise sqlite3.OperationalError("database is locked")
-
-    monkeypatch.setattr(db, "connect", CommitFails)
-    with pytest.raises(sqlite3.OperationalError):
+    monkeypatch.setattr(db, "connect", commit_fails)
+    with pytest.raises(db.OperationalError):
         db.add_document("a.txt", ["Rent."], {"title": "A"}, "full", data=b"Rent.")
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(db.OperationalError):
         db.add_job("upload", "a.txt", db.file_hash(b"Rent."), "auto", {}, data=b"Rent.")
     monkeypatch.setattr(db, "connect", real)
     assert db.list_documents() == [] and not any(files.glob("*"))
@@ -2245,7 +2236,7 @@ def test_a_one_page_pdf_has_page_numbers_too(local, monkeypatch):
     r = local.get(f"/api/documents/{job['doc_id']}/units").json
     assert r["pdf"] is True and [f["page"] for f in r["findings"]] == [1]
     with db.connect() as con:                                                             # a check from another units.py
-        con.execute("UPDATE documents SET unit_findings=json_set(unit_findings, '$.version', 'older')")
+        con.execute("""UPDATE documents SET unit_findings=(unit_findings::jsonb || '{"version": "older"}')::text""")
     assert jobs.check_units() == 1
     assert [f["page"] for f in local.get(f"/api/documents/{job['doc_id']}/units").json["findings"]] == [1]
     add(local, "spec.txt", b"Fuel tank 38.0 L / 40.1 U.S.gal")                           # text files have no pages
@@ -2267,7 +2258,7 @@ def test_a_long_list_of_unit_fixes_is_cut_and_counted(local, monkeypatch):
     assert r["total"] == 7 and [f["context"][-5:] for f in r["findings"]] == ["Day 1", "Day 2", "Day 3"]
     assert "recalculated" not in r["findings"][1]["context"]                              # the row before, as printed
     with db.connect() as con:                                                             # a check from before the total
-        con.execute("UPDATE documents SET unit_findings=json_remove(unit_findings, '$.total')")
+        con.execute("UPDATE documents SET unit_findings=(unit_findings::jsonb - 'total')::text")
     assert local.get("/api/documents").json[0]["unit_fixes"] == 3
     assert local.get(f"/api/documents/{job['doc_id']}/units").json["total"] == 3
 
@@ -2318,12 +2309,13 @@ BRAKES = ["Chapter 7 Brakes. Contents.", "Brake pedal free travel is 30-40 mm. "
 
 
 def _chunk_rows(doc_id=None):
-    """Chunks with their pages, and the model and size (bytes) of their vectors."""
+    """Chunks with their pages, and the model and size (values) of their vectors."""
     from app import db
     with db.connect() as con:
         return [dict(r) for r in con.execute(
-            "SELECT c.id, c.doc_id, c.idx, c.page_start, c.page_end, v.model, length(v.vector) AS size FROM chunks c"
-            " LEFT JOIN chunk_vectors v ON v.chunk_id = c.id WHERE ? IS NULL OR c.doc_id = ? ORDER BY c.id",
+            "SELECT c.id, c.doc_id, c.idx, c.page_start, c.page_end, v.model, v.dims AS size FROM chunks c"
+            " LEFT JOIN chunk_vectors v ON v.chunk_id = c.id WHERE CAST(? AS bigint) IS NULL OR c.doc_id = ?"
+            " ORDER BY c.id",
             (doc_id, doc_id))]
 
 
@@ -2367,7 +2359,7 @@ def test_questions_are_searched_without_their_stopwords(client):
     and in the blend with search by meaning counted as a keyword match."""
     from app.db import fts_query
     for question in (True, False):
-        assert fts_query("What is the hydraulic oil capacity?", question) == '"hydraulic" OR "oil" OR "capacity"'
+        assert fts_query("What is the hydraulic oil capacity?", question) == "'hydraulic' | 'oil' | 'capacity'"
     assert fts_query("What is 2 + 2?", question=True) == ""                               # nothing to search for
     add(client, "gearbox.txt", GEARBOX)
     assert client.get("/api/search?q=What is the oil capacity?").json == []               # "the" alone doesn't match
@@ -2379,8 +2371,8 @@ def test_the_search_box_still_finds_a_will_by_its_name(client):
     """Typed alone in the library's search box, a common word is what the user is looking
     for: a will, an IT policy, the WHO. Questions still leave such words out."""
     from app.db import fts_query
-    assert fts_query("will") == '"will"' and fts_query("will", question=True) == ""
-    assert fts_query("the will") == '"the" OR "will"' and fts_query("IT policy") == '"policy"'
+    assert fts_query("will") == "'will'" and fts_query("will", question=True) == ""
+    assert fts_query("the will") == "'the' | 'will'" and fts_query("IT policy") == "'policy'"
     will = add(client, "Last Will.txt", b"LAST WILL AND TESTAMENT\n\nI leave my tractor to my nephew.")["doc_id"]
     add(client, "IT policy.txt", b"Passwords are changed every 90 days.")
     assert [d["filename"] for d in client.get("/api/documents?q=will").json] == ["Last Will.txt"]  # by its name
@@ -2433,7 +2425,7 @@ def test_an_upload_is_indexed_for_search_by_meaning(local, monkeypatch):
     i = stages.index(("Indexing for search by meaning: 0 of 3 passages", 0, 3))
     assert stages[i + 1:i + 4] == [("Indexing for search by meaning: 2 of 3 passages", 2, 3),
                                    ("Indexing for search by meaning: 3 of 3 passages", 3, 3), ("Saving", None, None)]
-    assert {(r["model"], r["size"]) for r in _chunk_rows()} == {(ollama.EMBED_MODEL, 4 * (len(MEANINGS) + 1))}
+    assert {(r["model"], r["size"]) for r in _chunk_rows()} == {(ollama.EMBED_MODEL, len(MEANINGS) + 1)}
     assert [(r["kind"], r["model"], r["doc_id"], r["cost_usd"]) for r in _usage_rows()] == [
         ("analyze", ollama.MODEL, job["doc_id"], 0)] + [("embed", ollama.EMBED_MODEL, job["doc_id"], 0)] * 2
 
@@ -2472,23 +2464,33 @@ def test_without_the_embedding_model_uploads_and_questions_go_on(local, monkeypa
 
 
 def test_vectors_follow_rereads_and_deletes(local, monkeypatch):
-    """A re-read's new chunks get new vectors (the old ones go with their chunks), a delete
-    takes them away, and the vectors held in memory are reloaded after each: SQLite gives a
-    new chunk the id of a deleted one, which must not keep the old one's vector."""
-    from app import db, extract, jobs, vectors
+    """A re-read's new chunks get new vectors (the old ones go with their chunks), and a
+    delete takes them away."""
+    from app import db, extract, jobs, ollama
     fake_embedder(monkeypatch)
     monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [("Transmission fluid: 38 litres.", None)])
     doc_id = add(local, "spec.pdf", blank_pdf(1), model="ollama:qwen3.5:9b")["doc_id"]
-    assert vectors._vectors()[2][0].argmax() == 0                                         # the fluid meaning
+    (old,) = _chunk_rows()
+    assert _meaning(old["id"]) == 0                                                         # the fluid meaning
     monkeypatch.setattr(extract, "pdf_pages", lambda data, **kw: [("Brake pedal: 30 mm of free travel.", None)])
     local.post(f"/api/documents/{doc_id}/reread", json={"model": "ollama:qwen3.5:9b"})
     jobs.drain()
-    assert [(r["id"], r["model"] is not None) for r in _chunk_rows()] == [(1, True)]      # the same chunk id ...
-    assert vectors._vectors()[2][0].argmax() == 4                                         # ... with its own vector
+    (new,) = _chunk_rows()
+    assert new["id"] != old["id"] and new["model"] is not None                            # a new chunk ...
+    assert _meaning(new["id"]) == 4                                                       # ... with its own vector
     assert local.delete(f"/api/documents/{doc_id}").status_code == 204
-    assert vectors._vectors() is None and _chunk_rows() == []
+    assert db.vector_counts(ollama.EMBED_MODEL) == (0, 0) and _chunk_rows() == []
     with db.connect() as con:
         assert con.execute("SELECT count(*) FROM chunk_vectors").fetchone()[0] == 0
+
+
+def _meaning(chunk_id):
+    """Which of MEANINGS a chunk's stored vector stands for most (fake_embedder's)."""
+    from app import db
+    with db.connect() as con:
+        text = con.execute("SELECT embedding::text FROM chunk_vectors WHERE chunk_id=?", (chunk_id,)).fetchone()[0]
+    values = [float(x) for x in text.strip("[]").split(",")]
+    return values.index(max(values))
 
 
 def test_a_vector_made_for_text_that_changed_meanwhile_is_not_kept(client):
@@ -2497,9 +2499,9 @@ def test_a_vector_made_for_text_that_changed_meanwhile_is_not_kept(client):
     id), the vector is dropped and the new text is embedded on the next round."""
     from app import db, ollama
     (row,) = _chunk_rows(add(client)["doc_id"])
-    assert db.store_vectors(ollama.EMBED_MODEL, [(row["id"], "Some other text.", bytes(24))]) == 0
-    assert db.store_vectors(ollama.EMBED_MODEL, [(row["id"], LEASE.decode(), bytes(24))]) == 1
-    assert db.store_vectors(ollama.EMBED_MODEL, [(999, LEASE.decode(), bytes(24))]) == 0  # no such chunk
+    assert db.store_vectors(ollama.EMBED_MODEL, [(row["id"], "Some other text.", [0.5] * 6)]) == 0
+    assert db.store_vectors(ollama.EMBED_MODEL, [(row["id"], LEASE.decode(), [0.5] * 6)]) == 1
+    assert db.store_vectors(ollama.EMBED_MODEL, [(999, LEASE.decode(), [0.5] * 6)]) == 0  # no such chunk
 
 
 def test_vectors_of_another_embedding_model_are_made_again(client, monkeypatch):
@@ -2508,7 +2510,8 @@ def test_vectors_of_another_embedding_model_are_made_again(client, monkeypatch):
     add(client, "gearbox.txt", GEARBOX)
     assert db.vector_counts(ollama.EMBED_MODEL) == (1, 1)
     monkeypatch.setattr(ollama, "EMBED_MODEL", "other-embedding:1b")                       # OLLAMA_EMBED_MODEL changed
-    assert db.vector_counts("other-embedding:1b") == (1, 0) and vectors._vectors() is None  # never compared across models
+    assert db.vector_counts("other-embedding:1b") == (1, 0)
+    assert db.vector_size("other-embedding:1b") is None                                     # never compared across models
     assert vectors.backfill() == 1 and [r["model"] for r in _chunk_rows()] == ["other-embedding:1b"]
 
 
@@ -2664,13 +2667,8 @@ def test_chunks_from_before_pages_and_vectors_still_work(client, tmp_path, monke
     """The live library's chunks have no pages and no vectors: they are cited by file name,
     found by keywords at first, and embedded by the backfill from their stored text (no
     model reads the documents again), after which search by meaning finds them too."""
-    import sqlite3
-    from app import db, ollama, vectors
-    path = tmp_path / "live.db"
-    con = sqlite3.connect(path)
-    con.executescript(schema)
-    con.close()
-    monkeypatch.setattr(db, "DB_PATH", str(path))
+    from app import ollama, vectors
+    migrated(tmp_path, schema)
     r = client.post("/api/chat", json={"question": "When do I change the hydraulic oil?"}, headers=H).json
     assert r["sources"] == [{"doc_id": 1, "filename": "manual.pdf", "title": "Tractor manual", "has_file": False,
                              "pdf": False, "pages": [], "excerpts": [0]}]
@@ -2928,7 +2926,6 @@ def test_a_refused_streamed_answer_drops_its_words_but_keeps_its_question(client
 def test_an_answer_the_database_could_not_keep_is_still_given(client, monkeypatch):
     """Say the database stays locked when the answer is filled in: the model's stream is
     closed all the same, what it used is logged, and the page gets its answer."""
-    import sqlite3
     from app import db, llm
     closed = []
 
@@ -2941,7 +2938,7 @@ def test_an_answer_the_database_could_not_keep_is_still_given(client, monkeypatc
             on_usage("chat", "claude", model, {"input": 9, "output": 1, "cache_read": 0, "cache_write": 0})
 
     def locked(*args, **kw):
-        raise sqlite3.OperationalError("database is locked")
+        raise db.OperationalError("the database is unreachable")
 
     monkeypatch.setattr(llm, "chat_stream", model)
     monkeypatch.setattr(db, "finish_exchange", locked)
@@ -3156,15 +3153,14 @@ def test_a_conversation_keeps_the_documents_it_was_limited_to(client):
     client.post("/api/documents/delete", json={"ids": [b]})
     assert client.get(conv).json["doc_ids"] == []                                         # all gone, not "all documents"
     assert client.get(conv).json["messages"][1]["scope_names"] == ["a.txt", "b.txt"]     # what it was asked of
-    assert add(client, "c.txt", b"Something else.")["doc_id"] in (a, b)                    # SQLite gives an id out again
+    assert add(client, "c.txt", b"Something else.")["doc_id"] not in (a, b)                # ids are never given out again
     assert all(s.get("gone") and not s["has_file"] for s in client.get(conv).json["messages"][1]["sources"])
     client.post("/api/chat", json={"question": "Rent?", "conversation_id": r["conversation_id"]}, headers=H)
     assert client.get(conv).json["doc_ids"] is None
 
 
-def test_history_leaves_out_empty_answers(tmp_path, monkeypatch):
+def test_history_leaves_out_empty_answers(pg):
     from app import db
-    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
     first = db.begin_exchange(None, "q1", title="t")
     conv = first["conversation_id"]
     db.finish_exchange(first, "sent q1", {"content": "a1"})
@@ -3192,29 +3188,22 @@ def test_conversation_ids_are_never_given_out_again(client):
     assert [m["content"] for m in _messages(client, c)] == ["Rent?", "42"]
 
 
-def test_conversations_tables_from_the_first_release_keep_their_ids_from_now_on(client, tmp_path, monkeypatch):
-    """The conversations table as first released had no AUTOINCREMENT: it is copied into one
-    that has, its conversations and their messages kept."""
-    import sqlite3
+def test_conversations_tables_from_the_first_release_keep_their_ids_from_now_on(client, tmp_path):
+    """The conversations table as first released (no AUTOINCREMENT) is migrated with its ids,
+    its conversations and their messages kept, and a deleted conversation's id is never given
+    out again."""
     from app import db
-    path = tmp_path / "p5.db"
-    con = sqlite3.connect(path)
-    con.executescript(OLD_SCHEMAS["42a0a88"] + """
+    migrated(tmp_path, OLD_SCHEMAS["42a0a88"] + """
         INSERT INTO conversations (id, title, model, doc_ids) VALUES (1, 'Oil', 'auto', '[1]'), (2, 'Newest', 'auto', NULL);
         INSERT INTO messages (conversation_id, role, content, sent) VALUES (1, 'user', 'When?', 'sent When?'),
             (2, 'user', 'Hi', 'sent Hi');
         INSERT INTO messages (conversation_id, role, content, model_label, usage) VALUES
             (1, 'assistant', 'At 400 hours.', 'qwen3.5:9b', '{"input": 5}'), (2, 'assistant', 'Hello', 'x', 'null');
     """)
-    con.close()
-    monkeypatch.setattr(db, "DB_PATH", str(path))
     assert [(c["id"], c["title"], c["questions"], c["doc_ids"]) for c in client.get("/api/conversations").json] == [
         (2, "Newest", 1, None), (1, "Oil", 1, [1])]
     assert [m["content"] for m in _messages(client, 1)] == ["When?", "At 400 hours."]
     assert db.history(1) == [{"role": "user", "content": "sent When?"}, {"role": "assistant", "content": "At 400 hours."}]
-    with db.connect() as con:
-        assert "AUTOINCREMENT" in con.execute("SELECT sql FROM sqlite_master WHERE name='conversations'").fetchone()[0]
-        assert con.execute("PRAGMA foreign_keys").fetchone()[0] == 1 and not con.execute("PRAGMA foreign_key_check").fetchall()
     assert client.delete("/api/conversations/2").status_code == 204
     with db.connect() as con:                                                              # its messages went with it
         assert con.execute("SELECT count(*) FROM messages WHERE conversation_id=2").fetchone()[0] == 0
@@ -3239,7 +3228,8 @@ def test_a_question_is_kept_while_it_is_answered(client):
     assert rest(chunks)[-1][0] == "done" and _messages(client, c["id"])[1]["status"] == "done"
     old, new = db.begin_exchange(c["id"], "Deposit?"), db.begin_exchange(c["id"], "Pets?")
     with db.connect() as con:
-        con.execute("UPDATE messages SET created_at = datetime('now', '-1 hour') WHERE id IN (?, ?)",
+        con.execute("UPDATE messages SET created_at = to_char(now() AT TIME ZONE 'UTC' - interval '1 hour',"
+                    " 'YYYY-MM-DD HH24:MI:SS') WHERE id IN (?, ?)",
                     (old["question_id"], old["answer_id"]))
     jobs.recover()
     assert [(m["content"], m["status"], m["error"]) for m in _messages(client, c["id"])[2:] if m["role"] == "assistant"] == [
@@ -3345,14 +3335,8 @@ def test_questions_have_a_length_limit(client):
 
 
 @pytest.mark.parametrize("schema", OLD_SCHEMAS.values(), ids=OLD_SCHEMAS.keys())
-def test_libraries_from_before_saved_conversations_gain_them(client, tmp_path, monkeypatch, schema):
-    import sqlite3
-    from app import db
-    path = tmp_path / "live.db"
-    con = sqlite3.connect(path)
-    con.executescript(schema)
-    con.close()
-    monkeypatch.setattr(db, "DB_PATH", str(path))
+def test_libraries_from_before_saved_conversations_gain_them(client, tmp_path, schema):
+    migrated(tmp_path, schema)
     assert client.get("/api/conversations").json == []
     events = sse(client.post("/api/chat/stream", json={"question": "When do I change the hydraulic oil?", "doc_ids": [1]},
                              headers=H))
@@ -3581,15 +3565,14 @@ def test_wrong_passwords_are_held_up_per_address(guarded, monkeypatch):
         assert log_in(guarded, "wrong").status_code == 401                                # don't count
 
 
-def test_the_session_key_is_kept_across_restarts(guarded, tmp_path, monkeypatch):
-    import os
-    import stat
+def test_the_session_key_is_kept_across_restarts(guarded, monkeypatch):
     from app import main
+    from conftest import sql
     log_in(guarded)
-    key = tmp_path / "secret_key"
-    assert stat.S_IMODE(os.stat(key).st_mode) == 0o600 and len(key.read_text()) == 64
+    ((key,),) = sql("SELECT value FROM settings WHERE key = 'secret_key'")
+    assert len(key) == 64 and main.app.secret_key == key
     main.app.secret_key = None                                                            # a restart: read again
-    assert guarded.get("/api/documents").status_code == 200 and main.app.secret_key == key.read_text()
+    assert guarded.get("/api/documents").status_code == 200 and main.app.secret_key == key
     monkeypatch.setenv("SECRET_KEY", "the owner's own key")                               # SECRET_KEY wins
     main.app.secret_key = None
     assert guarded.get("/api/documents").status_code == 401                               # signed with the other key
@@ -3621,61 +3604,46 @@ def at(day, hour=3, minute=0, second=0):
     return datetime.datetime(2026, 11, day, hour, minute, second)
 
 
+def _dumped(path, table="documents"):
+    """The rows of `table` in a snapshot, as pg_restore writes them out (COPY lines)."""
+    import subprocess
+    from app import backup
+    out = subprocess.run(["pg_restore", "--data-only", "--table", table, "--file", "-", str(path)],
+                         env=backup._pg_env(), capture_output=True, text=True, check=True).stdout
+    lines = out.split("\n")
+    start = next(i for i, line in enumerate(lines) if line.startswith("COPY "))
+    return [line.split("\t") for line in lines[start + 1:lines.index("\\.", start)]]
+
+
 def test_a_backup_is_a_checked_snapshot_of_the_library_and_its_originals(client, tmp_path):
     import os
-    import sqlite3
-    from app import backup, db
+    from app import backup
     add(client)
     dest = tmp_path / "backups"
-    before = os.stat(db.DB_PATH).st_mtime_ns
     r = backup.run_once(str(dest), keep=14, now=at(12))
     snap = r["snapshot"]
-    assert snap["path"] == str(dest / "metabase-20261112-0300.db") and snap["documents"] == 1 and snap["removed"] == []
-    with sqlite3.connect(snap["path"]) as con:
-        assert con.execute("SELECT filename, title FROM documents").fetchall() == [("lease.txt", "Lease")]
-        assert con.execute("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'rent'").fetchone()[0] == 1
-    assert os.stat(db.DB_PATH).st_mtime_ns == before and not os.path.exists(db.DB_PATH + "-journal")  # only read
+    assert snap["path"] == str(dest / "metabase-20261112-0300.dump") and snap["documents"] == 1 and snap["removed"] == []
+    assert [row[1] for row in _dumped(snap["path"])] == ["lease.txt"]
+    assert any("900 euros" in row[3] for row in _dumped(snap["path"], "chunks"))
     assert r["files"] == {"copied": 1, "bytes": len(LEASE), "failed": 0, "missing": 0}
     assert (dest / "files" / hashlib.sha256(LEASE).hexdigest()).read_bytes() == LEASE
     assert not [n for n in os.listdir(dest) + os.listdir(dest / "files") if n.startswith(".")]  # nothing half written
 
 
 def test_a_snapshot_leaves_out_a_write_still_under_way(client, tmp_path):
-    """The backup API reads the library in one transaction: a write not yet committed is not
-    in the copy (a plain file copy could catch it half done)."""
-    import sqlite3
+    """pg_dump reads the library from one snapshot: a write not yet committed is not in it,
+    and the count of documents it reports is of the same moment."""
     from app import backup, db
     add(client)
-    writer = sqlite3.connect(db.DB_PATH)
-    writer.execute("BEGIN IMMEDIATE")
+    writer = db._dedicated(autocommit=False)
     writer.execute("UPDATE documents SET title = 'Half done'")
+    writer.execute("DELETE FROM usage")
     try:
-        path = backup.snapshot(str(tmp_path / "b"), keep=3)["path"]
+        snap = backup.snapshot(str(tmp_path / "b"), keep=3)
     finally:
         writer.rollback()
         writer.close()
-    with sqlite3.connect(path) as con:
-        assert con.execute("SELECT title FROM documents").fetchone()[0] == "Lease"
-
-
-def test_a_backup_reads_a_library_it_may_not_write(client, tmp_path, monkeypatch):
-    """The backup service mounts the library read-only; here its folder and file are read-only
-    (that stops a test run as root only through mode=ro, which is what the code relies on)."""
-    import os
-    import shutil
-    from app import backup, db
-    add(client)
-    ro = tmp_path / "ro"
-    ro.mkdir()
-    shutil.copy(db.DB_PATH, ro / "t.db")
-    monkeypatch.setattr(db, "DB_PATH", str(ro / "t.db"))
-    os.chmod(ro / "t.db", 0o444)
-    os.chmod(ro, 0o555)
-    try:
-        assert backup.snapshot(str(tmp_path / "b"), keep=3)["documents"] == 1
-        assert os.listdir(ro) == ["t.db"]                                                    # no journal, nothing else
-    finally:
-        os.chmod(ro, 0o755)
+    assert snap["documents"] == 1 and [row[4] for row in _dumped(snap["path"])] == ["Lease"]
 
 
 def test_backups_keep_the_newest_and_leave_other_files_alone(client, tmp_path):
@@ -3684,36 +3652,47 @@ def test_backups_keep_the_newest_and_leave_other_files_alone(client, tmp_path):
     add(client)
     dest = tmp_path / "b"
     removed = [backup.snapshot(str(dest), keep=3, now=at(day))["removed"] for day in range(1, 6)]
-    assert removed == [[], [], [], ["metabase-20261101-0300.db"], ["metabase-20261102-0300.db"]]
-    (dest / "my copy.db").write_bytes(b"x")
-    (dest / "metabase-latest.db").write_bytes(b"x")
-    (dest / ".backup-crashed.db").write_bytes(b"x")
-    os.utime(dest / ".backup-crashed.db", (0, 0))                                            # left by a crash long ago
-    (dest / ".backup-writing.db").write_bytes(b"x")                                          # a --now writing right now
+    assert removed == [[], [], [], ["metabase-20261101-0300.dump"], ["metabase-20261102-0300.dump"]]
+    (dest / "my copy.dump").write_bytes(b"x")
+    (dest / "metabase-latest.dump").write_bytes(b"x")
+    (dest / "metabase-20261001-0300.db").write_bytes(b"x")                                  # from before Postgres
+    (dest / ".backup-crashed.dump").write_bytes(b"x")
+    os.utime(dest / ".backup-crashed.dump", (0, 0))                                          # left by a crash long ago
+    (dest / ".backup-writing.dump").write_bytes(b"x")                                        # a --now writing right now
     backup.snapshot(str(dest), keep=3, now=at(6, minute=1))
     backup.snapshot(str(dest), keep=3, now=at(6, minute=1, second=40))                       # the same minute: replaced
-    assert sorted(os.listdir(dest)) == [".backup-writing.db", "metabase-20261104-0300.db", "metabase-20261105-0300.db",
-                                        "metabase-20261106-0301.db", "metabase-latest.db", "my copy.db"]
+    assert sorted(os.listdir(dest)) == [".backup-writing.dump", "metabase-20261001-0300.db", "metabase-20261104-0300.dump",
+                                        "metabase-20261105-0300.dump", "metabase-20261106-0301.dump",
+                                        "metabase-latest.dump", "my copy.dump"]
     assert backup.newest(str(dest)) == at(6, minute=1) and backup.newest(str(tmp_path / "none")) is None
 
 
 def test_backed_up_originals_stay_after_their_document_is_deleted(client, tmp_path, caplog):
     import os
-    from app import backup, db
+    from app import backup, storage
+    files = tmp_path / "files"
     a = add(client)["doc_id"]
     add(client, "pets.txt", b"Dogs are welcome.")
     dest = str(tmp_path / "b" / "files")
     assert backup.mirror_files(dest=dest)["copied"] == 2
     assert client.delete(f"/api/documents/{a}").status_code == 204
-    assert not os.path.exists(os.path.join(db.files_dir(), hashlib.sha256(LEASE).hexdigest()))
-    open(os.path.join(db.files_dir(), ".upload-x"), "wb").close()                           # an upload being written
+    assert not (files / hashlib.sha256(LEASE).hexdigest()).exists()
+    (files / ".upload-x").write_bytes(b"")                                                   # an upload being written
     assert backup.mirror_files(dest=dest) == {"copied": 0, "bytes": 0, "failed": 0, "missing": 0}
     assert sorted(os.listdir(dest)) == sorted(hashlib.sha256(b).hexdigest() for b in (LEASE, b"Dogs are welcome."))
-    damaged = "0" * 64
-    with open(os.path.join(db.files_dir(), damaged), "wb") as f:
-        f.write(b"not what its name says")
+    (files / ("0" * 64)).write_bytes(b"not what its name says")
     assert backup.mirror_files(dest=dest)["copied"] == 1 and "doesn't match its SHA-256" in caplog.text
-    assert backup.mirror_files(src=str(tmp_path / "no files yet"), dest=dest)["copied"] == 0
+    assert backup.mirror_files(src=storage.LocalStore(str(tmp_path / "no files yet")), dest=dest)["copied"] == 0
+
+
+def test_backed_up_originals_come_from_a_bucket_too(client, tmp_path, s3):
+    """With STORAGE_BACKEND=s3 the backup copies the originals out of the bucket, so the
+    backups volume holds a copy the bucket's owner doesn't control."""
+    from app import backup
+    add(client)
+    dest = tmp_path / "b" / "files"
+    assert backup.mirror_files(dest=str(dest)) == {"copied": 1, "bytes": len(LEASE), "failed": 0, "missing": 0}
+    assert (dest / hashlib.sha256(LEASE).hexdigest()).read_bytes() == LEASE
 
 
 def test_backups_are_due_after_the_hour_and_make_up_a_missed_night():
@@ -3739,15 +3718,15 @@ def test_the_backup_service_tries_a_failed_night_again_half_an_hour_later(tmp_pa
     def run_once(folder, keep, now):
         runs.append(now)
         if len(runs) == 1:
-            raise backup.BackupError("database is locked")
-        (tmp_path / now.strftime("metabase-%Y%m%d-%H%M.db")).write_bytes(b"")
+            raise backup.BackupError("Could not reach the database")
+        (tmp_path / now.strftime("metabase-%Y%m%d-%H%M.dump")).write_bytes(b"")
 
     def sleep(seconds):
         clock[0] += datetime.timedelta(seconds=seconds)
         if clock[0] > at(14, 3, 30):
             raise Stop
 
-    (tmp_path / "metabase-20261112-0300.db").write_bytes(b"")
+    (tmp_path / "metabase-20261112-0300.dump").write_bytes(b"")
     monkeypatch.setattr(backup, "_now", lambda: clock[0])
     monkeypatch.setattr(backup, "run_once", run_once)
     monkeypatch.setattr(backup.time, "sleep", sleep)
@@ -3758,89 +3737,88 @@ def test_the_backup_service_tries_a_failed_night_again_half_an_hour_later(tmp_pa
 
 def test_a_snapshot_can_be_restored_with_its_originals(client, tmp_path):
     import os
-    from app import backup, db
+    from app import backup
     a = add(client)["doc_id"]
     dest = str(tmp_path / "b")
     backup.run_once(dest, keep=3, now=at(12))
     assert client.delete(f"/api/documents/{a}").status_code == 204                          # its original goes too
     add(client, "pets.txt", b"Dogs are welcome.")
     r = backup.restore("latest", dest, now=at(13, 9, 15))
-    assert (r["snapshot"], r["documents"]) == ("metabase-20261112-0300.db", 1)
-    assert r["kept"] == os.path.abspath(db.DB_PATH) + ".before-restore-20261113-091500" and os.path.exists(r["kept"])
+    assert (r["snapshot"], r["documents"]) == ("metabase-20261112-0300.dump", 1)
+    assert r["kept"] == os.path.join(dest, "before-restore-20261113-091500.dump") and os.path.exists(r["kept"])
+    assert [row[1] for row in _dumped(r["kept"])] == ["pets.txt"]                            # the library it replaced
     assert r["files"] == {"copied": 1, "bytes": len(LEASE), "failed": 0, "missing": 0}
     (doc,) = client.get("/api/documents").json
     assert doc["filename"] == "lease.txt" and doc["has_file"]
     assert client.get(f"/api/documents/{doc['id']}/file").data == LEASE
     assert client.get("/api/search?q=rent").json                                             # its index came along
-    # The pets.txt original is no longer used: it stays in the library's folder, unused.
-    assert backup.restore("metabase-20261112-0300.db", dest, now=at(13, 9, 16))["files"]["copied"] == 0
+    assert add(client, "deposit.txt", b"The deposit is 1800 euros.")["doc_id"] > doc["id"]  # its ids carry on
+    # The pets.txt original is no longer used: it stays in the store, unused.
+    assert backup.restore("metabase-20261112-0300.dump", dest, now=at(13, 9, 16))["files"]["copied"] == 0
 
 
-def test_a_snapshot_of_the_live_librarys_schema_restores_and_is_brought_up_to_date(client, tmp_path, monkeypatch):
-    """The live library (made by 894b984) has no kept files and none of the newer tables: its
-    snapshot restores as it is, here onto a machine with no library yet, and the app brings
-    it up to date when it next opens it."""
-    import sqlite3
-    from app import backup, db
-    old = tmp_path / "live" / "metabase.db"
-    old.parent.mkdir()
-    con = sqlite3.connect(old)
-    con.executescript(SCHEMA_894B984)
-    con.close()
-    monkeypatch.setattr(db, "DB_PATH", str(old))
+def test_a_snapshot_restores_onto_an_empty_database(client, tmp_path, monkeypatch):
+    """A new machine, or a database lost: the snapshot restores into a database with no
+    library yet (nothing to keep first), vectors and search included."""
+    import psycopg
+    from app import backup, db, ollama, vectors
+    fake_embedder(monkeypatch)
+    add(client, "gearbox.txt", GEARBOX)
     dest = str(tmp_path / "b")
-    r = backup.run_once(dest, keep=3, now=at(12))
-    assert r["snapshot"]["documents"] == 1 and r["files"]["copied"] == 0
-    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new" / "metabase.db"))
+    assert backup.run_once(dest, keep=3, now=at(12))["snapshot"]["documents"] == 1
+    db.close_pool()
+    with psycopg.connect(db.DATABASE_URL, autocommit=True) as c:
+        c.execute(f"DROP SCHEMA {db.DB_SCHEMA} CASCADE")
+        c.execute(f"CREATE SCHEMA {db.DB_SCHEMA}")
+    db._schema_ready.clear()
     r = backup.restore("latest", dest)
     assert (r["documents"], r["kept"], r["files"]["copied"], r["files"]["missing"]) == (1, None, 0, 0)
-    doc = client.get("/api/documents").json[0]
-    assert doc["title"] == "Tractor manual" and doc["has_file"] is False and doc["sha256"] is None
-    assert client.get("/api/search?q=hydraulic").json[0]["doc_id"] == 1
-    with db.connect() as con:
-        assert con.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0                   # its newer tables were added
+    assert client.get("/api/documents").json[0]["filename"] == "gearbox.txt"
+    assert db.vector_counts(ollama.EMBED_MODEL) == (1, 1)
+    monkeypatch.setattr(vectors, "MEANING_MARGIN", 1.0)
+    r = client.post("/api/chat", json={"question": "lubricant quantity"}, headers=H).json  # no word in common
+    assert [e["match"] for e in r["excerpts"]] == ["meaning"]
 
 
 def test_a_restore_refuses_names_it_does_not_list_and_damaged_snapshots(client, tmp_path):
     import os
-    from app import backup, db
+    from app import backup
     add(client)
     dest = tmp_path / "b"
     with pytest.raises(backup.BackupError, match="No snapshots"):
         backup.restore("latest", str(dest))
     backup.snapshot(str(dest), keep=3, now=at(12))
-    for name in ("../t.db", "metabase-20261112-0300.db/..", "t.db", ""):
+    for name in ("../t.dump", "metabase-20261112-0300.dump/..", "t.dump", ""):
         with pytest.raises(backup.BackupError, match="No snapshot named"):
             backup.restore(name, str(dest))
-    (dest / "metabase-20261113-0300.db").write_bytes(b"SQLite format 3\0" + b"\x10\x00" + b"\xff" * 4000)
-    with pytest.raises(backup.BackupError, match="metabase-20261113-0300.db is damaged"):
+    (dest / "metabase-20261113-0300.dump").write_bytes(b"PGDMP" + b"\xff" * 4000)
+    with pytest.raises(backup.BackupError, match="Could not read metabase-20261113-0300.dump"):
         backup.restore("latest", str(dest))
-    assert os.listdir(os.path.dirname(db.DB_PATH)).count("t.db") == 1                         # left as it was
-    assert not [n for n in os.listdir(os.path.dirname(db.DB_PATH)) if "before-restore" in n or n.startswith(".")]
+    assert not [n for n in os.listdir(dest) if "before-restore" in n or n.startswith(".")]   # nothing kept or left
     assert client.get("/api/documents").json[0]["filename"] == "lease.txt"
 
 
 def test_a_restore_refuses_while_the_app_is_running(client, tmp_path, monkeypatch):
-    """gunicorn's master holds the library's lock while the app runs (gunicorn_conf.py). A
-    restore under it would leave the app on the replaced library's schema, vectors and job
-    ids, so it refuses and changes nothing."""
+    """gunicorn's worker holds the library's advisory lock while the app runs (gunicorn_conf.py).
+    A restore under it would leave the app on the replaced library's jobs and pauses, so it
+    refuses and changes nothing."""
     import logging
     import os
     import types
-    from app import backup, db, gunicorn_conf
+    from app import backup, db, gunicorn_conf, jobs
     add(client)
     dest = str(tmp_path / "b")
     backup.snapshot(dest, keep=3, now=at(12))
     monkeypatch.setattr(gunicorn_conf, "_lock", None)
-    gunicorn_conf.on_starting(types.SimpleNamespace(log=logging.getLogger("gunicorn")))
-    folder = os.path.dirname(db.DB_PATH)
-    before = sorted(os.listdir(folder))
+    monkeypatch.setattr(jobs, "start", lambda: None)
+    gunicorn_conf.post_worker_init(types.SimpleNamespace(log=logging.getLogger("gunicorn")))
+    before = sorted(os.listdir(dest))
     try:
-        second = db.lock_library()                                                           # a second app shares it
+        second = db.hold_app_lock()                                                          # a second app shares it
         second.close()
         with pytest.raises(backup.BackupError, match=r"The app is running: stop it first \(docker compose stop chatbot\)"):
             backup.restore("latest", dest)
-        assert sorted(os.listdir(folder)) == before                                          # nothing moved or left
+        assert sorted(os.listdir(dest)) == before                                            # nothing kept or left
     finally:
         gunicorn_conf._lock.close()
     assert backup.restore("latest", dest)["documents"] == 1                                  # the app stopped: it works
@@ -3853,7 +3831,8 @@ def test_the_backup_command_line(client, tmp_path):
     from app import db
     add(client)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env = {**os.environ, "DB_PATH": db.DB_PATH, "FILES_DIR": "", "BACKUP_DIR": str(tmp_path / "b"), "BACKUP_KEEP": "2"}
+    env = {**os.environ, "DATABASE_URL": db.DATABASE_URL, "DB_SCHEMA": db.DB_SCHEMA, "STORAGE_BACKEND": "local",
+           "FILES_DIR": str(tmp_path / "files"), "BACKUP_DIR": str(tmp_path / "b"), "BACKUP_KEEP": "2"}
 
     def run(*args, **more):
         return subprocess.run([sys.executable, "-m", "app.backup", *args], cwd=root, env={**env, **more},
@@ -3864,22 +3843,22 @@ def test_the_backup_command_line(client, tmp_path):
     assert "1 new original copied" in r.stdout
     r = run("--list")
     assert r.returncode == 0 and "(the newest 2 are kept)" in r.stdout and ": 1 (0.0 MB)" in r.stdout
-    assert re.search(r"^  metabase-\d{8}-\d{4}\.db ", r.stdout, re.M)
+    assert re.search(r"^  metabase-\d{8}-\d{4}\.dump ", r.stdout, re.M)
     r = run("--restore")
     assert r.returncode == 2 and "Name the snapshot to restore" in r.stdout
-    running = db.lock_library()                                                              # the app, in another process
+    running = db.hold_app_lock()                                                             # the app, in another process
     try:
         r = run("--restore", "latest")
     finally:
         running.close()
     assert r.returncode == 1 and "The app is running: stop it first" in r.stdout and "Traceback" not in r.stdout + r.stderr
     r = run("--restore", "latest")
-    assert r.returncode == 0 and "Restored metabase-" in r.stdout and "docker compose restart chatbot" in r.stdout
+    assert r.returncode == 0 and "Restored metabase-" in r.stdout and "docker compose start chatbot" in r.stdout
     r = run("--now", BACKUP_HOUR="25")
     assert r.returncode == 1 and "BACKUP_HOUR must be an hour from 0 to 23, not 25" in r.stderr
     r = run("--now", BACKUP_KEEP="none")
     assert r.returncode == 1 and "must be whole numbers" in r.stderr
-    r = run("--now", DB_PATH=str(tmp_path / "none.db"))
+    r = run("--now", DB_SCHEMA=db.DB_SCHEMA + "_none")
     assert r.returncode == 1 and "nothing to back up" in r.stdout and "Traceback" not in r.stdout + r.stderr
 
 
@@ -3978,7 +3957,6 @@ def test_cancel_cuts_off_an_ollama_call_that_never_answers(client, monkeypatch):
 def test_a_failed_job_is_marked_so_when_the_database_was_locked(local, monkeypatch):
     """A job whose failure couldn't be written (the database locked past its busy timeout)
     was left 'running', with nothing working on it, until a restart. It is tried again."""
-    import sqlite3
     from app import db, jobs, ollama
     real, tries = db.update_job, []
 
@@ -3986,7 +3964,7 @@ def test_a_failed_job_is_marked_so_when_the_database_was_locked(local, monkeypat
         if fields.get("status") == "failed":
             tries.append(job_id)
             if len(tries) == 1:
-                raise sqlite3.OperationalError("database is locked")
+                raise db.OperationalError("the database is unreachable")
         return real(job_id, when, **fields)
 
     def broken(model, messages, **kw):
@@ -3999,12 +3977,29 @@ def test_a_failed_job_is_marked_so_when_the_database_was_locked(local, monkeypat
     assert len(tries) == 2 and job["status"] == "failed" and job["error"] == "Ollama error: qwen3.5:9b: out of memory"
 
 
-def test_the_database_waits_out_a_long_write(client):
-    """Saving a large upload holds the database for seconds (7 s for a 44 MB text): with
-    sqlite3's default 5 s, polls and questions meanwhile failed with "database is locked"."""
+def test_reading_goes_on_while_a_long_write_is_under_way(client):
+    """Saving a large upload holds its transaction for seconds (7 s for a 44 MB text): polls
+    and questions meanwhile read the rows committed before it, rather than waiting."""
+    import threading
     from app import db
-    with db.connect() as con:
-        assert con.execute("PRAGMA busy_timeout").fetchone()[0] == db.BUSY_SECONDS * 1000 >= 30_000
+    add(client)
+    started, done = threading.Event(), threading.Event()
+
+    def long_write():
+        with db.connect() as con:
+            con.execute("UPDATE documents SET title = 'Half done'")
+            started.set()
+            done.wait(10)
+
+    t = threading.Thread(target=long_write)
+    t.start()
+    try:
+        assert started.wait(10)
+        assert [d["title"] for d in client.get("/api/documents").json] == ["Lease"]
+    finally:
+        done.set()
+        t.join()
+    assert [d["title"] for d in client.get("/api/documents").json] == ["Half done"]
 
 
 def test_deleting_a_document_drops_the_pages_its_reread_had_read(local):
@@ -4051,14 +4046,15 @@ def test_scraps_of_long_documents_are_left_out_of_search_by_meaning(client, monk
     included. Chunks under MIN_CHARS are left out of search by meaning unless they are their
     document's only one; keywords still find them. Greetings are no keywords either: "hi"
     found a manual's "Hi-Low range shift"."""
-    from app import db, vectors
+    from app import db, ollama, vectors
     fake_embedder(monkeypatch)
     text = "Brake pedal free travel is 30-40 mm. " * 40 + "\n\nOne dog at most may live in the flat, on a lead."
     page, scrap = _chunk_rows(add(client, "manual.txt", text.encode())["doc_id"])          # a page, and a scrap
     (only,) = _chunk_rows(add(client, "note.txt", b"A dog lives here.")["doc_id"])         # a document's only chunk
     r = client.post("/api/chat", json={"question": "pets allowed?"}, headers=H).json         # no word in common
     assert [(e["filename"], e["match"]) for e in r["excerpts"]] == [("note.txt", "meaning")]
-    assert sorted(vectors._vectors()[0].tolist()) == [page["id"], only["id"]] and scrap["model"]  # embedded, not compared
+    compared = db.nearest_chunks(ollama.EMBED_MODEL, [1.0] * (len(MEANINGS) + 1), 10, None, vectors.MIN_CHARS)
+    assert sorted(c for c, _ in compared) == [page["id"], only["id"]] and scrap["model"]  # embedded, not compared
     assert {h["filename"] for h in client.get("/api/search?q=dog").json} == {"manual.txt", "note.txt"}
     assert db.fts_query("Hi! Thanks, hello", question=True) == ""
 
@@ -5036,34 +5032,28 @@ def test_a_question_can_be_limited_to_folders(client):
     assert ask(folder_ids=[manuals, tractor]).json["scope_folders"] == [{"id": tractor, "name": "Tractor"}]
 
 
-def test_libraries_from_before_folders_gain_them(client, tmp_path, monkeypatch):
+def test_libraries_from_before_folders_gain_them(client, tmp_path):
     """The live library: no folders table, no key details, a conversations table without
-    AUTOINCREMENT (copied into one with it first, then given folder_ids)."""
-    import sqlite3
+    folder_ids: migrated, they are there, empty."""
     from app import db
-    path = tmp_path / "live.db"
-    con = sqlite3.connect(path)
-    con.executescript(OLD_SCHEMAS["42a0a88"] + """
+    migrated(tmp_path, OLD_SCHEMAS["42a0a88"] + """
         INSERT INTO conversations (id, title, model, doc_ids) VALUES (1, 'Oil', 'auto', '[1]');
         INSERT INTO messages (conversation_id, role, content, sent) VALUES (1, 'user', 'When?', 'sent When?');
         INSERT INTO messages (conversation_id, role, content) VALUES (1, 'assistant', 'At 400 hours.');
     """)
-    con.close()
-    monkeypatch.setattr(db, "DB_PATH", str(path))
     (doc,) = client.get("/api/documents").json
     assert (doc["folder_id"], doc["user_edited"], doc["kind"], doc["thumb"], doc["vendor"]) == (None, [], "pdf", None, None)
     (c,) = client.get("/api/conversations").json
     assert (c["doc_ids"], c["folder_ids"]) == ([1], None)
     with db.connect() as con:
-        assert "AUTOINCREMENT" in con.execute("SELECT sql FROM sqlite_master WHERE name='conversations'").fetchone()[0]
-        assert "folder_ids" in {r[1] for r in con.execute("PRAGMA table_info(conversations)")}
-        assert {"documents_folder", "documents_sha256"} <= {r[1] for r in con.execute("PRAGMA index_list(documents)")}
+        assert {"documents_folder", "documents_sha256", "documents_fts"} <= {r[0] for r in con.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'documents'")}
     tractor = folder(client, "Tractor")
     assert client.post("/api/documents/move", json={"ids": [1], "folder_id": tractor}).json["moved"] == 1
     r = client.post("/api/chat", json={"question": "When do I change the hydraulic oil?", "conversation_id": 1,
                                        "folder_ids": [tractor]}, headers=H).json
     assert r["scope_count"] == 1 and "400 hours" in client.seen["msg"]
-    db._schema_ready.discard(str(path))                                                  # a restart: migrated again
+    db._schema_ready.clear()                                                             # a restart: schema checked again
     assert client.get("/api/conversations/1").json["folder_ids"] == [tractor]            # kept
     assert [m["content"] for m in _messages(client, 1)][:2] == ["When?", "At 400 hours."]
     assert client.patch("/api/documents/1", json={"vendor": "KIOTI"}).status_code == 200

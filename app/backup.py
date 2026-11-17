@@ -1,9 +1,10 @@
 """Backups of the library, run by the `backup` service in docker-compose.yml.
 
-Every night at BACKUP_HOUR it writes a consistent snapshot of the SQLite database into
-BACKUP_DIR as metabase-YYYYMMDD-HHMM.db, keeps the newest BACKUP_KEEP, and copies the kept
-originals that aren't there yet into BACKUP_DIR/files. It only reads the library, so the
-data volume can be mounted read-only.
+Every night at BACKUP_HOUR it writes a consistent snapshot of the Postgres database into
+BACKUP_DIR as metabase-YYYYMMDD-HHMM.dump (pg_dump's custom format), keeps the newest
+BACKUP_KEEP, and copies the kept originals that aren't there yet into BACKUP_DIR/files, from
+whichever store keeps them (storage.py: a local folder, S3 or Azure). It only reads the
+library.
 
     python -m app.backup                run nightly (the service)
     python -m app.backup --now          take one now
@@ -17,22 +18,22 @@ import logging
 import os
 import re
 import signal
-import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
-from contextlib import closing
-from urllib.parse import quote
 
-from . import db
+from psycopg.conninfo import conninfo_to_dict
+
+from . import db, storage
 
 log = logging.getLogger(__name__)
 
 BACKUP_DIR = os.environ.get("BACKUP_DIR") or "/backups"
-NAME = re.compile(r"^metabase-(\d{8}-\d{4})\.db$")  # sorts by time: the newest is the greatest
+NAME = re.compile(r"^metabase-(\d{8}-\d{4})\.dump$")  # sorts by time: the newest is the greatest
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 TMP = ".backup-"                       # files being written; a crash leaves them, the next run clears them
-RETRY = datetime.timedelta(minutes=30)  # after a failed run (say the library was locked throughout)
+RETRY = datetime.timedelta(minutes=30)  # after a failed run (say the database was down throughout)
 CHECK_SECONDS = 60                     # the loop looks at the clock this often, so a night the machine
                                        # slept through is made up soon after it wakes
 
@@ -57,34 +58,41 @@ def settings():
     return hour, keep
 
 
-def _open_ro(path):
-    """Open a database read-only (mode=ro), so it works on a read-only mount and can never
-    change the file. Waits for a writer to finish its transaction."""
-    return sqlite3.connect(f"file:{quote(os.path.abspath(path))}?mode=ro", uri=True, timeout=60)
+def _pg_env():
+    """pg_dump's and pg_restore's connection, as environment variables (so the password is
+    not on a command line)."""
+    params = conninfo_to_dict(db.DATABASE_URL)
+    names = {"host": "PGHOST", "port": "PGPORT", "user": "PGUSER", "password": "PGPASSWORD", "dbname": "PGDATABASE",
+             "sslmode": "PGSSLMODE"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+    env.update({names[k]: str(v) for k, v in params.items() if k in names and v is not None})
+    return env
 
 
-def _check(path, compact=False, name=None):
-    """Check a copy (integrity_check) and return how many documents it holds. compact: VACUUM
-    it first, since the live file keeps the space deleted documents freed (the live library
-    was 92% free pages). Every table has an INTEGER PRIMARY KEY (FTS5's shadow tables too),
-    so VACUUM keeps all ids. Without compact, the file is only read. name: the copy's name in
-    messages (the snapshot it is to become)."""
-    name = name or os.path.basename(path)
+def _schema_args():
+    """Only the library's schema when it has one of its own (tests); else the whole database."""
+    return ["--schema", db.DB_SCHEMA] if db.DB_SCHEMA else []
+
+
+def _run(args, what):
     try:
-        with closing(sqlite3.connect(path, isolation_level=None) if compact else _open_ro(path)) as con:
-            if compact:
-                con.execute("VACUUM")
-            result = [r[0] for r in con.execute("PRAGMA integrity_check")]
-            if result == ["ok"]:
-                try:
-                    return con.execute("SELECT count(*) FROM documents").fetchone()[0]
-                except sqlite3.OperationalError:  # not a library (no documents table)
-                    return None
-    except sqlite3.OperationalError as e:  # say a full disk while compacting
-        raise BackupError(f"Could not check {name}: {e}") from e
-    except sqlite3.DatabaseError as e:  # not a database at all ("file is not a database")
-        result = [str(e)]
-    raise BackupError(f"{name} is damaged: {'; '.join(result[:3])}")
+        done = subprocess.run(args, env=_pg_env(), capture_output=True, text=True, timeout=3600)
+    except FileNotFoundError:
+        raise BackupError(f"{args[0]} is not installed (the image installs postgresql-client)") from None
+    if done.returncode:
+        detail = (done.stderr or done.stdout).strip().splitlines()
+        raise BackupError(f"Could not {what}: {'; '.join(detail[-3:]) or f'{args[0]} failed'}")
+    return done.stdout
+
+
+def _verify(path, name=None):
+    """Check a dump can be read (pg_restore lists its contents) and return how many tables
+    it has data for."""
+    out = _run(["pg_restore", "--list", path], f"read {name or os.path.basename(path)}")
+    tables = sum(" TABLE DATA " in line for line in out.splitlines())
+    if not tables:
+        raise BackupError(f"{name or os.path.basename(path)} holds no library")
+    return tables
 
 
 def _clear_leftovers(folder):
@@ -141,52 +149,65 @@ def prune(folder, keep):
     return removed
 
 
+def _dump(path):
+    """pg_dump the library into `path`, from one exported snapshot: the dump and the count of
+    documents returned see the same moment, and a write under way is in it whole or not at
+    all. Returns how many documents it holds."""
+    try:
+        con = db._dedicated(autocommit=False)
+    except db.Error as e:
+        raise BackupError(f"Could not reach the database: {e}") from e
+    try:
+        con.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        snap = con.execute("SELECT pg_export_snapshot()").fetchone()[0]
+        try:
+            documents = con.execute("SELECT count(*) FROM documents").fetchone()[0]
+        except db.Error:
+            raise BackupError("No library in the database yet: nothing to back up") from None
+        _run(["pg_dump", "--format=custom", "--no-owner", "--no-privileges", f"--snapshot={snap}",
+              *_schema_args(), "--file", path], "dump the database")
+    finally:
+        con.close()
+    return documents
+
+
 def snapshot(folder=None, keep=None, now=None):
-    """Copy the database into `folder` through SQLite's backup API, which reads it in one
-    read transaction: a write under way is in the copy whole or not at all, where a file
-    copy could catch it half done. The copy is compacted and checked before it gets its
-    name, then all but the newest `keep` snapshots are removed.
-    Returns {path, size, documents, removed}."""
+    """Dump the database into `folder`, check the dump, then give it its name and remove all
+    but the newest `keep` snapshots. Returns {path, size, documents, removed}."""
     folder = folder or BACKUP_DIR
     keep = keep or settings()[1]
-    if not os.path.isfile(db.DB_PATH):
-        raise BackupError(f"No library at {db.DB_PATH} yet: nothing to back up")
     os.makedirs(folder, exist_ok=True)
     _clear_leftovers(folder)
-    path = os.path.join(folder, (now or datetime.datetime.now()).strftime("metabase-%Y%m%d-%H%M.db"))
-    fd, tmp = tempfile.mkstemp(dir=folder, prefix=TMP, suffix=".db")  # readable by its owner only (0600)
+    path = os.path.join(folder, (now or datetime.datetime.now()).strftime("metabase-%Y%m%d-%H%M.dump"))
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=TMP, suffix=".dump")  # readable by its owner only (0600)
     os.close(fd)
     try:
-        try:
-            with closing(_open_ro(db.DB_PATH)) as src, closing(sqlite3.connect(tmp)) as out:
-                src.backup(out)
-        except sqlite3.Error as e:  # say still locked after a minute, a crash's journal to roll back first, a full disk
-            raise BackupError(f"Could not copy {db.DB_PATH}: {e}") from e
-        documents = _check(tmp, compact=True, name=os.path.basename(path))
+        documents = _dump(tmp)
+        _verify(tmp, os.path.basename(path))
         os.replace(tmp, path)  # a second one within the same minute replaces the first
     except BaseException:
-        for leftover in (tmp, tmp + "-journal"):
-            try:
-                os.remove(leftover)
-            except FileNotFoundError:
-                pass
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
         raise
     return {"path": path, "size": os.path.getsize(path), "documents": documents, "removed": prune(folder, keep)}
 
 
-def _copy(path, folder, name):
-    """Copy one original into `folder` under `name` (temporary file, then rename, as db._store
-    writes them), checking it against the SHA-256 in its name. Returns its size."""
+def _write(folder, name, chunks, stamp=None):
+    """Write an original into `folder` under `name` (temporary file, then rename), checking it
+    against the SHA-256 in its name. `chunks`: its bytes, in pieces. Returns its size."""
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=TMP)
-    digest = hashlib.sha256()
+    digest, size = hashlib.sha256(), 0
     try:
-        with open(path, "rb") as f, os.fdopen(fd, "wb") as out:
-            for block in iter(lambda: f.read(1 << 20), b""):
+        with os.fdopen(fd, "wb") as out:
+            for block in chunks:
                 digest.update(block)
                 out.write(block)
+                size += len(block)
         os.chmod(tmp, 0o644)
-        st = os.stat(path)
-        os.utime(tmp, (st.st_atime, st.st_mtime))
+        if stamp:
+            os.utime(tmp, stamp)
         os.replace(tmp, os.path.join(folder, name))
     except BaseException:
         try:
@@ -196,39 +217,69 @@ def _copy(path, folder, name):
         raise
     if SHA256.match(name) and digest.hexdigest() != name:
         log.warning("Original %s doesn't match its SHA-256 (damaged?); copied as it is", name)
-    return st.st_size
+    return size
+
+
+def _blocks(path):
+    with open(path, "rb") as f:
+        yield from iter(lambda: f.read(1 << 20), b"")
 
 
 def mirror_files(src=None, dest=None, names=None):
-    """Copy the originals in `src` (the library's files) that `dest` doesn't have yet. Add only:
-    an original whose documents were deleted stays in the backup, so a restored snapshot finds
-    it. Files are named by their SHA-256, so one already there has the same content.
-    names: only these (a restore copies back what its snapshot uses).
-    Returns {copied, bytes, failed, missing}."""
-    src = src or db.files_dir()
+    """Copy the originals in the store `src` (storage.py's, by default) that the folder `dest`
+    doesn't have yet. Add only: an original whose documents were deleted stays in the backup,
+    so a restored snapshot finds it. Originals are named by their SHA-256, so one already there
+    has the same content. names: only these. Returns {copied, bytes, failed, missing}."""
+    src = src or storage.store()
     dest = dest or os.path.join(BACKUP_DIR, "files")
     result = {"copied": 0, "bytes": 0, "failed": 0, "missing": 0}
-    if names is None:
-        try:
-            names = [n for n in os.listdir(src) if not n.startswith(".")]  # .upload-*: still being written
-        except FileNotFoundError:
-            return result  # no originals kept yet
+    try:
+        names = src.names() if names is None else names
+    except Exception as e:
+        log.error("Could not list the originals in %s: %s", src.describe(), e)
+        result["failed"] += 1
+        return result
     _clear_leftovers(dest)
     for name in sorted(names):
-        path = os.path.join(src, name)
         if os.path.exists(os.path.join(dest, name)):
-            continue
-        if not os.path.isfile(path):
-            result["missing"] += 1  # deleted meanwhile, or (restoring) never backed up
             continue
         try:
             os.makedirs(dest, exist_ok=True)
-            result["bytes"] += _copy(path, dest, name)
+            path = src.local_path(name)
+            if path:
+                st = os.stat(path)
+                result["bytes"] += _write(dest, name, _blocks(path), (st.st_atime, st.st_mtime))
+            else:
+                result["bytes"] += _write(dest, name, [src.get(name)])
             result["copied"] += 1
         except FileNotFoundError:
-            result["missing"] += 1
-        except OSError as e:
+            result["missing"] += 1  # deleted meanwhile
+        except Exception as e:
             log.error("Could not copy original %s: %s", name, e)
+            result["failed"] += 1
+    return result
+
+
+def restore_files(folder, names, dest=None):
+    """Put the originals `names` back into the store `dest` (storage.py's) from the backup's
+    files `folder`, those it lacks. Returns {copied, bytes, failed, missing}."""
+    dest = dest or storage.store()
+    result = {"copied": 0, "bytes": 0, "failed": 0, "missing": 0}
+    for name in sorted(names):
+        path = os.path.join(folder, name)
+        try:
+            if dest.exists(name):
+                continue
+            if not os.path.isfile(path):
+                result["missing"] += 1  # never backed up
+                continue
+            with open(path, "rb") as f:
+                data = f.read()
+            if dest.put(name, data):
+                result["copied"] += 1
+                result["bytes"] += len(data)
+        except Exception as e:
+            log.error("Could not put original %s back: %s", name, e)
             result["failed"] += 1
     return result
 
@@ -255,43 +306,33 @@ def run_once(folder=None, keep=None, now=None):
     return {"snapshot": snap, "files": files}
 
 
-def _referenced(path):
-    """The originals a library uses: its documents', and those of jobs that still need theirs.
-    A snapshot from before originals were kept (or jobs existed) has none."""
-    names = set()
-    with closing(_open_ro(path)) as con:
-        for sql, args in (("SELECT file_path FROM documents", ()),
-                          (f"SELECT file_path FROM jobs WHERE status IN ({','.join('?' * len(db.HOLDING_JOBS))})",
-                           db.HOLDING_JOBS)):
-            try:
-                names.update(os.path.basename(r[0]) for r in con.execute(sql, args) if r[0])
-            except sqlite3.OperationalError:
-                pass
-    return names
+def _referenced():
+    """The originals the library uses now: its documents', and those of jobs that still need theirs."""
+    marks = ",".join("?" * len(db.HOLDING_JOBS))
+    with db.connect() as con:
+        rows = con.execute(f"SELECT file_path FROM documents WHERE file_path IS NOT NULL UNION"
+                           f" SELECT file_path FROM jobs WHERE status IN ({marks})", db.HOLDING_JOBS).fetchall()
+    return {storage.name(r[0]) for r in rows if r[0]}
 
 
 def _lock_out_the_app():
-    """The library's lock (db.lock_library), taken exclusively: the app holds it while it
-    runs, and one starting meanwhile waits until it is closed. Returns it, to close when done
-    (None where files can't be locked: then only the README's "stop it first" keeps the app
-    away)."""
+    """The library's advisory lock (db.lock_out_app), taken exclusively: the app holds it while
+    it runs, and one starting meanwhile waits until it is released."""
     try:
-        return db.lock_library(exclusive=True, wait=False)
-    except BlockingIOError:
+        return db.lock_out_app()
+    except db.AppRunning:
         raise BackupError("The app is running: stop it first (docker compose stop chatbot). It keeps some of the"
                           " library in memory, and would carry on as if the database it replaced were still"
                           " there") from None
-    except OSError as e:
-        log.warning("Could not tell whether the app is running (%s): make sure it is stopped", e)
-        return None
+    except db.Error as e:
+        raise BackupError(f"Could not reach the database: {e}") from e
 
 
 def restore(name, folder=None, now=None):
     """Put snapshot `name` ('latest': the newest) back as the library, and copy back the
-    originals it uses that the library's files folder lacks. The database it replaces is
-    kept beside it as <DB_PATH>.before-restore-<time> (with its journal, if it had one).
-    Refuses while the app runs (it keeps the library's state in memory).
-    Returns {snapshot, documents, kept, files}."""
+    originals it uses that the store lacks. The library it replaces is dumped first, beside
+    the snapshots, as before-restore-<time>.dump. Refuses while the app runs (it keeps some of
+    the library's state in memory). Returns {snapshot, documents, kept, files}."""
     folder = folder or BACKUP_DIR
     names = snapshots(folder)
     if name == "latest":
@@ -301,40 +342,31 @@ def restore(name, folder=None, now=None):
     if name not in names:  # also keeps a name from reaching outside the folder
         raise BackupError(f"No snapshot named {name!r} in {folder} (--list shows them)")
     path = os.path.join(folder, name)
-    documents = _check(path)
-    target = os.path.abspath(db.DB_PATH)
-    os.makedirs(os.path.dirname(target), exist_ok=True)
+    _verify(path)
     lock = _lock_out_the_app()
     try:
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=TMP, suffix=".db")
-        os.close(fd)
-        kept = None
+        stamp = (now or datetime.datetime.now()).strftime("%Y%m%d-%H%M%S")
+        kept = os.path.join(folder, f"before-restore-{stamp}.dump")
         try:
-            with closing(_open_ro(path)) as src, closing(sqlite3.connect(tmp)) as out:
-                src.backup(out)
-            os.chmod(tmp, 0o644)
-            stamp = (now or datetime.datetime.now()).strftime("%Y%m%d-%H%M%S")
-            # A journal left by a crash goes with its database: beside the restored one, SQLite
-            # would take it for that one's and "roll it back" into it.
-            for suffix in ("", "-journal", "-wal", "-shm"):
-                if os.path.exists(target + suffix):
-                    os.replace(target + suffix, f"{target}.before-restore-{stamp}{suffix}")
-                    kept = kept or f"{target}.before-restore-{stamp}"
-            os.replace(tmp, target)
-        except BaseException:
-            for leftover in (tmp, tmp + "-journal"):
-                try:
-                    os.remove(leftover)
-                except FileNotFoundError:
-                    pass
-            raise
-        files = mirror_files(src=os.path.join(folder, "files"), dest=db.files_dir(), names=_referenced(target))
+            _dump(kept)
+        except BackupError as e:
+            if "No library" not in str(e):
+                raise
+            kept = None  # an empty database: nothing to keep
+        db.close_pool()
+        _run(["pg_restore", "--clean", "--if-exists", "--no-owner", "--no-privileges", "--single-transaction",
+              "--exit-on-error", *_schema_args(), "--dbname", conninfo_to_dict(db.DATABASE_URL).get("dbname", ""),
+              path], f"restore {name}")
+        db._schema_ready.clear()
+        with db.connect() as con:  # brings a snapshot from an older version of the app up to date
+            documents = con.execute("SELECT count(*) FROM documents").fetchone()[0]
+        files = restore_files(os.path.join(folder, "files"), _referenced())
     finally:
-        if lock:
-            lock.close()
-    log.info("Restored %s (%s) to %s%s. %s copied back%s.", name, _count(documents or 0, "document"), target,
-             f"; the database it replaced is kept as {kept}" if kept else "", _count(files["copied"], "original"),
-             f"; {files['missing']} the library uses are in neither the backup nor the library: their documents"
+        lock.close()
+    log.info("Restored %s (%s)%s. %s copied back%s.", name, _count(documents or 0, "document"),
+             f"; the library it replaced is kept as {os.path.basename(kept)}" if kept else "",
+             _count(files["copied"], "original"),
+             f"; {files['missing']} the library uses are in neither the backup nor the store: their documents"
              " keep their text but can't be opened or re-read" if files["missing"] else "")
     return {"snapshot": name, "documents": documents, "kept": kept, "files": files}
 
@@ -361,8 +393,8 @@ def _now():  # the loop's clock (tests set it)
 def loop(hour, keep, folder=None):
     """The service: look at the clock every minute, and back up when due() says so."""
     folder = folder or BACKUP_DIR
-    log.info("Backing up %s every night at %02d:00 %s into %s, keeping the newest %d",
-             db.DB_PATH, hour, time.strftime("%Z"), folder, keep)
+    log.info("Backing up the library every night at %02d:00 %s into %s, keeping the newest %d",
+             hour, time.strftime("%Z"), folder, keep)
     tried = None
     while True:
         now = _now()
@@ -396,8 +428,7 @@ def main(argv=None):
     try:
         if args.restore:
             restore(args.restore)
-            # restart, not start: it also starts it afresh if a version from before the lock was left running
-            print("Start the app again: docker compose restart chatbot")
+            print("Start the app again: docker compose start chatbot")
             return 0
         if args.now:
             return 1 if run_once(keep=keep)["files"]["failed"] else 0
