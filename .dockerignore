@@ -1,5 +1,7 @@
 .git
+.github
 data
+scripts
 tests
 __pycache__
 *.pyc

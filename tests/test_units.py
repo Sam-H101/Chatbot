@@ -1,6 +1,7 @@
 import re
 
-from app.units import fix
+from app import units
+from app.units import SCRIPT_L, check, find, fix, scan
 
 
 def test_kioti_quarts_misprint_is_corrected():
@@ -46,8 +47,124 @@ def test_gallons_first_misprint():
     assert out.startswith("Capacity 10.0 US gal (38.0 L") and "40.1 U.S. qt" in out
 
 
+UNRELATED = ["R2 bulbs 12 volt and 40/45 watt", "adjust the length (L) of feedback rod", "M12 x 40 (four places)",
+             "25 ~ 40 mm<br>0.984 ~ 1.574 in.", "4-40 L. SHAFT 2", "Torque 40 lbf·ft"]
+
+
 def test_unrelated_numbers_untouched():
-    for s in ["R2 bulbs 12 volt and 40/45 watt", "adjust the length (L) of feedback rod",
-              "M12 x 40 (four places)", "25 ~ 40 mm<br>0.984 ~ 1.574 in.", "4-40 L. SHAFT 2",
-              "Torque 40 lbf·ft"]:
+    for s in UNRELATED:
         assert fix(s) == s
+
+
+# ---- find(): the misprints fix() corrects, listed at upload ----
+
+KIOTI = [  # the real KIOTI texts above: one quarts misprint each
+    "| Capacity | Transmission fluid | 38.0 ℓ / 40.1 U.S.gal |",
+    "38.0 ℓ<br>40.1 U.S.gal.",
+    "| Capacity | Transmission fluid | 38.0 ℓ |\n|---|---|---|\n| | | 40.1 U.S.gal. |",
+    "Capacity Transmission\r\nfluid\r\n38.0 \r\n40.1 U.S.gal.\r\nIMPORTANT",
+    "Capacity 40.1 US gal (38.0 L)",
+]
+FINE = ["38.0 ℓ<br>10.0 U.S.gal.", "Fuel tank: 50 L (13.2 US gal)", "10.0 U.S. gallons / 38 litres",
+        "DEF: 15.5 L / 3.4 imp. gal", "Model 2\n12 US gal tank", "Step 4 - 5 gallons", "38.0 \n10.0 U.S.gal.",
+        "2024 / 40 gal", *UNRELATED]
+
+
+def test_find_lists_the_kioti_misprints():
+    assert find(KIOTI[0]) == [{"page": None, "kind": "quarts-printed-as-gallons", "printed": "38.0 ℓ / 40.1 U.S.gal",
+                               "corrected": "38.0 ℓ / 10.0 U.S.gal (40.1 U.S. qt)",
+                               "context": "Capacity Transmission fluid"}]
+    (split,) = find(KIOTI[2])                                                            # table rows apart
+    assert (split["printed"], split["corrected"]) == ("38.0 ℓ 40.1 U.S.gal.", "38.0 ℓ 10.0 U.S.gal. (40.1 U.S. qt)")
+    (lost,) = find(KIOTI[3])                                                             # the text layer lost the ℓ
+    assert (lost["printed"], lost["corrected"]) == ("38.0 40.1 U.S.gal.", "38.0 L 10.0 U.S.gal. (40.1 U.S. qt)")
+    assert lost["context"] == "Capacity Transmission fluid"
+    for s in KIOTI:
+        assert [f["kind"] for f in find(s)] == ["quarts-printed-as-gallons"], s
+
+
+def test_find_and_fix_cannot_disagree():
+    """They run the same code: a text has findings exactly when fix() changes more than
+    the ℓ symbol, and fix() writes what the findings say it corrects to."""
+    for s in KIOTI + FINE + ["Tank 50 L / 31 US gal", "Tank 50 L / 11.0 US gal"]:
+        found = find(s)
+        assert bool(found) == (fix(s) != SCRIPT_L.sub(" L", s)), s
+        for f in found:
+            assert " ".join(SCRIPT_L.sub(" L", f["corrected"]).split()) in " ".join(re.sub(r"[|]|-{3,}|<br>", " ", fix(s)).split())
+    assert find("") == [] and all(find(s) == [] for s in FINE)
+
+
+def test_each_kind_of_misprint():
+    assert [f["kind"] for f in find("Tank 50 L / 31 US gal")] == ["inconsistent-pair"]
+    assert [f["kind"] for f in find("Tank 50 L / 11.0 US gal")] == ["imperial-printed-as-us-gallons"]
+    assert fix("Tank 50 L / 11.0 US gal") == "Tank 50 L / 13.2 US gal (11 imp. gal)"
+
+
+def test_findings_carry_their_page_when_the_text_has_pages():
+    text = "Contents\fFuel tank: 50 L (13.2 US gal)\f\fTransmission fluid 38.0 ℓ / 40.1 U.S.gal"
+    (f,) = find(text)
+    assert f["page"] == 4 and f["context"] == "Transmission fluid"                       # the context stays on its page
+    assert find(KIOTI[0], page=7)[0]["page"] == 7 and find(KIOTI[0])[0]["page"] is None
+    assert fix(text).count("\f") == 3                                                     # page breaks are kept
+
+
+def test_pairs_side_by_side_in_a_table_are_not_mixed_up():
+    """Real text from Chapter 9 (two models, one cell each): 2.4 gal belongs to 8.9 ℓ.
+    Before, the gallons-first rule paired it with the next cell's 8.3 ℓ and "corrected"
+    it to 2.2 gal, a misprint note included."""
+    cabin = "| | Coolant Capacity | 8.9 ℓ, 2.4 U.S.gal | 8.3 ℓ, 2.2 U.S.gal |"
+    assert fix(cabin) == SCRIPT_L.sub(" L", cabin) and find(cabin) == []
+    mirrored = "| | Coolant Capacity | 2.4 U.S.gal, 8.9 ℓ | 2.2 U.S.gal, 8.3 ℓ |"
+    assert fix(mirrored) == SCRIPT_L.sub(" L", mirrored) and find(mirrored) == []
+    # A misprint in the second cell is still found, whichever unit comes first.
+    assert [f["printed"] for f in find("| 8.9 ℓ, 2.4 U.S.gal | 8.3 ℓ, 8.8 U.S.gal |")] == ["8.3 ℓ, 8.8 U.S.gal"]
+    assert [f["printed"] for f in find("| 2.4 U.S.gal, 8.9 ℓ | 8.8 U.S.gal, 8.3 ℓ |")] == ["8.8 U.S.gal, 8.3 ℓ"]
+    assert [f["printed"] for f in find("| 38.0 ℓ / 40.1 U.S.gal | 30.0 ℓ / 7.9 U.S.gal |")] == ["38.0 ℓ / 40.1 U.S.gal"]
+
+
+def test_the_context_reaches_into_the_chunk_before():
+    """A long paragraph is cut into chunks anywhere: the context then starts in the chunk
+    before (on the same page), as the KIOTI-like staging manual showed."""
+    (f,) = scan(["Engine notes.\n\nFuel tank (export model", ") ..... 50 L / 11.0 US gal"])
+    assert f["context"] == "Engine notes. Fuel tank (export model ) ....."
+    (f,) = scan(["Fuel tank", "\f50 L / 11.0 US gal"])                                  # not across a page break
+    assert f["context"] == "" and f["page"] == 2
+
+
+def test_scan_counts_pages_across_a_documents_chunks():
+    """Chunks keep the page breaks inside them, so pages carry on from chunk to chunk."""
+    chunks = ["Contents", "\fIntro.\n\n\fCapacity 38.0 ℓ / 40.1 U.S.gal", "More: 19.0 L / 20.05 U.S.gal", "\fx"]
+    assert [(f["page"], f["printed"]) for f in scan(chunks)] == [(3, "38.0 ℓ / 40.1 U.S.gal"),
+                                                                 (3, "19.0 L / 20.05 U.S.gal")]
+    assert [f["page"] for f in scan([KIOTI[0], KIOTI[1]])] == [None, None]               # no pages to count
+    assert scan([]) == []
+
+
+def test_a_pdf_without_page_breaks_starts_on_page_1():
+    """A one-page PDF, or one with text on its first page only, keeps no page break."""
+    assert [f["page"] for f in scan([KIOTI[0], KIOTI[1]], paged=True)] == [1, 1]
+    assert check([KIOTI[0]], paged=True)["paged"] is True and check([KIOTI[0]])["paged"] is False
+
+
+def test_findings_show_the_documents_own_text():
+    """Each rule reads the text the rules before it corrected. A finding's page, context
+    and printed figures come from the text as given: the second pair here showed the
+    first pair's correction (10.0 gal) as if the document printed it, and its printed
+    figures ended in a bracket that never closed."""
+    text = "Transmission fluid: 38.0 L / 40.1 U.S.gal\fWasher tank: 3.0 US gal (2.0 L) Fuel: 50 L"
+    first, second = find(text)
+    assert (first["page"], first["printed"]) == (1, "38.0 L / 40.1 U.S.gal")
+    assert second["page"] == 2 and second["context"] == "Washer tank:"
+    assert second["printed"] == "3.0 US gal (2.0 L)" and second["corrected"].startswith("0.5 US gal (2.0 L [gallon")
+    assert second["corrected"].endswith("misprint])") and fix(text).count("10.0 U.S.gal (40.1 U.S. qt)") == 1
+    (second,) = find(text.replace("\f", " "))[1:]                                        # on one page: the first pair too
+    assert second["context"] == "Transmission fluid: 38.0 L / 40.1 U.S.gal Washer tank:"
+    assert [f["printed"] for f in find("| 38.0 ℓ (40.1 U.S.gal) | 50 L (31 US gal)")] == [
+        "38.0 ℓ (40.1 U.S.gal)", "50 L (31 US gal)"]
+
+
+def test_a_check_keeps_the_first_findings_and_counts_them_all(monkeypatch):
+    monkeypatch.setattr(units, "MAX_FINDINGS", 2)
+    found = check([f"Tank {n}: 50 L / 31 US gal" for n in range(5)])
+    assert found["total"] == 5 and len(found["findings"]) == 2 and found["findings"][0]["context"] == "Tank 0:"
+    assert len(scan([f"Tank {n}: 50 L / 31 US gal" for n in range(5)])) == 5             # no cap without one

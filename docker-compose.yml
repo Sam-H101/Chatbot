@@ -11,19 +11,155 @@ services:
       - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
       - OLLAMA_MODEL
       - OLLAMA_VISION_MODEL
+      - OLLAMA_EMBED_MODEL
       - OLLAMA_NUM_CTX
       - OLLAMA_ANALYZE_CHARS
+      - OLLAMA_TIMEOUT
+      - OLLAMA_KEEP_ALIVE
+      - ANALYZE_MAX_SECTIONS
       # Claude backend only. Optional: set a key here instead of typing it into the page.
       - ANTHROPIC_API_KEY
       - CLAUDE_MODEL
       - CLAUDE_EFFORT
       - CLAUDE_ANALYZE_CHARS
+      - CLAUDE_PDF_PAGES
+      - CONFIRM_COST_USD
       - SYSTEM_PROMPT
+      - TOP_K
+      - SEARCH_MIN_SIMILARITY
+      - SEARCH_MEANING_MARGIN
       - PDF_EXTRACTOR
+      # Which PDF pages count as scanned (read by a model, and paid for with Claude), and
+      # how Claude's reading is split up.
+      - MIN_PAGE_CHARS
+      - RENDER_SCALE
+      - PDF_PAGES_PER_CALL
+      - PDF_CONCURRENCY
+      - PDF_MAX_BATCH_MB
       - MAX_UPLOAD_MB
+      # The library's database: the postgres service below.
+      - DATABASE_URL=postgresql://chatbot:${POSTGRES_PASSWORD:-chatbot}@postgres:5432/chatbot
+      # Where originals are kept (app/storage.py): local (default, /data/files), s3 or azure.
+      - STORAGE_BACKEND
+      - S3_BUCKET
+      - S3_PREFIX
+      - S3_ENDPOINT_URL   # MinIO, R2, B2 and other S3-compatible stores
+      - S3_REGION
+      - AWS_REGION
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AZURE_STORAGE_CONTAINER
+      - AZURE_STORAGE_PREFIX
+      - AZURE_STORAGE_CONNECTION_STRING
+      - AZURE_STORAGE_ACCOUNT_URL
+      - AZURE_STORAGE_KEY
+      - AZURE_STORAGE_SAS_TOKEN
+      # FILES_DIR and THUMBS_DIR are left at the image's /data/files and /data/thumbs: the backup
+      # and restore services below look for local originals in the metabase volume.
+      # Login: set APP_PASSWORD (in .env, say) to ask everyone for it. Unset, there is no login.
+      # SECRET_KEY signs the session cookie; unset, a random one is kept in the database.
+      - APP_PASSWORD
+      - SECRET_KEY
+      - SESSION_DAYS
     depends_on:
-      - ollama
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
     restart: unless-stopped
+
+  # The library's database: Postgres with pgvector (search by meaning). Not published: only
+  # the app and its backup services talk to it. Set POSTGRES_PASSWORD in .env before the
+  # first start (it is set when the data volume is first made; changing it later needs ALTER
+  # USER as well).
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg18-trixie
+    volumes:
+      - pgdata:/var/lib/postgresql   # PostgreSQL 18 keeps its data in 18/docker under it
+    environment:
+      - POSTGRES_USER=chatbot
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-chatbot}
+      - POSTGRES_DB=chatbot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatbot -d chatbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Nightly snapshot of the library (pg_dump) and copies of its originals (app/backup.py),
+  # into the backups volume. Same image. See README, Backups.
+  backup:
+    build: .
+    command: ["python", "-m", "app.backup"]
+    volumes:
+      - metabase:/data:ro
+      - backups:/backups
+    environment:
+      - BACKUP_HOUR      # default 3, in the container's time: UTC unless TZ is set
+      - BACKUP_KEEP      # default 14 snapshots
+      - TZ               # e.g. America/New_York
+      # The library's database: the postgres service below.
+      - DATABASE_URL=postgresql://chatbot:${POSTGRES_PASSWORD:-chatbot}@postgres:5432/chatbot
+      # Where originals are kept (app/storage.py): local (default, /data/files), s3 or azure.
+      - STORAGE_BACKEND
+      - S3_BUCKET
+      - S3_PREFIX
+      - S3_ENDPOINT_URL   # MinIO, R2, B2 and other S3-compatible stores
+      - S3_REGION
+      - AWS_REGION
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AZURE_STORAGE_CONTAINER
+      - AZURE_STORAGE_PREFIX
+      - AZURE_STORAGE_CONNECTION_STRING
+      - AZURE_STORAGE_ACCOUNT_URL
+      - AZURE_STORAGE_KEY
+      - AZURE_STORAGE_SAS_TOKEN
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Not started by `up`: `docker compose run --rm restore <snapshot>` puts a snapshot back
+  # (stop the chatbot first). Without a name it lists them. The library it replaces is dumped
+  # into the backups volume first, so that is mounted writable here.
+  restore:
+    build: .
+    # `up --build` skips a service behind a profile: build it at every run instead (cached,
+    # so quick), or it would keep the code of the first restore.
+    pull_policy: build
+    profiles: ["restore"]
+    entrypoint: ["python", "-m", "app.backup", "--restore"]
+    command: []
+    volumes:
+      - metabase:/data
+      - backups:/backups
+    environment:
+      - TZ
+      # The library's database: the postgres service below.
+      - DATABASE_URL=postgresql://chatbot:${POSTGRES_PASSWORD:-chatbot}@postgres:5432/chatbot
+      # Where originals are kept (app/storage.py): local (default, /data/files), s3 or azure.
+      - STORAGE_BACKEND
+      - S3_BUCKET
+      - S3_PREFIX
+      - S3_ENDPOINT_URL   # MinIO, R2, B2 and other S3-compatible stores
+      - S3_REGION
+      - AWS_REGION
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AZURE_STORAGE_CONTAINER
+      - AZURE_STORAGE_PREFIX
+      - AZURE_STORAGE_CONNECTION_STRING
+      - AZURE_STORAGE_ACCOUNT_URL
+      - AZURE_STORAGE_KEY
+      - AZURE_STORAGE_SAS_TOKEN
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   ollama:
     image: ollama/ollama
@@ -42,5 +178,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  metabase:
+  metabase:   # local originals and thumbnails (and the SQLite library from before Postgres)
+  pgdata:     # the Postgres database
+  backups:
   ollama:

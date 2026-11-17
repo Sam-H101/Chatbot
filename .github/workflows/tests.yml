@@ -1,0 +1,21 @@
+# The test suite on every push and pull request, as it runs locally: in Docker, against a real
+# Postgres (with pgvector) and Azurite (docker-compose.test.yml). Tests use fakes for Claude
+# and Ollama, so they need no API key or GPU.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker compose -f docker-compose.test.yml run --rm --build tests
+      - if: always()
+        run: docker compose -f docker-compose.test.yml down -v
