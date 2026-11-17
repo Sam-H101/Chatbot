@@ -74,9 +74,9 @@ services:
   # first start (it is set when the data volume is first made; changing it later needs ALTER
   # USER as well).
   postgres:
-    image: pgvector/pgvector:0.8.1-pg17
+    image: pgvector/pgvector:0.8.7-pg18-trixie
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql   # PostgreSQL 18 keeps its data in 18/docker under it
     environment:
       - POSTGRES_USER=chatbot
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-chatbot}
