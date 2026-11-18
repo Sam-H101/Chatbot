@@ -28,6 +28,8 @@ services:
       - TOP_K
       - SEARCH_MIN_SIMILARITY
       - SEARCH_MEANING_MARGIN
+      - SEARCH_KEYWORD_MIN_SIMILARITY
+      - TZ               # e.g. America/New_York: questions are sent with today's date ("this month")
       - PDF_EXTRACTOR
       # Which PDF pages count as scanned (read by a model, and paid for with Claude), and
       # how Claude's reading is split up.
@@ -57,8 +59,9 @@ services:
       - AZURE_STORAGE_SAS_TOKEN
       # FILES_DIR and THUMBS_DIR are left at the image's /data/files and /data/thumbs: the backup
       # and restore services below look for local originals in the metabase volume.
-      # Login: set APP_PASSWORD (in .env, say) to ask everyone for it. Unset, there is no login.
-      # SECRET_KEY signs the session cookie; unset, a random one is kept in the database.
+      # Sign-in: everyone has an account (app/users.py); the first is made at /setup with the setup
+      # code the app writes in its log. SECRET_KEY signs the session cookie; unset, a random one is
+      # kept in the database. APP_PASSWORD (a shared password) is no longer used: the log warns if set.
       - APP_PASSWORD
       - SECRET_KEY
       - SESSION_DAYS

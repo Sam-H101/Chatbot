@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import threading
+from datetime import datetime
 from urllib.parse import urlsplit
 
 import io
@@ -271,8 +272,8 @@ def _start_worker():
     jobs.start()  # once per process (gunicorn starts it at boot); queued jobs carry on after a restart
 
 
-# The optional login (APP_PASSWORD): checked after the two hooks above, so a request from
-# another site still gets its 403 and any request, the login page's too, starts the worker.
+# Signing in (user accounts): checked after the two hooks above, so a request from another
+# site still gets its 403 and any request, the sign-in page's too, starts the worker.
 auth.setup(app)
 
 
@@ -918,6 +919,12 @@ def _question(body):
     return question, choice, scope, None, history
 
 
+def _today():
+    """Today's date where the library is kept (the container's TZ; UTC unless set), which a
+    question is sent with: "this month" means nothing to a model otherwise."""
+    return datetime.now().astimezone().date()
+
+
 def _prompt(question, scope, history, on_usage):
     """What the model is sent for a question: (system prompt, the user turn with the passages
     that best match it, by keywords and by meaning (vectors.search), what the page shows of
@@ -931,7 +938,7 @@ def _prompt(question, scope, history, on_usage):
     # given the documents' titles and summaries instead, so it can say what the library holds.
     library = db.library_overview() if not hits and scope is None else None
     user_message = llm.build_user_message(question, hits, scope and list(scope["direct"].values()), library,
-                                          scope and scope["folders"])
+                                          scope and scope["folders"], _today())
     excerpts, sources = _cited(hits)
     # What it was asked of: the documents chosen ([] when only folders were), their names, the
     # folders chosen, and how many documents that came to (all None: every document).

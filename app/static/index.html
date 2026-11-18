@@ -37,6 +37,9 @@
   <symbol id="i-image" viewBox="0 0 24 24"><path d="M5 4.5h14A1.5 1.5 0 0 1 20.5 6v12a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 18V6A1.5 1.5 0 0 1 5 4.5z"/><path d="M3.5 16l5-5 4 4 2.5-2.5 5.5 5.5"/><circle cx="15.5" cy="9" r="1.5"/></symbol>
   <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15.5V4M7.5 8.5 12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></symbol>
   <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M15.5 4.5l4 4L8.5 19.5 3.5 20.5l1-5z"/><path d="M13 7l4 4"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M15.5 5.2a3.5 3.5 0 0 1 0 6.6M17.5 14.2A6.5 6.5 0 0 1 21.5 20"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M10 4H5v16h5M14 8l4 4-4 4M18 12H9"/></symbol>
   </defs>
 </svg>
 <aside id="shelf">
@@ -83,11 +86,17 @@
     <button id="usagebtn" type="button" title="Model calls, tokens and cost">Usage</button>
     <button id="keybtn" type="button" title="Claude API key"><span id="keydot"></span><span class="wide">API key</span><span class="narrow">Key</span></button>
     <button class="icon" id="theme" type="button" aria-label="Switch light or dark theme" title="Switch light or dark theme">◐</button>
-    <button id="logout" type="submit" form="logoutform" hidden aria-label="Log out" title="Log out of this library"><span
-      class="wide">Log out</span><svg class="narrow" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path
-      d="M10 4H5v16h5M14 8l4 4-4 4M18 12H9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <button id="acctbtn" type="button" hidden aria-haspopup="true" aria-expanded="false" aria-controls="account"
+      title="Your account, users and Log out"><svg class="ic" aria-hidden="true"><use href="#i-user"/></svg><span
+      class="wide" id="acctname"></span></button>
   </header>
   <form id="logoutform" method="post" action="/logout" hidden></form>
+  <div id="account" hidden>
+    <div class="muted small">Signed in as</div>
+    <div id="acctwho"></div>
+    <button id="acctusers" type="button"><svg class="ic" aria-hidden="true"><use href="#i-users"/></svg> Users and passwords…</button>
+    <button id="logout" type="submit" form="logoutform"><svg class="ic" aria-hidden="true"><use href="#i-logout"/></svg> Log out</button>
+  </div>
   <div id="settings" hidden>
     <span class="label">Claude API key</span>
     <input id="key" type="password" placeholder="sk-ant-…" autocomplete="off">
@@ -269,6 +278,26 @@
         <textarea id="newrule" rows="3" aria-label="New instruction" placeholder="e.g. Whenever a volume is given in gallons, also give it in litres (1 US gallon = 3.785 L, 1 imperial gallon = 4.546 L), show the calculation, and say which gallon the document uses."></textarea>
         <button class="primary" id="addrule" type="button">Add instruction</button>
       </div>
+    </div>
+  </dialog>
+  <dialog id="usersview" class="form" aria-labelledby="usvtitle">
+    <div class="tvhead">
+      <h2 id="usvtitle">Users</h2>
+      <span class="grow"></span>
+      <button class="icon" id="usvclose" type="button" aria-label="Close users">✕</button>
+    </div>
+    <div class="rbody">
+      <p class="muted">Everyone listed can sign in and do anything here, managing users included. A new password signs that person out everywhere.</p>
+      <div id="userlist"></div>
+      <form id="adduser" class="adduser">
+        <span class="label">Add a user</span>
+        <input id="newuser" class="field" maxlength="40" placeholder="User name" aria-label="New user's name"
+          autocomplete="off" autocapitalize="none" spellcheck="false" required>
+        <input id="newpass" class="field" type="password" minlength="8" placeholder="Password (8 characters or more)"
+          aria-label="New user's password" autocomplete="new-password" required>
+        <span class="err" id="adderr" role="alert"></span>
+        <button class="primary" type="submit">Add user</button>
+      </form>
     </div>
   </dialog>
   <dialog id="usageview" class="form wide" aria-labelledby="uvtitle">

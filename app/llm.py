@@ -101,8 +101,8 @@ def _report(on_usage, kind, model, response):
 # oil capacity of 11.0 litres, confidently and wrongly.
 SYSTEM = os.environ.get("SYSTEM_PROMPT") or (
     "You answer questions for the user of a document chatbot. Each user message may "
-    "start with <excerpts> retrieved from the user's uploaded documents by search, and a "
-    "<scope> naming the only documents the user wants searched. Use the excerpts when "
+    "start with <today>, today's date, <excerpts> retrieved from the user's uploaded documents "
+    "by search, and a <scope> naming the only documents the user wants searched. Use the excerpts when "
     "relevant, and cite each one you use in parentheses with the file name from its file "
     "attribute. When no excerpt matched the question, a <library> lists the documents with "
     "their summaries instead. If none of this contains the answer, say so. If the answer is "
@@ -286,15 +286,22 @@ def excerpt_text(hit):
 
 def library_text(docs, total):
     """A question that matched no passage ("Summarise everything in my library") gets the
-    documents' titles and summaries instead (db.library_overview), up to LIBRARY_CHARS."""
+    documents' titles and summaries instead (db.library_overview), up to LIBRARY_CHARS, each
+    with its key details (the date it bears, who issued it, its total, when it is due): "How
+    much have I spent this month?" is near no receipt in particular, and is answered from these."""
     lines, size = [], 0
     for d in docs:
         title = d["title"] if d["title"] and d["title"] != d["filename"] else ""
         summary = " ".join((d["summary"] or "").split())
         if len(summary) > 400:
             summary = summary[:400].rsplit(" ", 1)[0] + " …"
+        amount = d.get("total_amount")
+        details = ", ".join(filter(None, (
+            d.get("document_date") and f"dated {d['document_date']}", d.get("vendor") and f"from {d['vendor']}",
+            amount is not None and f"total {amount:.2f}" + (f" {d['currency']}" if d.get("currency") else ""),
+            d.get("due_date") and f"due {d['due_date']}")))
         line = (f"- {d['filename']}" + (f": {title}" if title else "") + (f" ({d['doc_type']})" if d["doc_type"] else "")
-                + (f". {summary}" if summary else ""))
+                + (f" [{details}]" if details else "") + (f". {summary}" if summary else ""))
         if lines and size + len(line) > LIBRARY_CHARS:
             break
         lines.append(line)
@@ -305,24 +312,16 @@ def library_text(docs, total):
             + "\n".join(lines) + "\n</library>\n")
 
 
-def build_user_message(question, hits, scope=None, library=None, folders=None):
+def build_user_message(question, hits, scope=None, library=None, folders=None, today=None):
     """The question, after the excerpts retrieved for it. Each names its file and, for a
     PDF read since pages were kept, its page or pages, which PAGE_NOTE asks the answer to
     cite. `scope`: the file names of the documents the user limited the question to.
     `folders`: the folders it was limited to ([{name, count}]: documents in each, its
-    subfolders' included). `library`: db.library_overview(), given when no excerpt was found."""
-    head = ""
-    if folders:
-        items = [f"the folder {f['name']} ({f['count']} document{'' if f['count'] == 1 else 's'}, including its "
-                 "subfolders)" for f in folders[:10]]
-        if len(folders) > 10:
-            items.append(f"{len(folders) - 10} more folders")
-        names = list(scope or [])
-        items += names[:10] + ([f"{len(names) - 10} more documents"] if len(names) > 10 else [])
-        head = f"<scope>Only these were searched: {'; '.join(items)}</scope>\n"
-    elif scope:
-        names = ", ".join(scope[:10]) + (f" and {len(scope) - 10} more" if len(scope) > 10 else "")
-        head = f"<scope>Only these documents were searched: {names}</scope>\n"
+    subfolders' included). `library`: db.library_overview(), given when no excerpt was found.
+    `today`: the date (a datetime.date), without which "this month" or "is it overdue?"
+    can't be answered; in this turn rather than the system prompt, which stays cacheable."""
+    head = f"<today>{today:%A} {today.isoformat()}</today>\n" if today else ""
+    head += _scope_note(scope, folders)
     if not hits:
         return head + (library_text(*library) if library and library[1] else "") + question
     parts = []
@@ -335,6 +334,23 @@ def build_user_message(question, hits, scope=None, library=None, folders=None):
     paged = next((h for h in hits if h.get("page_start")), None)
     note = "\n\n" + PAGE_NOTE.format(file=_attr(paged["filename"]), page=paged["page_start"]) if paged else ""
     return head + "<excerpts>\n" + "\n".join(parts) + "\n</excerpts>" + note + "\n\n" + question
+
+
+def _scope_note(scope, folders):
+    """The <scope> line of a question limited to documents or folders ("" when it isn't)."""
+    head = ""
+    if folders:
+        items = [f"the folder {f['name']} ({f['count']} document{'' if f['count'] == 1 else 's'}, including its "
+                 "subfolders)" for f in folders[:10]]
+        if len(folders) > 10:
+            items.append(f"{len(folders) - 10} more folders")
+        names = list(scope or [])
+        items += names[:10] + ([f"{len(names) - 10} more documents"] if len(names) > 10 else [])
+        head = f"<scope>Only these were searched: {'; '.join(items)}</scope>\n"
+    elif scope:
+        names = ", ".join(scope[:10]) + (f" and {len(scope) - 10} more" if len(scope) > 10 else "")
+        head = f"<scope>Only these documents were searched: {names}</scope>\n"
+    return head
 
 
 def _attr(name):
