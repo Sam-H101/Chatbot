@@ -38,6 +38,13 @@ MIN_SIMILARITY = float(os.environ.get("SEARCH_MIN_SIMILARITY") or "0.47")
 # its answer 0.57) and "How much is the rent?" (0.36, its answer 0.55). Not tighter: for
 # "hydraulic oil capacity", the "transmission fluid ... 38.0 litres" passage was 0.10 behind.
 MEANING_MARGIN = float(os.environ.get("SEARCH_MEANING_MARGIN") or "0.12")
+# A passage found by keywords alone must be at least this similar to the question: one word
+# in common is not being about it. "How much have I spent on food this month" (spent, food,
+# month) found one receipt by meaning, and filled the other four places with a tractor
+# manual's "every 6 months" and four chapters' "Food Accelerator Rod" (0.13-0.19); "How long
+# is the warranty?" gave three of five to passages with "long" in them (0.22-0.28). Keyword
+# passages that do bear on their question came to 0.34 and more (the warranty's 0.34-0.40).
+KEYWORD_MIN_SIMILARITY = float(os.environ.get("SEARCH_KEYWORD_MIN_SIMILARITY") or "0.30")
 # Chunks shorter than this (characters) are left out of search by meaning, unless they are
 # their document's only chunk; keyword search still finds them. A scrap of a longer document
 # (the tail of a table, a page footer: "h Squareness Item Factory Specification Allowable
@@ -179,29 +186,27 @@ def backfill(batches=4):
     return done
 
 
-def _nearest(question, n, floor, doc_ids=None, on_usage=None):
-    """The `n` chunks nearest the question in meaning (cosine), nearest first, as [(chunk
-    id, similarity)], none less similar than `floor` (None: however far); only in the
-    documents `doc_ids`, if given. [] when there are no vectors to compare it with (the
-    question isn't embedded then) or it can't be embedded."""
+def _question_vector(question, doc_ids=None, on_usage=None):
+    """The question's embedding, to compare with the chunks' (among the documents `doc_ids`,
+    if given). None when there are no vectors to compare it with (the question isn't
+    embedded then) or it can't be embedded."""
     if not ready():
-        return []
-    model = ollama.EMBED_MODEL
-    size = db.vector_size(model, MIN_CHARS, doc_ids)
+        return None
+    size = db.vector_size(ollama.EMBED_MODEL, MIN_CHARS, doc_ids)
     if size is None:
-        return []
+        return None
     try:
         (q,) = ollama.embed([QUERY.format(question)], kind="embed-query", on_usage=on_usage)
     except Exception as e:
         _failed("questions", e)
-        return []
+        return None
     _worked("questions")
     if len(q) != size:
         log.warning("A question's embedding has %d values, the stored ones %d", len(q), size)
-        return []
+        return None
     if not any(q):
-        return []  # no direction: as near to everything as to nothing
-    return db.nearest_chunks(model, q, n, floor, MIN_CHARS, doc_ids)
+        return None  # no direction: as near to everything as to nothing
+    return q
 
 
 def search(question, limit, doc_ids=None, on_usage=None):
@@ -212,7 +217,10 @@ def search(question, limit, doc_ids=None, on_usage=None):
     hears of the question's embedding call.
 
     In all documents, a passage found by meaning alone must be at least MIN_SIMILARITY
-    and within MEANING_MARGIN of the nearest. Limited to the documents `doc_ids`, the
+    and within MEANING_MARGIN of the nearest, and one found by keywords alone at least
+    KEYWORD_MIN_SIMILARITY (one without a vector yet counts: nothing says it is far), so a
+    library of manuals and receipts doesn't answer a question about one with passages of
+    the other that share a word with it. Limited to the documents `doc_ids`, the
     question is about them whatever it says ("What is this document about?" is near no
     passage in particular, and shares no keyword with them): their nearest passages count
     however far they are, and when fewer than `limit` are found, their opening passages
@@ -220,8 +228,13 @@ def search(question, limit, doc_ids=None, on_usage=None):
     scoped = doc_ids is not None
     n = max(4 * limit, 20)  # candidates from each ranking
     keyword = db.search_chunks(question, n, doc_ids, question=True)
+    model, q = ollama.EMBED_MODEL, _question_vector(question, doc_ids, on_usage)
+    near = db.nearest_chunks(model, q, n, None if scoped else MIN_SIMILARITY, MIN_CHARS, doc_ids) if q else []
+    if q and not scoped:
+        close = {c for c, _ in near}
+        far = db.similarities(model, q, [h["chunk_id"] for h in keyword if h["chunk_id"] not in close])
+        keyword = [h for h in keyword if far.get(h["chunk_id"], 1.0) >= KEYWORD_MIN_SIMILARITY]
     by_words = {h["chunk_id"]: rank for rank, h in enumerate(keyword)}
-    near = _nearest(question, n, None if scoped else MIN_SIMILARITY, doc_ids, on_usage)
     if near and not scoped:
         near = [(c, s) for c, s in near if c in by_words or s >= near[0][1] - MEANING_MARGIN]
     by_meaning = {cid: rank for rank, (cid, _) in enumerate(near)}

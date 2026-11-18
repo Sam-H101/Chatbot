@@ -15,7 +15,8 @@ URL = os.environ.get("TEST_DATABASE_URL", "")
 def pg(monkeypatch, tmp_path):
     if not URL:
         pytest.skip("TEST_DATABASE_URL is not set: run the tests with docker-compose.test.yml")
-    from app import db, storage
+    from app import auth, db, storage
+    monkeypatch.setattr(auth, "REQUIRED", False)  # no sign-in, unless a test switches it on (test_app.guarded)
     schema = "t_" + uuid.uuid4().hex[:16]
     with psycopg.connect(URL, autocommit=True) as c:
         c.execute(f"CREATE SCHEMA {schema}")

@@ -9,10 +9,11 @@ const key = $('key');
 key.value = store.get('claudeKey') || '';
 let busy = false;
 
-// With a password set (APP_PASSWORD), the server asks every call that changes something for
-// this header, which a page on another site can't add (app/auth.py).
+// The server asks every call that changes something for this header, which a page on another
+// site can't add (app/auth.py).
 const OWN = { 'X-Requested-With': 'fetch' };
-// A call made once the session has ended (Log out in another tab, a new password, SESSION_DAYS
+// A call made once the session has ended (Log out in another tab, a new password or the account
+// deleted, SESSION_DAYS
 // passed) gets 401 {login: true}: the page goes to the login page, which says so, and the call
 // never settles, so nothing shows an error on the way out. A question being sent (until the
 // server has kept it) or typed, and a new instruction, go along in this tab's sessionStorage
@@ -115,16 +116,20 @@ const askKey = () => { $('settings').hidden = false; key.focus(); };
 $('keybtn').onclick = () => { $('settings').hidden = !$('settings').hidden; if (!$('settings').hidden) key.focus(); };
 $('keydone').onclick = () => $('settings').hidden = true;
 $('keyclear').onclick = () => { key.value = ''; key.oninput(); key.focus(); };
+const showAccount = open => { $('account').hidden = !open; $('acctbtn').setAttribute('aria-expanded', String(open)); };
+$('acctbtn').onclick = () => showAccount($('account').hidden);
 document.addEventListener('click', e => {
   // The path as dispatched: still right when a handler has already removed the clicked button.
   const path = e.composedPath(), inside = sel => path.some(n => n.matches?.(sel));
   if (!inside('#settings, #keybtn')) $('settings').hidden = true;
+  if (!inside('#account, #acctbtn')) showAccount(false);
   if (!inside('#chats, #chatsbtn, dialog')) { document.body.classList.remove('chatsopen'); syncChatsButton(); }
 });
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape' || e.defaultPrevented) return;
   const settings = !$('settings').hidden;
   $('settings').hidden = true;
+  if (!$('account').hidden) { showAccount(false); $('acctbtn').focus(); return; }
   if (document.querySelector('dialog[open]')) return;  // Escape closes the dialog only
   if (document.body.classList.contains('chatsopen')) {
     document.body.classList.remove('chatsopen');
@@ -260,6 +265,76 @@ $('addrule').onclick = async () => {
     $('newrule').value = '';
   } catch (err) { toast(err.message, { error: true }); }
   loadRules();
+};
+
+// ---- users: anyone signed in may add, delete and set passwords (app/auth.py) ----
+let me = null;  // {id, username} signed in, from /api/session
+const fmtWhen = s => s ? new Date(s.replace(' ', 'T') + (/[zZ+]/.test(s.slice(10)) ? '' : 'Z')).toLocaleDateString(undefined,
+  { year: 'numeric', month: 'short', day: 'numeric' }) : 'never';
+
+async function loadUsers() {
+  const box = $('userlist');
+  let list;
+  try { list = await api('/api/users'); } catch (err) { box.replaceChildren(el('div', 'err', err.message)); return; }
+  box.replaceChildren();
+  for (const u of list) {
+    const row = el('div', 'userrow');
+    const who = el('div', 'who');
+    who.append(el('b', '', u.username), u.you ? el('span', 'you', 'you') : '',
+               el('div', 'muted small', `Added ${fmtWhen(u.created_at)} · last signed in ${fmtWhen(u.last_login_at)}`));
+    const acts = el('div', 'acts');
+    const err = el('span', 'err');
+    err.setAttribute('role', 'alert');
+    // A new password: a field and Save in place of the buttons, until saved or cancelled.
+    const setPw = btn('Set password', () => {
+      const pw = Object.assign(el('input', 'field'), { type: 'password', minLength: 8, placeholder: 'New password',
+                                                       autocomplete: 'new-password' });
+      pw.setAttribute('aria-label', `New password for ${u.username}`);
+      const form = el('form', 'pwform');
+      const cancel = btn('Cancel', () => { form.replaceWith(acts); err.textContent = ''; });
+      const save = Object.assign(el('button', 'primary', 'Save'), { type: 'submit' });
+      form.append(pw, cancel, save);
+      form.onsubmit = async e => {
+        e.preventDefault();
+        save.disabled = true;
+        try {
+          await send('/api/users/' + u.id, { password: pw.value }, 'PATCH');
+          toast(u.you ? 'Password changed. Your other sign-ins are signed out.' : `Password set; ${u.username} is signed out everywhere.`);
+          loadUsers();
+        } catch (ex) { err.textContent = ex.message; save.disabled = false; pw.focus(); }
+      };
+      acts.replaceWith(form);
+      pw.focus();
+    });
+    const del = btn('Delete', async () => {
+      if (!del.classList.contains('sure')) {  // second click confirms
+        del.classList.add('sure'); del.textContent = u.you ? 'Delete yourself?' : 'Delete?';
+        setTimeout(() => { del.classList.remove('sure'); del.textContent = 'Delete'; }, 3000);
+        return;
+      }
+      try {
+        await api('/api/users/' + u.id, { method: 'DELETE' });
+        if (u.you) { leave(); location.assign('/login'); return; }
+        toast(`${u.username} deleted`);
+      } catch (ex) { err.textContent = ex.message; }
+      loadUsers();
+    }, { cls: 'x' });
+    acts.append(setPw, del);
+    row.append(who, acts, err);
+    box.append(row);
+  }
+}
+$('acctusers').onclick = () => { showAccount(false); $('adderr').textContent = ''; loadUsers(); $('usersview').showModal(); };
+$('usvclose').onclick = () => $('usersview').close();
+$('adduser').onsubmit = async e => {
+  e.preventDefault();
+  $('adderr').textContent = '';
+  try {
+    const u = await send('/api/users', { username: $('newuser').value.trim(), password: $('newpass').value });
+    $('newuser').value = $('newpass').value = '';
+    toast(`${u.username} can sign in now`);
+    loadUsers();
+  } catch (err) { $('adderr').textContent = err.message; }
 };
 
 // ---- usage: every model call with its tokens and cost ----
@@ -1402,8 +1477,16 @@ $('logoutform').addEventListener('submit', () => {
 
 // ---- start: after all three scripts have run ----
 function start() {
-  // Log out, when there is a login (body.login: where the row is short of room, Instructions reads Rules).
-  api('/api/session').then(s => { $('logout').hidden = !s.login; document.body.classList.toggle('login', !!s.login); }).catch(() => {});
+  // The account button, when signed in (body.login: where the row is short of room, Instructions reads Rules).
+  api('/api/session').then(s => {
+    me = s.user;
+    $('acctbtn').hidden = !me;
+    document.body.classList.toggle('login', !!me);
+    if (me) {
+      $('acctname').textContent = $('acctwho').textContent = me.username;
+      $('acctbtn').setAttribute('aria-label', `Account: ${me.username}`);
+    }
+  }).catch(() => {});
   // What was being written when the session ended (toLogin), back in its box.
   try {
     const draft = JSON.parse(sessionStorage.getItem('draft') || 'null');

@@ -18,3 +18,8 @@ def post_worker_init(worker):
         jobs.start()
     except Exception:  # say the database stays locked: the first request tries again
         worker.log.exception("Could not start the job worker")
+    try:
+        from app import auth
+        auth.announce()  # no account yet: the setup code, in the log
+    except Exception:  # the first request that finds no account says it instead
+        worker.log.exception("Could not check for user accounts")

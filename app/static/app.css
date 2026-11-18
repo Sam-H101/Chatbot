@@ -222,7 +222,27 @@ body.docs #convtitle { display: none; }
 #settings .row { display: flex; gap: 8px; justify-content: flex-end; }
 header button { white-space: nowrap; flex: none; }  /* only the conversation's title gives way */
 header .narrow, header .short { display: none; }
-#logout svg { vertical-align: -3px; }
+/* The account button: the user's name beside an icon, the icon alone where the row is short of room. */
+#acctbtn > svg.ic { margin-right: 0; }
+#acctname { display: inline-block; max-width: 12ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; margin-left: 6px; }
+#acctbtn[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+#account { position: absolute; right: 20px; top: 58px; width: min(260px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; box-shadow: var(--shadow); z-index: 13; display: grid; gap: 8px; }
+#account[hidden] { display: none; }
+#acctwho { font-weight: 600; overflow-wrap: anywhere; margin: -4px 0 4px; }
+#account button { text-align: left; border-radius: 10px; }
+/* Users */
+.userrow { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+.userrow .who { min-width: 0; overflow-wrap: anywhere; }
+.userrow .you { margin-left: 8px; font: 600 10.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+.userrow .acts { display: flex; gap: 6px; }
+.userrow .x { border-color: transparent; background: none; color: var(--soft); }
+.userrow .x.sure { color: var(--bad); font-weight: 600; }
+.userrow .err { grid-column: 1 / -1; }
+.pwform { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
+.pwform .field { flex: 1 1 180px; }
+.adduser { display: grid; gap: 8px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.adduser button { justify-self: end; }
+@media (max-width: 480px) { .userrow { grid-template-columns: 1fr; } }
 
 /* ---- chat view ---- */
 #chatview { flex: 1; display: flex; flex-direction: column; min-height: 0; }
