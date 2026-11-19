@@ -2642,6 +2642,36 @@ def test_a_word_in_common_is_not_enough_to_be_found_by_keywords(client, monkeypa
     assert ask() == [("lease.txt", "both"), ("manual.txt", "keywords")]
 
 
+def test_a_question_about_spending_is_given_every_receipt(client, monkeypatch):
+    """"How much have I spent on medical supplies" was near no receipt enough to find it
+    (the one with "FL ENEMA 2PK" among pretzels least of all), so nothing was added up. A
+    question whose nearest passage is a receipt's is given all the documents with totals,
+    however far each is, and no manual; when they don't all fit, the model is told."""
+    from app import vectors
+    add(client, "manual.txt", b"Check the brake pedal free travel. Rent a trailer if needed.")
+    analysis(monkeypatch, doc_type="Receipt", total_amount="64.44", currency="USD")
+    add(client, "landlord.txt", b"Received: rent 900 euros, deposit 900 euros.")
+    add(client, "walmart.txt", b"FL ENEMA 2PK 2.84\nPIZZA CUTTER 2.37\nTOTAL 64.44")
+    fake_embedder(monkeypatch)
+    monkeypatch.setattr(vectors, "_paused", {})
+    assert vectors.backfill() == 3
+
+    def ask(question):
+        r = client.post("/api/chat", json={"question": question}, headers=H).json
+        return sorted((e["filename"], e["match"]) for e in r["excerpts"])
+
+    assert ask("How much rent have I paid?") == [("landlord.txt", "both"), ("walmart.txt", "meaning")]
+    assert "PIZZA CUTTER" in client.seen["msg"] and "don't cover" not in client.seen["msg"]
+    assert ask("How do I adjust the brake pedal?") == [("manual.txt", "both")]             # nearest a manual: as before
+    monkeypatch.setattr(vectors, "TOTALS_MIN_SIMILARITY", 2.0)
+    assert ask("How much rent have I paid?") == [("landlord.txt", "both"), ("manual.txt", "keywords")]  # off: as it was
+    monkeypatch.setattr(vectors, "TOTALS_MIN_SIMILARITY", 0.4)
+    monkeypatch.setattr(vectors, "TOTALS_CHARS", 0)                                        # room for TOP_K passages only
+    monkeypatch.setenv("TOP_K", "1")
+    assert ask("How much rent have I paid?") == [("landlord.txt", "both")]
+    assert "The excerpts don't cover 1 more of the receipts, bills and invoices" in client.seen["msg"]
+
+
 def test_a_question_is_sent_with_todays_date_and_the_documents_key_details(client, monkeypatch):
     """"How much have I spent this month?" is near no receipt in particular: the model gets
     the library's documents with the date, vendor and total read from each, and today's date,
