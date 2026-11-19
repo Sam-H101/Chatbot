@@ -2797,6 +2797,35 @@ def rest(chunks):
     return _events(b"".join(chunks).decode())
 
 
+def held(monkeypatch, words=("4", "2"), closed=None, usage=None):
+    """Claude's answers, written in their own thread (main.chat_stream), faked to wait before
+    each of these words until the test lets it through (gate.release()); a test that must
+    see an answer part way holds it so. Each closed model stream is recorded in `closed`, and
+    reports `usage` (if given) as it closes. Returns the gate."""
+    import threading
+    from app import llm
+    gate = threading.Semaphore(0)
+
+    def slow(c, history, msg, model=None, system=None, on_usage=None):
+        try:
+            for word in words:
+                assert gate.acquire(timeout=10), "the test never let the answer go on"
+                yield word
+        finally:
+            if closed is not None:
+                closed.append(True)
+            if usage and on_usage:
+                on_usage("chat", "claude", model, usage)
+
+    monkeypatch.setattr(llm, "chat_stream", slow)
+    return gate
+
+
+def follow(client, s, after=0, **kw):
+    """GET /api/chat/stream/<conversation>/<answer>: an answer's events again, from the after-th."""
+    return client.get(f"/api/chat/stream/{s['conversation_id']}/{s['answer_id']}?after={after}", **kw)
+
+
 def _messages(client, conv_id):
     return client.get(f"/api/conversations/{conv_id}").json["messages"]
 
@@ -2845,36 +2874,38 @@ def test_a_streamed_request_that_is_wrong_gets_a_plain_http_error(client, monkey
     assert client.get("/api/conversations").json == []
 
 
-def test_stopping_a_streamed_answer_keeps_what_was_written(client, monkeypatch):
-    """The page closes the stream (Stop): the model's stream is closed with it, and the
-    answer is kept as far as it got, with what it used."""
-    from app import llm
+def test_an_answer_goes_on_when_its_stream_closes(client, monkeypatch):
+    """A phone's browser sent to the background drops the stream; so do a reload and opening
+    another conversation. The answer is written on all the same, and kept whole when done;
+    the page can follow it again from the events it had (GET /api/chat/stream/<c>/<a>?after=n),
+    with a comment every KEEPALIVE_SECONDS while there is nothing new, so a dead connection
+    shows. Once FOLLOW_SECONDS have passed since it ended, it is only in its conversation."""
+    from app import main
     closed = []
-
-    def slow(c, history, msg, model=None, system=None, on_usage=None):
-        try:
-            for word in ("The ", "rent ", "is ", "900 ", "euros."):
-                yield word
-        finally:
-            closed.append(True)
-            on_usage("chat", "claude", model, {"input": 50, "output": 3, "cache_read": 0, "cache_write": 0})
-
-    monkeypatch.setattr(llm, "chat_stream", slow)
+    gate = held(monkeypatch, ("The ", "rent ", "is ", "900 ", "euros."), closed,
+                {"input": 50, "output": 5, "cache_read": 0, "cache_write": 0})
+    monkeypatch.setattr(main, "KEEPALIVE_SECONDS", 0.05)
     add(client)
-    r = client.post("/api/chat/stream", json={"question": "How much is the rent?"}, headers=H, buffered=False)
-    chunks, got = iter(r.response), ""
-    while got.count("event: delta") < 2:
-        got += next(chunks).decode()
-    assert '"conversation_id"' in got and not closed
-    r.close()                                                                             # the page pressed Stop
-    assert closed == [True]
-    (conv,) = client.get("/api/conversations").json
-    question, answer = _messages(client, conv["id"])
-    assert (answer["content"], answer["status"], answer["usage"]["input"]) == ("The rent ", "stopped", 50)
+    gate.release(2)
+    r, chunks, events = stream(client, {"question": "How much is the rent?"}, "delta")
+    while sum(n == "delta" for n, _ in events) < 2:
+        events += _events(next(chunks).decode())
+    s = events[0][1]
+    assert b": still answering" in next(chunks)                                          # held: a keep-alive instead
+    r.close()                                                                             # the phone went to the home screen
+    assert not closed and _messages(client, s["conversation_id"])[1]["status"] == "answering"
+    gate.release(3)
+    more = sse(follow(client, s, len(events)))                                           # back: from where it was
+    assert [d for n, d in more if n == "delta"] == ["is ", "900 ", "euros."]
+    assert more[-1][0] == "done" and more[-1][1]["answer"] == "The rent is 900 euros." and closed == [True]
+    answer = _messages(client, s["conversation_id"])[1]
+    assert (answer["content"], answer["status"], answer["usage"]["input"]) == ("The rent is 900 euros.", "done", 50)
     (row,) = [u for u in _usage_rows() if u["kind"] == "chat"]
     assert row["input_tokens"] == 50 and row["cost_usd"] > 0
-    client.post("/api/chat", json={"question": "Go on", "conversation_id": conv["id"]}, headers=H)
-    assert client.seen["history"][1] == {"role": "assistant", "content": "The rent "}      # the next question has it
+    assert sse(follow(client, s)) == [*events, *more]                                     # a reloaded page: all of it
+    assert follow(client, {**s, "answer_id": s["answer_id"] + 1}).status_code == 404
+    monkeypatch.setattr(main, "FOLLOW_SECONDS", -1)
+    assert follow(client, s).status_code == 404                                           # its conversation has it
 
 
 def test_local_answers_stream_from_ollama(local, monkeypatch):
@@ -3291,11 +3322,12 @@ def test_conversations_tables_from_the_first_release_keep_their_ids_from_now_on(
     assert client.post("/api/chat", json={"question": "x", "conversation_id": 2}, headers=H).status_code == 404
 
 
-def test_a_question_is_kept_while_it_is_answered(client):
+def test_a_question_is_kept_while_it_is_answered(client, monkeypatch):
     """The question is kept as it is asked, its answer marked as being written: a page
     reloaded meanwhile, or another tab, shows it (and waits). A restart fails such answers
     begun before it, saying so, and leaves those begun since alone."""
     from app import db, jobs
+    gate = held(monkeypatch)
     add(client)
     r, chunks, events = stream(client, {"question": "How much is the rent?"}, "start")
     start = events[-1][1]
@@ -3304,6 +3336,7 @@ def test_a_question_is_kept_while_it_is_answered(client):
     question, answer = _messages(client, c["id"])
     assert question["content"] == "How much is the rent?"
     assert (answer["id"], answer["status"], answer["content"]) == (start["answer_id"], "answering", "")
+    gate.release(2)
     assert rest(chunks)[-1][0] == "done" and _messages(client, c["id"])[1]["status"] == "done"
     old, new = db.begin_exchange(c["id"], "Deposit?"), db.begin_exchange(c["id"], "Pets?")
     with db.connect() as con:
@@ -3317,20 +3350,11 @@ def test_a_question_is_kept_while_it_is_answered(client):
 
 def test_a_stopped_answer_keeps_what_the_page_showed(client, monkeypatch):
     """The page says how much of an answer it showed when it stopped it (POST /api/chat/stop):
-    that much is kept, whether the answer is still being written or was kept already (the
-    server notices a closed stream only a piece or two later). Stopped before its first
-    words, the question stays with an empty answer, which later questions aren't sent."""
-    from app import llm
+    that much is kept, whether the answer is still being written or was kept already (written
+    to the end while the page had lost its stream, say). Stopped before its first words, the
+    question stays with an empty answer, which later questions aren't sent."""
     closed = []
-
-    def slow(c, history, msg, model=None, system=None, on_usage=None):
-        try:
-            for word in ("The ", "rent ", "is ", "900 ", "euros."):
-                yield word
-        finally:
-            closed.append(True)
-
-    monkeypatch.setattr(llm, "chat_stream", slow)
+    gate = held(monkeypatch, ("The ", "rent ", "is ", "900 ", "euros."), closed)
     add(client)
 
     def stop(s, shown, **kw):
@@ -3342,22 +3366,29 @@ def test_a_stopped_answer_keeps_what_the_page_showed(client, monkeypatch):
     s1 = events[-1][1]
     conv_id = s1["conversation_id"]
     assert stop(s1, 0).status_code == 204
+    gate.release(5)
     (done,) = rest(chunks)
     assert done[0] == "done" and (done[1]["answer"], done[1]["status"]) == ("", "stopped") and closed == [True]
     assert [(m["content"], m.get("status")) for m in _messages(client, conv_id)] == [
         ("How much is the rent?", None), ("", "stopped")]
     # Two pieces sent, one shown: it ends before its next piece, with what was shown.
+    gate = held(monkeypatch, ("The ", "rent ", "is ", "900 ", "euros."), closed)
+    gate.release(2)
     r, chunks, events = stream(client, {"question": "Rent?", "conversation_id": conv_id}, "delta")
     events += _events(next(chunks).decode())
     s2 = events[0][1]
     assert stop(s2, len("The ")).status_code == 204
+    gate.release(3)
     assert rest(chunks)[-1][1]["answer"] == "The " and len(closed) == 2
-    # The stream closed first (kept as written), the stop after: it is cut all the same.
+    # The stream closed, and the answer written to the end meanwhile; the stop after cuts it all the same.
+    gate = held(monkeypatch, ("The ", "rent ", "is ", "900 ", "euros."), closed)
+    gate.release(2)
     r, chunks, events = stream(client, {"question": "Rent again?", "conversation_id": conv_id}, "delta")
-    events += _events(next(chunks).decode())
     r.close()
     s3 = events[0][1]
-    assert _messages(client, conv_id)[-1]["content"] == "The rent "
+    gate.release(3)
+    assert sse(follow(client, s3))[-1][1]["answer"] == "The rent is 900 euros."
+    assert _messages(client, conv_id)[-1]["content"] == "The rent is 900 euros."
     assert stop(s3, 1).status_code == 204 and _messages(client, conv_id)[-1]["content"] == "T"
     assert [(m["content"], m.get("status")) for m in _messages(client, conv_id)[2:]] == [
         ("Rent?", None), ("The ", "stopped"), ("Rent again?", None), ("T", "stopped")]
@@ -3371,20 +3402,26 @@ def test_a_stopped_answer_keeps_what_the_page_showed(client, monkeypatch):
     assert stop(s3, 0, headers={"Origin": "http://evil.example"}).status_code == 403
 
 
-def test_renaming_a_conversation_while_it_is_answered_keeps_the_new_title(client):
+def test_renaming_a_conversation_while_it_is_answered_keeps_the_new_title(client, monkeypatch):
+    gate = held(monkeypatch)
     add(client)
+    gate.release()
     r, chunks, events = stream(client, {"question": "How much is the rent?"}, "delta")
     conv_id = events[0][1]["conversation_id"]
     assert client.patch(f"/api/conversations/{conv_id}", json={"title": "My rent questions"}).status_code == 200
+    gate.release()
     assert rest(chunks)[-1][1]["title"] == "My rent questions"
 
 
-def test_a_document_deleted_while_answering_leaves_the_conversations_scope(client):
+def test_a_document_deleted_while_answering_leaves_the_conversations_scope(client, monkeypatch):
+    gate = held(monkeypatch)
     a = add(client, "a.txt", b"The rent is 900 euros.")["doc_id"]
     b = add(client, "b.txt", b"The rent is 500 euros.")["doc_id"]
+    gate.release()
     r, chunks, events = stream(client, {"question": "Rent?", "doc_ids": [a, b]}, "delta")
     conv = f"/api/conversations/{events[0][1]['conversation_id']}"
     assert client.delete(f"/api/documents/{b}").status_code == 204
+    gate.release()
     assert rest(chunks)[-1][0] == "done" and client.get(conv).json["doc_ids"] == [a]
     add(client, "c.txt", b"Something else.")                                              # may be given b's id
     assert client.get(conv).json["doc_ids"] == [a]
