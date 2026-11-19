@@ -315,7 +315,8 @@ def library_text(docs, total):
 def build_user_message(question, hits, scope=None, library=None, folders=None, today=None):
     """The question, after the excerpts retrieved for it. Each names its file and, for a
     PDF read since pages were kept, its page or pages, which PAGE_NOTE asks the answer to
-    cite. `scope`: the file names of the documents the user limited the question to.
+    cite, and a note when they leave out receipts the question was about (hits.missed).
+    `scope`: the file names of the documents the user limited the question to.
     `folders`: the folders it was limited to ([{name, count}]: documents in each, its
     subfolders' included). `library`: db.library_overview(), given when no excerpt was found.
     `today`: the date (a datetime.date), without which "this month" or "is it overdue?"
@@ -333,6 +334,10 @@ def build_user_message(question, hits, scope=None, library=None, folders=None, t
         parts.append(f"<excerpt {attrs}>\n{excerpt_text(h)}\n</excerpt>")
     paged = next((h for h in hits if h.get("page_start")), None)
     note = "\n\n" + PAGE_NOTE.format(file=_attr(paged["filename"]), page=paged["page_start"]) if paged else ""
+    missed = getattr(hits, "missed", 0)  # vectors.search: receipts, bills and invoices that did not fit
+    if missed:
+        note += (f"\n\nThe excerpts don't cover {missed} more of the receipts, bills and invoices in the library: "
+                 "if you add amounts up, say that the sum leaves those out.")
     return head + "<excerpts>\n" + "\n".join(parts) + "\n</excerpts>" + note + "\n\n" + question
 
 

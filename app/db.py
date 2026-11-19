@@ -1805,6 +1805,16 @@ def similarities(model, vector, chunk_ids):
     return {r[0]: float(r[1]) for r in rows if r[1] is not None and r[1] == r[1]}  # NaN: a vector of zeros
 
 
+def documents_with_totals(chunk_id):
+    """If this chunk's document has a total (a receipt, bill or invoice: total_amount, read
+    from it or typed in), the ids of all the documents that have one, newest first; else []."""
+    with connect() as con:
+        return [r[0] for r in con.execute(
+            "SELECT id FROM documents WHERE total_amount IS NOT NULL AND EXISTS (SELECT 1 FROM chunks c"
+            " JOIN documents d ON d.id = c.doc_id WHERE c.id = ? AND d.total_amount IS NOT NULL) ORDER BY id DESC",
+            (chunk_id,))]
+
+
 def missing_vectors(model, limit, skip=()):
     """Up to `limit` chunks, all of one document, that have no vector from this embedding
     model (indexed before search by meaning, while the model was unavailable, or by

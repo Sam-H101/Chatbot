@@ -7,13 +7,14 @@ import mimetypes
 import os
 import re
 import threading
+import time
 from datetime import datetime
 from urllib.parse import urlsplit
 
 import io
 
 import anthropic
-from flask import Flask, Response, jsonify, request, send_file, send_from_directory, stream_with_context
+from flask import Flask, Response, copy_current_request_context, jsonify, request, send_file, send_from_directory
 from werkzeug.routing import IntegerConverter
 
 from . import auth, db, extract, jobs, llm, ollama, storage, thumbs, vectors
@@ -62,9 +63,57 @@ TITLE_CHARS = 80
 # Most characters of a question (about 5,000 tokens). Each one is kept, twice (as asked and
 # as sent), and sent again with every later question of its conversation.
 QUESTION_CHARS = 20000
-# Streamed answers being written in this process, by (conversation id, answer id): how many
-# characters of it the page showed when it stopped it (POST /api/chat/stop), None until then.
+# Streamed answers of this process, by (conversation id, answer id): each an _Answer, written
+# in its own thread, and kept FOLLOW_SECONDS after it ends for a page that reconnects.
 _live, _live_lock = {}, threading.Lock()
+FOLLOW_SECONDS = 600
+KEEPALIVE_SECONDS = 15  # a comment this often while nothing else is sent, so a dead connection shows
+
+
+class _Answer:
+    """A streamed answer's events as its thread adds them, for any number of streams to follow
+    (chat_stream's, and a reconnected page's: chat_follow). `shown`: how many characters the
+    page showed when it stopped it (chat_stop), None until then; `saved`: kept in its
+    conversation, after which a stop cuts the saved answer instead; `ended`: when its last
+    event was added (time.monotonic())."""
+
+    def __init__(self):
+        self.events, self.cond = [], threading.Condition()
+        self.shown = self.ended = None
+        self.saved = False
+
+    def add(self, name, data):
+        with self.cond:
+            self.events.append((name, data))
+            self.cond.notify_all()
+
+    def end(self):
+        with self.cond:
+            self.ended = time.monotonic()
+            self.cond.notify_all()
+
+    def follow(self, after=0):
+        """The events from the after-th on, as they come, then None every KEEPALIVE_SECONDS
+        while there is none; returns after the last."""
+        i = after
+        while True:
+            with self.cond:
+                if i >= len(self.events) and self.ended is None:
+                    self.cond.wait(KEEPALIVE_SECONDS)
+                new, ended = self.events[i:], self.ended is not None
+            i += len(new)
+            yield from new
+            if ended and i >= len(self.events):
+                return
+            if not new:
+                yield None
+
+
+def _forget_old_answers():
+    now = time.monotonic()
+    with _live_lock:
+        for key in [k for k, a in _live.items() if a.ended is not None and now - a.ended > FOLLOW_SECONDS]:
+            del _live[key]
 
 
 class BadChoice(ValueError):
@@ -1036,36 +1085,72 @@ def chat_stream():
     "delta": the next piece of the answer's text; then "done" (the answer, its status, usage
     and conversation) or "error" ({error, status, kept}: kept when the text so far stands).
     A request that is wrong (an empty question, an unknown model, a deleted conversation, a
-    Claude model and no key) gets a plain HTTP error instead, as from /api/chat. Closing the
-    stream stops the answer, which is kept as far as it got (see chat_stop). Nothing may
-    buffer it on the way: no-cache, and X-Accel-Buffering for nginx-like proxies."""
+    Claude model and no key) gets a plain HTTP error instead, as from /api/chat.
+
+    The answer is written in a thread of its own, so it goes on when the stream closes (a
+    phone's browser sent to the background, a reload, another conversation opened): the page
+    can follow it again (chat_follow) or find it in its conversation. Only a stop said so
+    (chat_stop) ends it early. Nothing may buffer the stream on the way: no-cache, and
+    X-Accel-Buffering for nginx-like proxies."""
     question, choice, scope, conv, history = _question(_body())
-    events = _answer_events(question, choice, scope, conv, history)
-    return Response(stream_with_context(_sse(events)), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    _forget_old_answers()
+    a = _Answer()
+
+    @copy_current_request_context  # the request's Claude key header, read as the answer is written
+    def write():
+        try:
+            for name, data in _answer_events(a, question, choice, scope, conv, history):
+                a.add(name, data)
+        except Exception:
+            log.exception("A streamed answer failed")
+        finally:
+            a.end()
+
+    threading.Thread(target=write, name="answer", daemon=True).start()
+    return _sse(a.follow())
+
+
+@app.get("/api/chat/stream/<id:conv_id>/<id:answer_id>")
+def chat_follow(conv_id, answer_id):
+    """A streamed answer again, from its after-th event on (the events a page already had,
+    comments not counted; 0: all of them), as chat_stream sends it: for a page whose stream
+    was cut off (a phone's browser in the background) or that was reloaded meanwhile. 404 when
+    this server is not writing it, nor wrote it in the last FOLLOW_SECONDS: its conversation
+    then has it as it was kept (or its status says why not)."""
+    after = _int_arg("after", 0, 0, 10**9)
+    _forget_old_answers()
+    with _live_lock:
+        a = _live.get((conv_id, answer_id))
+    if a is None:
+        return jsonify(error="This answer is not being written"), 404
+    return _sse(a.follow(after))
 
 
 def _sse(events):
-    """Events as Server-Sent Events. A comment goes first, so the headers leave at once."""
-    try:
+    """Events as Server-Sent Events: a comment goes first, so the headers leave at once, and
+    another whenever nothing else has for KEEPALIVE_SECONDS (events gives None then)."""
+    def body():
         yield ": answering\n\n"
-        for name, data in events:
-            yield f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-    finally:
-        events.close()  # the page went away: the answer stops and is kept (_answer_events)
+        for e in events:
+            if e is None:
+                yield ": still answering\n\n"
+            else:
+                yield f"event: {e[0]}\ndata: {json.dumps(e[1], ensure_ascii=False)}\n\n"
+
+    return Response(body(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-def _answer_events(question, choice, scope, conv, history):
-    """A streamed answer's events (chat_stream). The question is kept first (_begin), so a
-    page reloaded meanwhile still shows it, and "start" names it at once. Auto picks its model
+def _answer_events(a, question, choice, scope, conv, history):
+    """A streamed answer's events (chat_stream), in `a`'s thread. The question is kept first
+    (_begin), so a page reloaded meanwhile still shows it, and "start" names it at once; from
+    then on the answer is in _live, for chat_follow and chat_stop. Auto picks its model
     as _run does: by what fits the local model, and by switching to Claude when Ollama fails
     before its first words; a model that fails after them ends the answer where it got to.
-    The answer is filled in however it ends: done; stopped (the page closed the stream, which
-    is noticed as GeneratorExit at the next piece, or said so through chat_stop, checked
-    before each piece); broken off part way (an error event with kept: true); or failed with
-    no words (kept: false; a refusal's words are dropped too). A stop the page reported keeps
-    exactly what it showed: a stream closed at once still had a piece or two on the way."""
-    calls, pieces, gen, ex, key = [], [], None, None, None
+    The answer is filled in however it ends: done; stopped (the page
+    said so through chat_stop, checked before each piece); broken off part way (an error event
+    with kept: true); or failed with no words (kept: false; a refusal's words are dropped
+    too). A stop keeps exactly what the page showed, which may be less than was written."""
+    calls, pieces, gen, ex = [], [], None, None
     user_message = found = used = note = saved = None
     status, error = "failed", None
 
@@ -1073,13 +1158,12 @@ def _answer_events(question, choice, scope, conv, history):
         calls.append(jobs.priced(*call))
 
     def stopped():
-        return _live.get(key) is not None
+        return a.shown is not None
 
     try:
         ex = _begin(conv, question, choice, scope)
-        key = ex["conversation_id"], ex["answer_id"]
         with _live_lock:
-            _live[key] = None
+            _live[ex["conversation_id"], ex["answer_id"]] = a
         yield "start", {k: ex[k] for k in ("conversation_id", "title", "answer_id")}
         system, user_message, found, local = _prompt(question, scope, history, on_usage)
 
@@ -1101,9 +1185,6 @@ def _answer_events(question, choice, scope, conv, history):
                 pieces.append(piece)
                 yield "delta", piece
         status = "stopped" if stopped() else "done"
-    except GeneratorExit:  # stopped: the page closed the stream
-        status = "stopped"
-        raise
     except Exception as e:
         status = "broken" if pieces and not isinstance(e, llm.Refused) else "failed"
         error = _failure(e)
@@ -1120,11 +1201,11 @@ def _answer_events(question, choice, scope, conv, history):
         text = "".join(pieces) if status != "failed" else ""
         usage = next((c[3] for c in reversed(calls) if c[0] == "chat"), None)
         if ex:
-            with _live_lock:  # a stop sent meanwhile finds the answer either still live, or kept
-                shown = _live.pop(key, None)
-                if shown is not None:  # the page stopped it there: what it showed is what is kept
-                    text, status, error = "".join(pieces)[:shown], "stopped", None
+            with _live_lock:  # a stop sent meanwhile finds the answer either still being written, or kept
+                if a.shown is not None:  # the page stopped it there: what it showed is what is kept
+                    text, status, error = "".join(pieces)[:a.shown], "stopped", None
                 saved = _finish(ex, user_message, text, found, used, note, usage, status, error and error[0])
+                a.saved = True
     if status in ("done", "stopped"):
         yield "done", {"answer": text, "status": status, "usage": usage, **saved, "turns": _turns(user_message, text)}
     else:
@@ -1136,17 +1217,18 @@ def chat_stop():
     """The page stopped a streamed answer after showing `shown` characters of it (Unicode
     code points): {conversation_id, answer_id, shown}, as its "start" event named them. The
     answer keeps that much and no more, whether it is still being written (it ends before
-    its next piece, or as soon as the model begins) or was kept already. Otherwise the
-    server only notices a stop when a piece fails to go out, and keeps the pieces sent just
-    before it, which the page never showed: "Stopped before the answer began" with words."""
+    its next piece, or as soon as the model begins) or was kept already. Pieces written
+    after the page's last one never showed: "Stopped before the answer began" has no words.
+    The only way to end an answer early: closing its stream leaves it going (chat_stream)."""
     body = _body()
     conv_id, answer_id, shown = (body.get(k) for k in ("conversation_id", "answer_id", "shown"))
     if not all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**63 for v in (conv_id, answer_id, shown)):
         raise BadChoice('Expected {"conversation_id", "answer_id", "shown"}: whole numbers')
     with _live_lock:
-        live = (conv_id, answer_id) in _live
+        a = _live.get((conv_id, answer_id))
+        live = a is not None and not a.saved
         if live:
-            _live[conv_id, answer_id] = shown
+            a.shown = shown
     if live or db.cut_answer(conv_id, answer_id, shown):
         return "", 204
     return jsonify(error="Not found"), 404

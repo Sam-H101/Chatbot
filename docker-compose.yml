@@ -29,6 +29,7 @@ services:
       - SEARCH_MIN_SIMILARITY
       - SEARCH_MEANING_MARGIN
       - SEARCH_KEYWORD_MIN_SIMILARITY
+      - SEARCH_TOTALS_MIN_SIMILARITY
       - TZ               # e.g. America/New_York: questions are sent with today's date ("this month")
       - PDF_EXTRACTOR
       # Which PDF pages count as scanned (read by a model, and paid for with Claude), and

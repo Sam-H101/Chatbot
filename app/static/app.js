@@ -1135,7 +1135,7 @@ function renameChat(item, c) {
 async function openChat(id, picked = false) {
   if (picked) { document.body.classList.remove('chatsopen'); syncChatsButton(); }
   if (picked && busy && chat?.id === id) return;  // the one being answered: it carries on
-  stopAnswer();
+  leaveAnswer();  // one being answered here goes on without the page, in its conversation
   const mine = ++chatShown;
   let c;
   try { c = await api('/api/conversations/' + id); } catch (err) {
@@ -1159,7 +1159,7 @@ async function openChat(id, picked = false) {
     pruneScope();
   }
   drawChat(c);
-  if (pending(c)) watchChat(id, mine, sign(c));
+  if (!attachAnswer(c, mine) && pending(c)) watchChat(id, mine, sign(c));  // its answer being written: shown as it is
   drawChats();
   scroll();
 }
@@ -1170,8 +1170,8 @@ function drawChat(c) {  // a saved conversation's questions and answers
   if (!c.messages.length) emptyState();
 }
 
-// An answer still being written, in another tab or by this page before a reload (the server
-// fills it in once it notices the page went), is read again until it is done.
+// An answer still being written that this page can't follow as it is written (attachAnswer: the
+// server was not writing it after all, or another one is on screen) is read again until it is done.
 const pending = c => c.messages.some(m => m.status === 'answering');
 const sign = c => c.messages.map(m => `${m.id}:${m.status}:${m.content.length}`).join();
 function watchChat(id, mine, seen, wait = 1000) {
@@ -1194,7 +1194,7 @@ function watchChat(id, mine, seen, wait = 1000) {
 }
 
 function newChat(focus = true) {  // a new conversation starts on all documents (picking one brings back its own)
-  stopAnswer();
+  leaveAnswer();
   ++chatShown;
   setChat(null);
   setScope({});
@@ -1294,22 +1294,61 @@ const dots = () => { const d = el('span', 'dots'); d.append(el('i'), el('i'), el
 // arrive, so the text shows as it is written. Without that (an older browser, or a server
 // without the route), /api/chat gives the whole answer at once.
 const canStream = typeof TextDecoder === 'function' && typeof ReadableStream === 'function' && 'body' in Response.prototype;
-let answering = null;  // the answer being written (its AbortController): Stop aborts the fetch
+// The server writes an answer to the end whatever becomes of its stream (a phone's browser sent
+// to the background, a reload, another conversation opened): only Stop and Log out end it early.
+let answering = null;  // the answer this page is showing as it is written (its AbortController)
 const stopAnswer = () => answering?.abort();
+// Another conversation opened, or a new one: this page stops showing the answer, which goes on.
+const leaveAnswer = () => { if (answering) { answering.left = true; answering.abort(); } };
 $('stop').onclick = () => { stopAnswer(); $('question').focus(); };
 
-// A stopped answer is kept as far as the page showed it, which the server can't know: it
-// notices a closed stream only when a piece fails to go out, and the piece or two sent just
-// before never showed. live: the streamed answer being written, from its start event, and
-// how many characters of it are shown (code points, as the server counts).
+// A stopped answer is kept as far as the page showed it (the server may have written more).
+// live: the streamed answer being written, from its start event, and how many characters of
+// it are shown (code points, as the server counts).
 let live = null;
 function reportStop(l) {
-  if (!l || l.reported) return;  // once: Log out reports it before pagehide, and so does Stop
+  if (!l || l.reported) return;  // once: Log out reports it, and then aborts
   l.reported = true;
   fetch('/api/chat/stop', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json', ...OWN },
     body: JSON.stringify({ conversation_id: l.conversation_id, answer_id: l.answer_id, shown: l.shown }) }).catch(() => {});
 }
-addEventListener('pagehide', () => reportStop(live));  // a reload or a closed tab stops it too
+
+const aborted = () => new DOMException('Stopped', 'AbortError');
+// Resolves once the page is visible (at once if it is), or rejects when the signal aborts.
+const whenVisible = signal => new Promise((ok, no) => {
+  if (signal.aborted) return no(aborted());
+  if (document.visibilityState === 'visible') return ok();
+  const seen = () => { if (document.visibilityState === 'visible') { off(); ok(); } };
+  const stop = () => { off(); no(aborted()); };
+  const off = () => { document.removeEventListener('visibilitychange', seen); signal.removeEventListener('abort', stop); };
+  document.addEventListener('visibilitychange', seen);
+  signal.addEventListener('abort', stop);
+});
+const pause = (ms, signal) => new Promise((ok, no) => {
+  if (signal.aborted) return no(aborted());
+  const t = setTimeout(() => { signal.removeEventListener('abort', stop); ok(); }, ms);
+  const stop = () => { clearTimeout(t); no(aborted()); };
+  signal.addEventListener('abort', stop, { once: true });
+});
+// The connection to the server was lost: the answer goes on there, and can be followed again.
+const lostError = () => Object.assign(new Error('The connection to the server was lost.'), { kept: true, lost: true });
+
+// An answer being written, again (GET /api/chat/stream/...), from the events `on` has had.
+// 404: the server is not writing it (any more): its conversation has it (err.gone).
+async function followAnswer(l, signal, on) {
+  let res;
+  try {
+    res = await fetch(`/api/chat/stream/${l.conversation_id}/${l.answer_id}?after=${on.seen}`,
+                      { signal, headers: { ...OWN, 'X-API-Key': key.value } });
+  } catch (err) {
+    throw err.name === 'AbortError' ? err : lostError();
+  }
+  if ((res.headers.get('content-type') || '').startsWith('text/event-stream')) return readEvents(res, on);
+  const data = await res.json().catch(() => ({}));
+  if (loginGone(res.status, data)) return toLogin();
+  if (res.status === 404) throw Object.assign(new Error(data.error || 'Not found'), { gone: true });
+  throw lostError();  // a proxy's 502 while the server restarts, say: try again
+}
 
 async function fetchAnswer(req, signal, on) {
   const opts = { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req) };
@@ -1332,7 +1371,10 @@ async function fetchAnswer(req, signal, on) {
 
 // The events: start (the conversation, and the answer's id), meta, delta (a piece of text),
 // then done, or error ({error, status, kept}: kept when the words so far stand). A stream
-// that ends without either broke off on the way.
+// that ends without either broke off on the way (err.lost). on.seen counts the events had,
+// for followAnswer to go on from. The server sends a comment at least every 15 s, so a stream
+// silent for longer is dead (a phone that slept): one silent for 35 s, or for 20 s when the
+// page comes back into view, is given up as lost.
 async function readEvents(res, on) {
   let done = null;
   const handle = block => {
@@ -1343,6 +1385,7 @@ async function readEvents(res, on) {
     }
     if (!data) return;  // a comment
     const d = JSON.parse(data);
+    on.seen = (on.seen || 0) + 1;
     if (name === 'start') on.start(d);
     else if (name === 'meta') on.meta(d);
     else if (name === 'delta') on.delta(d);
@@ -1353,24 +1396,35 @@ async function readEvents(res, on) {
   if (!reader) (await res.text()).split('\n\n').forEach(handle);  // nothing to read as it comes: all of it at once
   else {
     const dec = new TextDecoder();
-    let buf = '';
+    let buf = '', last = Date.now(), timer = null, onShow = null;
+    const dead = new Promise((_, no) => {
+      const check = limit => { if (Date.now() - last > limit) no(lostError()); };
+      timer = setInterval(() => check(35000), 5000);
+      onShow = () => { if (document.visibilityState === 'visible') check(20000); };
+      document.addEventListener('visibilitychange', onShow);
+    });
+    dead.catch(() => {});
     try {
       for (;;) {
         let part;
-        try { part = await reader.read(); } catch (err) {
-          if (err.name === 'AbortError') throw err;
-          throw Object.assign(new Error('The connection to the server was lost.'), { kept: true });
+        try { part = await Promise.race([reader.read(), dead]); } catch (err) {
+          if (err.name === 'AbortError' || err.lost) throw err;
+          throw lostError();
         }
         if (part.done) break;
+        last = Date.now();
         buf += dec.decode(part.value, { stream: true });
         for (let i; (i = buf.indexOf('\n\n')) >= 0; buf = buf.slice(i + 2)) handle(buf.slice(0, i));
       }
     } catch (err) {
       reader.cancel().catch(() => {});
       throw err;
+    } finally {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onShow);
     }
   }
-  if (!done) throw Object.assign(new Error('The connection to the server was lost.'), { kept: true });
+  if (!done) throw lostError();
   return done;
 }
 
@@ -1382,13 +1436,45 @@ function setBusy(on) {
 
 async function ask(question) {
   if (busy || !question) return;
-  setBusy(true);
-  const shown = chatShown, ctl = answering = new AbortController();
   showQuestion(question, scopeAll() || scopeGone ? '' : onlyText(scope.folders.map(folderName), scope.docs.map(docName)));
   const { bot, body } = answerTurn();
+  // A folder with nothing in it is the server's to say (it looks at the folder now): this page's
+  // listing may be older than an upload made into it from another tab or device.
+  const req = { question, model: $('chatModel').value, ...(scope.docs.length ? { doc_ids: scope.docs } : {}),
+                ...(scope.folders.length ? { folder_ids: scope.folders } : {}), ...(chat ? { conversation_id: chat.id } : {}) };
+  await writeAnswer(bot, body, (on, signal) => {
+    if (scopeGone) throw new Error(GONE);  // never every document unasked
+    asking = question;
+    return fetchAnswer(req, signal, on);
+  });
+}
+
+// An answer from another visit, still being written (a reload, or the conversation opened
+// again): followed from its first event, in the turn drawn for it. If the server is not writing
+// it after all, the conversation is read again until it is done (watchChat).
+function attachAnswer(c, mine) {
+  const a = c.messages[c.messages.length - 1], t = $('log').lastElementChild;
+  if (busy || a?.role !== 'assistant' || a.status !== 'answering' || !t?.classList.contains('bot')) return false;
+  const body = el('div', 'body'), ids = { conversation_id: c.id, answer_id: a.id, shown: 0 };
+  t.replaceChildren(body);
+  writeAnswer(t, body, (on, signal) => followAnswer(ids, signal, on),
+              () => { if (mine === chatShown) watchChat(c.id, mine, ''); }, ids);
+  return true;
+}
+
+// Show an answer as it is written, in the turn `bot`: begin(on, signal) starts its stream (on:
+// the event handlers). If the connection is lost, the server goes on writing it: once the page
+// is visible again it follows the answer on from where it was (a phone's browser back from the
+// background), and keeps trying. gone(): the server is not writing it any more (it ended a while
+// ago, or the server restarted): by default the conversation is opened again, as kept.
+// known: the answer's ids when they are known before its start event (attachAnswer).
+async function writeAnswer(bot, body, begin, gone, known = null) {
+  setBusy(true);
+  const shown = chatShown, ctl = answering = new AbortController();
   body.append(dots());
   scroll();
-  let meta = {}, text = '', stopped = false, mine = null;
+  let meta = {}, text = '', stopped = false, mine = known, note = null, reopen = null;
+  live = mine;
   // The conversation the server keeps this in, from the start event on (null: it was deleted
   // meanwhile). Its title is the list's business after that: renamed while this is answered,
   // the header keeps the new one.
@@ -1397,25 +1483,38 @@ async function ask(question) {
     if (!m.conversation_id) setChat(null);
     else if (m.conversation_id !== chat?.id) { setChat({ id: m.conversation_id, title: m.title }); loadChats(); }
   };
+  const on = {
+    seen: 0,
+    start: s => {
+      asking = '';
+      if (!mine || mine.answer_id !== s.answer_id) live = mine = { conversation_id: s.conversation_id, answer_id: s.answer_id, shown: 0 };
+      follow(s);
+    },
+    meta: m => { meta = m; follow(m); },
+    delta: piece => {
+      const pinned = nearBottom();
+      if (!text) { body.replaceChildren(); bot.classList.add('live'); }
+      text += piece;
+      if (mine) mine.shown += [...piece].length;
+      body.append(piece);
+      if (pinned) scroll();
+    },
+  };
   try {
-    if (scopeGone) throw new Error(GONE);  // never every document unasked
-    // A folder with nothing in it is the server's to say (it looks at the folder now): this page's
-    // listing may be older than an upload made into it from another tab or device.
-    const req = { question, model: $('chatModel').value, ...(scope.docs.length ? { doc_ids: scope.docs } : {}),
-                  ...(scope.folders.length ? { folder_ids: scope.folders } : {}), ...(chat ? { conversation_id: chat.id } : {}) };
-    asking = question;
-    const r = await fetchAnswer(req, ctl.signal, {
-      start: s => { asking = ''; live = mine = { conversation_id: s.conversation_id, answer_id: s.answer_id, shown: 0 }; follow(s); },
-      meta: m => { meta = m; follow(m); },
-      delta: piece => {
-        const pinned = nearBottom();
-        if (!text) { body.replaceChildren(); bot.classList.add('live'); }
-        text += piece;
-        if (mine) mine.shown += [...piece].length;
-        body.append(piece);
-        if (pinned) scroll();
-      },
-    });
+    let r, tries = 0;
+    for (let attempt = () => begin(on, ctl.signal);;) {
+      try {
+        r = await attempt();
+        break;
+      } catch (err) {
+        if (!err.lost || !mine || ctl.signal.aborted || ++tries > 40) throw err;
+        if (!note) bot.append(note = el('div', 'switched', 'The connection was lost. The answer is still being written, and carries on here when the connection is back.'));
+        await whenVisible(ctl.signal);
+        await pause(tries === 1 ? 250 : Math.min(1000 * 2 ** (tries - 2), 10000), ctl.signal);
+        attempt = () => followAnswer(mine, ctl.signal, on);
+      }
+    }
+    note?.remove();
     const pinned = nearBottom();
     bot.classList.remove('live');
     body.textContent = r.answer;
@@ -1423,10 +1522,27 @@ async function ask(question) {
     follow(r);
     if (pinned) scroll();
   } catch (err) {
+    note?.remove();
     bot.classList.remove('live');
     stopped = err.name === 'AbortError';
-    if (stopped || (err.kept && !err.data)) reportStop(mine);  // stopped here, or the connection was lost
-    follow(err.data);  // a failed question is kept too: in a new conversation, made for it
+    if (ctl.left) {  // another conversation was opened: this one's answer goes on without the page
+    } else if (err.gone) {
+      reopen = gone || (() => { if (shown === chatShown) openChat(mine.conversation_id); });
+    } else {
+      if (stopped) reportStop(mine);  // Stop: kept as far as it showed here
+      follow(err.data);  // a failed question is kept too: in a new conversation, made for it
+      showFailure(err);
+    }
+  }
+  if (answering === ctl) answering = null;
+  if (live === mine) live = null;
+  asking = '';
+  setBusy(false);
+  if (reopen) reopen();
+  else if (shown === chatShown) loadChats();
+  if (stopped && !ctl.left) setTimeout(loadChats, 1500);  // the server keeps a stopped answer once it notices
+
+  function showFailure(err) {
     if ((stopped || err.kept) && text) {  // the words so far stand, and are kept with the conversation
       finishAnswer(bot, { ...meta, answer: text, status: stopped ? 'stopped' : 'broken', error: err.message });
     } else {
@@ -1440,12 +1556,6 @@ async function ask(question) {
       }
     }
   }
-  if (answering === ctl) answering = null;
-  if (live === mine) live = null;
-  asking = '';
-  setBusy(false);
-  if (shown === chatShown) loadChats();
-  if (stopped) setTimeout(loadChats, 1500);  // the server keeps a stopped answer once it notices
 }
 
 const qbox = $('question');
@@ -1466,7 +1576,7 @@ $('ask').onsubmit = e => {
 };
 
 // An answer being written is stopped first, while the session still lets the stop report through
-// (pagehide's would get 401, and the server would keep more than the page showed). The Claude key
+// (closing the tab or reloading leaves it going; logging out does not). The Claude key
 // typed here is forgotten, so whoever logs in next in this browser isn't using it.
 $('logoutform').addEventListener('submit', () => {
   leave();
