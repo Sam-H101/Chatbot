@@ -45,6 +45,21 @@ MEANING_MARGIN = float(os.environ.get("SEARCH_MEANING_MARGIN") or "0.12")
 # is the warranty?" gave three of five to passages with "long" in them (0.22-0.28). Keyword
 # passages that do bear on their question came to 0.34 and more (the warranty's 0.34-0.40).
 KEYWORD_MIN_SIMILARITY = float(os.environ.get("SEARCH_KEYWORD_MIN_SIMILARITY") or "0.30")
+# A question whose nearest passage of all, at least this similar, is in a document with a
+# total (a receipt, bill or invoice) is asked of all such documents, up to TOTALS_PASSAGES
+# passages and TOTALS_CHARS characters: what was spent on a kind of thing is added up from
+# every receipt's lines, and which receipts have such lines no embedding tells. "How much
+# have I spent on medical supplies" was 0.44 at most to five receipts (the one with "FL ENEMA
+# 2PK" and "DULCO SC 30" among pretzels and a pizza cutter), all under MIN_SIMILARITY, so
+# the model was given a tractor manual's passage with "supplies" in it and no receipt at all;
+# embedding receipts with their summaries and keywords brought them no nearer (0.38-0.44).
+# But the receipts were nearer than any manual (0.33), as for eight questions about spending
+# (their nearest receipt 0.44-0.60, the nearest manual 0.29-0.40), while small talk and
+# questions about the manuals were nearer a manual. The floor is for a library of receipts
+# alone, where small talk came to 0.31-0.41 ("hi" 0.33).
+TOTALS_MIN_SIMILARITY = float(os.environ.get("SEARCH_TOTALS_MIN_SIMILARITY") or "0.40")
+TOTALS_PASSAGES = 20
+TOTALS_CHARS = 12000  # of receipts, some 5,000 tokens: room left in a local model's context for the conversation
 # Chunks shorter than this (characters) are left out of search by meaning, unless they are
 # their document's only chunk; keyword search still finds them. A scrap of a longer document
 # (the tail of a table, a page footer: "h Squareness Item Factory Specification Allowable
@@ -224,11 +239,43 @@ def search(question, limit, doc_ids=None, on_usage=None):
     question is about them whatever it says ("What is this document about?" is near no
     passage in particular, and shares no keyword with them): their nearest passages count
     however far they are, and when fewer than `limit` are found, their opening passages
-    ("opening") make up the rest."""
+    ("opening") make up the rest.
+
+    A question about the documents with totals (TOTALS_MIN_SIMILARITY) is searched as if
+    limited to them, with room for TOTALS_PASSAGES passages of up to TOTALS_CHARS in all (and
+    never fewer than `limit`), so each receipt's opening passage is there to add up from. The
+    result's `missed` is how many of those documents did not fit (0 otherwise)."""
+    scoped = doc_ids is not None
+    model, q = ollama.EMBED_MODEL, _question_vector(question, doc_ids, on_usage)
+    totals = []
+    if q and not scoped:
+        nearest = db.nearest_chunks(model, q, 1, TOTALS_MIN_SIMILARITY, MIN_CHARS)
+        totals = db.documents_with_totals(nearest[0][0]) if nearest else []
+    if totals:
+        hits = search_among(question, max(limit, TOTALS_PASSAGES), totals, q)
+        size, kept = 0, Hits()
+        for h in hits:
+            size += len(h["text"])
+            if len(kept) >= limit and size > TOTALS_CHARS:
+                break
+            kept.append(h)
+        kept.missed = len(set(totals) - {h["doc_id"] for h in kept})
+        return kept
+    return Hits(search_among(question, limit, doc_ids, q))
+
+
+class Hits(list):
+    """A search's passages; `missed`: documents with totals that the question was about and
+    that did not fit among them."""
+    missed = 0
+
+
+def search_among(question, limit, doc_ids, q):
+    """search, given the question's embedding `q` (None: by keywords alone)."""
     scoped = doc_ids is not None
     n = max(4 * limit, 20)  # candidates from each ranking
     keyword = db.search_chunks(question, n, doc_ids, question=True)
-    model, q = ollama.EMBED_MODEL, _question_vector(question, doc_ids, on_usage)
+    model = ollama.EMBED_MODEL
     near = db.nearest_chunks(model, q, n, None if scoped else MIN_SIMILARITY, MIN_CHARS, doc_ids) if q else []
     if q and not scoped:
         close = {c for c, _ in near}
